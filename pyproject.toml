@@ -1,0 +1,45 @@
+[project]
+name = "agentflow-computer-mcp"
+version = "0.1.0"
+description = "Local MCP server for AgentFlow desktop agents (macOS)"
+readme = "README.md"
+authors = [
+    { name = "AgentFlow", email = "lnlockly@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]>=1.2.0",
+    "pyautogui>=0.9.54",
+    "websockets>=13.0",
+    "pyobjc-framework-Quartz>=10.0; platform_system == 'Darwin'",
+    "tomli>=2.0; python_version < '3.11'",
+    "Pillow>=10.0",
+]
+
+[project.scripts]
+agentflow-computer-mcp = "agentflow_computer_mcp.__main__:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.7",
+]
