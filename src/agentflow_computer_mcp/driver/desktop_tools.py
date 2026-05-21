@@ -1,0 +1,529 @@
+"""LLM-facing tool catalog + executor. Wraps:
+- screen / mouse / keyboard / window / clipboard from ``agentflow_computer_mcp.tools``
+- macOS AppleScript bridges to iTerm + Google Chrome
+- Playwright headed Chromium (lazy)
+- AgentFlow API client (``af_*`` tools)
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import io
+import json
+import subprocess
+import threading
+import time
+from typing import Any
+
+from PIL import Image
+
+from ..tools import clipboard, keyboard, mouse, screen, window
+from .af_client import AF_TOOL_DESCRIPTORS, AFClient, dispatch_af_tool
+
+NOISY_OWNERS: frozenset[str] = frozenset(
+    {
+        "Window Server",
+        "Пункт управления",
+        "Focus",
+        "TextInputMenuAgent",
+        "SystemUIServer",
+        "Spotlight",
+        "Dock",
+    }
+)
+
+CAPTURE_LOCK = threading.Lock()
+
+
+def grab_full_png() -> bytes:
+    with CAPTURE_LOCK:
+        return screen.capture()
+
+
+def jpeg_b64_full(quality: int = 70, width_cap: int = 1280) -> str:
+    png = grab_full_png()
+    img = Image.open(io.BytesIO(png))
+    if img.width > width_cap:
+        ratio = width_cap / img.width
+        img = img.resize((width_cap, int(img.height * ratio)), Image.LANCZOS)
+    out = io.BytesIO()
+    img.convert("RGB").save(out, format="JPEG", quality=quality)
+    return base64.b64encode(out.getvalue()).decode()
+
+
+def jpeg_b64_region(x: int, y: int, w: int, h: int, quality: int = 85) -> str:
+    png = grab_full_png()
+    img = Image.open(io.BytesIO(png))
+    crop = img.crop(
+        (max(0, x), max(0, y), min(img.width, x + w), min(img.height, y + h))
+    )
+    out = io.BytesIO()
+    crop.convert("RGB").save(out, format="JPEG", quality=quality)
+    return base64.b64encode(out.getvalue()).decode()
+
+
+def osa(script: str, timeout: int = 8) -> tuple[int, str]:
+    try:
+        r = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return r.returncode, (r.stdout or r.stderr).strip()
+    except subprocess.TimeoutExpired:
+        return -1, "osascript timeout"
+
+
+def app_activate(owner: str) -> str:
+    rc, out = osa(f'tell application "{owner}" to activate')
+    time.sleep(0.5)
+    return f"activated {owner!r}" if rc == 0 else f"failed: {out}"
+
+
+def chrome_run_js(js: str, tab_index: int | None = None) -> str:
+    js_esc = js.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+    if tab_index is None:
+        script = f'tell application "Google Chrome" to tell active tab of front window to execute javascript "{js_esc}"'
+    else:
+        script = f'tell application "Google Chrome" to tell tab {tab_index} of front window to execute javascript "{js_esc}"'
+    rc, out = osa(script, timeout=20)
+    return out if rc == 0 else f"error: {out}"
+
+
+def chrome_open_url(url: str, new_tab: bool = True) -> str:
+    if new_tab:
+        rc, out = osa(
+            f'tell application "Google Chrome" to tell front window to make new tab with properties {{URL:"{url}"}}',
+            timeout=10,
+        )
+    else:
+        rc, out = osa(
+            f'tell application "Google Chrome" to set URL of active tab of front window to "{url}"',
+            timeout=10,
+        )
+    return f"opened {url}" if rc == 0 else f"error: {out}"
+
+
+def chrome_list_tabs() -> str:
+    rc, out = osa(
+        'tell application "Google Chrome" to get {URL, title} of tabs of front window',
+        timeout=10,
+    )
+    return out
+
+
+def read_iterm_session() -> str:
+    rc, out = osa(
+        'tell application "iTerm" to tell current window to tell current session to get contents'
+    )
+    if rc == 0 and out:
+        return out[-2500:]
+    rc2, out2 = osa(
+        'tell application "Terminal" to tell front window to get contents of selected tab'
+    )
+    if rc2 == 0 and out2:
+        return out2[-2500:]
+    return f"error: iTerm={out!r} Terminal={out2!r}"
+
+
+def get_window_list() -> list[dict[str, Any]]:
+    wins = window.list_windows()
+    compact: list[dict[str, Any]] = []
+    for w in wins:
+        owner = w.get("owner") or ""
+        if owner in NOISY_OWNERS:
+            continue
+        b = w.get("bounds") or {}
+        if (b.get("width") or 0) < 60 or (b.get("height") or 0) < 60:
+            continue
+        compact.append(
+            {
+                "owner": owner,
+                "title": w.get("title") or "",
+                "window_id": w.get("window_id"),
+                "bounds": b,
+            }
+        )
+    return compact
+
+
+# ---- Playwright (headed AI-controlled Chromium) -----------------------------
+
+class PlaywrightHost:
+    """Lazy-init headed Chromium running in its own asyncio loop on a background thread."""
+
+    def __init__(self) -> None:
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._browser: Any = None
+        self._page: Any = None
+        self._lock = threading.Lock()
+
+    def _ensure_loop(self) -> asyncio.AbstractEventLoop:
+        if self._loop is None:
+            with self._lock:
+                if self._loop is None:
+                    self._loop = asyncio.new_event_loop()
+                    threading.Thread(target=self._loop.run_forever, daemon=True).start()
+        return self._loop
+
+    def _submit(self, coro: Any, timeout: int = 60) -> Any:
+        loop = self._ensure_loop()
+        fut = asyncio.run_coroutine_threadsafe(coro, loop)
+        return fut.result(timeout=timeout)
+
+    async def _start(self) -> None:
+        if self._browser is not None:
+            return
+        from playwright.async_api import async_playwright
+
+        pw = await async_playwright().start()
+        browser = await pw.chromium.launch(
+            headless=False,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        ctx = await browser.new_context(viewport={"width": 1280, "height": 800})
+        self._page = await ctx.new_page()
+        self._browser = browser
+
+    def ensure(self) -> str:
+        self._submit(self._start())
+        return "browser ready"
+
+    def navigate(self, url: str) -> str:
+        self.ensure()
+
+        async def _go() -> str:
+            await self._page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            return f"navigated to {self._page.url}"
+
+        return self._submit(_go())
+
+    def snapshot(self) -> tuple[str, str]:
+        self.ensure()
+
+        async def _snap() -> tuple[str, str]:
+            page = self._page
+            title = await page.title()
+            url = page.url
+            text = await page.evaluate("() => document.body.innerText.slice(0, 3000)")
+            png = await page.screenshot(full_page=False, type="jpeg", quality=70)
+            return (
+                f"title: {title}\nurl: {url}\ntext (first 3000 chars):\n{text}",
+                base64.b64encode(png).decode(),
+            )
+
+        return self._submit(_snap())
+
+    def click(self, selector: str) -> str:
+        self.ensure()
+
+        async def _c() -> str:
+            await self._page.click(selector, timeout=8000)
+            return f"clicked {selector!r}"
+
+        return self._submit(_c())
+
+    def fill(self, selector: str, text: str) -> str:
+        self.ensure()
+
+        async def _f() -> str:
+            await self._page.fill(selector, text, timeout=8000)
+            return f"filled {selector!r} with {len(text)} chars"
+
+        return self._submit(_f())
+
+    def press(self, key: str) -> str:
+        self.ensure()
+
+        async def _p() -> str:
+            await self._page.keyboard.press(key)
+            return f"pressed {key}"
+
+        return self._submit(_p())
+
+    def eval_js(self, js: str) -> str:
+        self.ensure()
+
+        async def _e() -> str:
+            r = await self._page.evaluate(js)
+            return json.dumps(r, ensure_ascii=False)[:2000]
+
+        return self._submit(_e())
+
+
+# ---- Tool catalog -----------------------------------------------------------
+
+DESKTOP_TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "screen_capture",
+        "description": "Full-screen screenshot (compressed JPEG, attached to next message).",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "screen_region",
+        "description": "Crop screenshot to (x,y,w,h) at native res.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "integer"},
+                "y": {"type": "integer"},
+                "width": {"type": "integer"},
+                "height": {"type": "integer"},
+            },
+            "required": ["x", "y", "width", "height"],
+        },
+    },
+    {
+        "name": "mouse_click",
+        "description": "Click absolute pixel (x,y).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "integer"},
+                "y": {"type": "integer"},
+                "button": {"type": "string", "default": "left"},
+                "clicks": {"type": "integer", "default": 1},
+            },
+            "required": ["x", "y"],
+        },
+    },
+    {
+        "name": "keyboard_type",
+        "description": "Type text at current focus.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "keyboard_shortcut",
+        "description": "Press key combo (e.g. 'cmd+space').",
+        "input_schema": {
+            "type": "object",
+            "properties": {"combo": {"type": "string"}},
+            "required": ["combo"],
+        },
+    },
+    {
+        "name": "activate_app",
+        "description": "Bring an app to front by owner name.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"owner": {"type": "string"}},
+            "required": ["owner"],
+        },
+    },
+    {
+        "name": "window_list",
+        "description": "List visible windows with bounds.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "read_terminal",
+        "description": "Read text of front iTerm/Terminal session via AppleScript (~2500 chars).",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "chrome_open_url",
+        "description": "Open URL in user's real Google Chrome.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string"},
+                "new_tab": {"type": "boolean", "default": True},
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "chrome_tabs",
+        "description": "List URL + title of all tabs in user's front Chrome window.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "chrome_eval",
+        "description": "Run JS in user's real Chrome active tab. Uses their session cookies.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "js": {"type": "string"},
+                "tab_index": {"type": "integer"},
+            },
+            "required": ["js"],
+        },
+    },
+    {
+        "name": "clipboard_write",
+        "description": "Write text to clipboard.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "clipboard_read",
+        "description": "Read clipboard.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "wait",
+        "description": "Sleep N seconds (max 5).",
+        "input_schema": {
+            "type": "object",
+            "properties": {"seconds": {"type": "number"}},
+            "required": ["seconds"],
+        },
+    },
+    {
+        "name": "browser_open",
+        "description": "Open headed Chromium (separate from user's Chrome). Once.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "browser_navigate",
+        "description": "Navigate the AI-controlled Chromium to URL.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"url": {"type": "string"}},
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "browser_snapshot",
+        "description": "Get current Chromium title+URL+body text+screenshot.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "browser_click",
+        "description": "Click element in Chromium by CSS selector.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"selector": {"type": "string"}},
+            "required": ["selector"],
+        },
+    },
+    {
+        "name": "browser_fill",
+        "description": "Fill input in Chromium by selector.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "selector": {"type": "string"},
+                "text": {"type": "string"},
+            },
+            "required": ["selector", "text"],
+        },
+    },
+    {
+        "name": "browser_press",
+        "description": "Press key in Chromium (e.g. 'Enter').",
+        "input_schema": {
+            "type": "object",
+            "properties": {"key": {"type": "string"}},
+            "required": ["key"],
+        },
+    },
+    {
+        "name": "browser_eval",
+        "description": "Run JS expression in Chromium page context.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"js": {"type": "string"}},
+            "required": ["js"],
+        },
+    },
+    {
+        "name": "task_complete",
+        "description": "Finish with answer.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+        },
+    },
+]
+
+
+def all_tool_descriptors() -> list[dict[str, Any]]:
+    """Desktop tools + AgentFlow API tools, in one flat list for the Anthropic API."""
+    return DESKTOP_TOOLS + AF_TOOL_DESCRIPTORS
+
+
+class ToolExecutor:
+    def __init__(
+        self,
+        last_cursor_ref: list[int],
+        af_client: AFClient | None = None,
+        pw: PlaywrightHost | None = None,
+    ) -> None:
+        self._cursor = last_cursor_ref
+        self._af = af_client
+        self._pw = pw or PlaywrightHost()
+
+    def execute(self, name: str, args: dict[str, Any]) -> tuple[str, dict[str, str] | None]:
+        # AgentFlow API tools
+        if name.startswith("af_"):
+            if self._af is None:
+                return json.dumps({"ok": False, "error": "no AF api key configured"}), None
+            return dispatch_af_tool(self._af, name, args), None
+
+        if name == "screen_capture":
+            return "screenshot", {"b64": jpeg_b64_full()}
+        if name == "screen_region":
+            return (
+                "region",
+                {"b64": jpeg_b64_region(args["x"], args["y"], args["width"], args["height"])},
+            )
+        if name == "mouse_click":
+            x, y = args["x"], args["y"]
+            mouse.click(x, y, args.get("button", "left"), clicks=args.get("clicks", 1))
+            self._cursor[:] = [x, y]
+            return f"clicked ({x},{y})", None
+        if name == "keyboard_type":
+            keyboard.type_text(args["text"])
+            return f"typed {len(args['text'])} chars", None
+        if name == "keyboard_shortcut":
+            keyboard.shortcut(args["combo"])
+            return f"pressed {args['combo']}", None
+        if name == "activate_app":
+            return app_activate(args["owner"]), None
+        if name == "window_list":
+            w = get_window_list()
+            return json.dumps({"count": len(w), "windows": w}, ensure_ascii=False), None
+        if name == "read_terminal":
+            return read_iterm_session(), None
+        if name == "chrome_open_url":
+            return chrome_open_url(args["url"], args.get("new_tab", True)), None
+        if name == "chrome_tabs":
+            return chrome_list_tabs(), None
+        if name == "chrome_eval":
+            return chrome_run_js(args["js"], args.get("tab_index")), None
+        if name == "clipboard_write":
+            asyncio.run(clipboard.write(args["text"]))
+            return "ok", None
+        if name == "clipboard_read":
+            return json.dumps(asyncio.run(clipboard.read()), ensure_ascii=False), None
+        if name == "wait":
+            time.sleep(min(float(args["seconds"]), 5))
+            return f"slept {args['seconds']}s", None
+        if name == "browser_open":
+            return self._pw.ensure(), None
+        if name == "browser_navigate":
+            return self._pw.navigate(args["url"]), None
+        if name == "browser_snapshot":
+            text, b64 = self._pw.snapshot()
+            return text, {"b64": b64}
+        if name == "browser_click":
+            return self._pw.click(args["selector"]), None
+        if name == "browser_fill":
+            return self._pw.fill(args["selector"], args["text"]), None
+        if name == "browser_press":
+            return self._pw.press(args["key"]), None
+        if name == "browser_eval":
+            return self._pw.eval_js(args["js"]), None
+        if name == "task_complete":
+            return "__DONE__", None
+        return f"unknown tool: {name}", None

@@ -1,10 +1,15 @@
 # agentflow-computer-mcp
 
-Local MCP server that lets AgentFlow's Eliza agents control your macOS desktop over a WebSocket reverse-tunnel.
+Local daemon that lets AgentFlow's Eliza agents — and a direct LLM driver — control your macOS desktop. The package ships two surfaces in one wheel.
 
-## What it does
+| Surface | Console script | Use |
+|---|---|---|
+| Single-process daemon | `agentflow-desktop` | HTTP viewer at http://localhost:8765 with chat input, MJPEG live stream, action log. Anthropic tool-use loop against your Mac + the AgentFlow REST API. |
+| MCP server | `agentflow-computer-mcp` | stdio for Claude Desktop / Cursor, or `ws` reverse-tunnel for the AgentFlow cloud. Scoped tools only. |
 
-Exposes scoped tools to an attached agent:
+## Tools exposed
+
+Mac control (both surfaces):
 
 - `computer.screen.capture(region?)` — PNG via Quartz, resized to 1280px wide
 - `computer.mouse.click/move/scroll`
@@ -16,30 +21,61 @@ Exposes scoped tools to an attached agent:
 
 Five paths can never be read or written, regardless of user scope: `~/.ssh`, `~/.config`, `~/Library/Keychains`, `~/.aws`, `~/.gnupg`.
 
+The `agentflow-desktop` daemon adds an extra layer for the local LLM loop:
+
+- `screen_capture`, `screen_region`, `mouse_click`, `keyboard_type`, `keyboard_shortcut`, `activate_app`, `window_list`, `read_terminal` — direct Mac control
+- `chrome_open_url`, `chrome_tabs`, `chrome_eval` — drive the user's real Google Chrome (uses their cookies) via AppleScript
+- `browser_open`, `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_fill`, `browser_press`, `browser_eval` — headed Playwright Chromium (separate from user's Chrome)
+- `clipboard_read`, `clipboard_write`, `wait`, `task_complete`
+- `af_*` — AgentFlow REST API (see below)
+
+### LLM-facing `af_*` tools
+
+| Tool | Wraps |
+|---|---|
+| `af_list_projects` / `af_get_project` / `af_create_project` / `af_approve_project` / `af_list_project_events` | `/_agents/me/projects/...` |
+| `af_list_devices` / `af_get_device` | `/_agents/me/devices/...` |
+| `af_list_agents` / `af_send_agent_message` | `/_agents/me/agents/...` |
+| `af_send_telegram_message` | `/_agents/me/telegram/send` |
+| `af_post_matrix_room` | `/_agents/me/matrix/send` |
+
+These run inline in the driver loop and let the LLM act on AgentFlow itself (create projects, ping agents, broadcast) without scripting curl. The system prompt advertises them so the model picks them up when a task is platform-side.
+
 ## Install
 
-From the AgentFlow cabinet at `https://agentflow.website/cabinet/devices`, click "Add device" — the modal prints a one-liner of the form:
+From the AgentFlow cabinet at `https://agentflow.website/cabinet/devices`, click "Add device" — the modal prints a one-liner:
 
 ```bash
 curl -sSL https://agentflow.website/install/computer-mcp.sh | \
   AF_KEY=<api-key> AF_DEVICE_TOKEN=<one-time-token> AF_DEVICE_ID=<uuid> bash
 ```
 
-The installer:
+The installer pip-installs the package, writes `~/.agentflow/auth.json` (mode 0600), drops a default `~/.agentflow/computer-scope.toml`, loads a launchd plist. After install you grant Accessibility + Screen Recording to your terminal in System Settings → Privacy & Security.
 
-1. `pip install --user` the package
-2. Writes `~/.agentflow/auth.json` (mode 0600) with your key + enrollment token
-3. Writes a default `~/.agentflow/computer-scope.toml`
-4. Drops a launchd plist into `~/Library/LaunchAgents/com.agentflow.computer-mcp.plist`
-5. Loads it via `launchctl`
+## Run
 
-After install you must grant Accessibility and Screen Recording permissions to your terminal / shell / python binary in System Settings → Privacy & Security.
-
-Start it:
+### `agentflow-desktop` — full daemon (local LLM loop)
 
 ```bash
-launchctl start com.agentflow.computer-mcp
-tail -f ~/Library/Logs/agentflow-computer-mcp.log
+agentflow-desktop run                                 # full daemon, port 8765
+agentflow-desktop run --port 9000 --fps 12            # custom viewer port + capture fps
+agentflow-desktop run --no-af-tools                   # hide af_* tools from the LLM
+agentflow-desktop drive "screen_capture, then window_list, summarize"
+agentflow-desktop tools                               # list LLM-facing tools
+agentflow-desktop health                              # probe Quartz capture + AF API
+agentflow-desktop version
+```
+
+API key resolution order: `--api-key` → `$AGENTFLOW_API_KEY` → `$AF_API_KEY` → `~/.agentflow/auth.json`.
+
+The viewer's preset library loads from `presets/desktop-tasks.yaml` (or `--presets path/to/file.yaml`). 16 tasks ship by default.
+
+### `agentflow-computer-mcp` — MCP server
+
+```bash
+agentflow-computer-mcp --version
+agentflow-computer-mcp --mode stdio   # MCP stdio (Claude Desktop / Cursor / Continue)
+agentflow-computer-mcp --mode ws      # reverse-tunnel to AgentFlow cloud (default in launchd)
 ```
 
 ## Auth
@@ -56,17 +92,17 @@ tail -f ~/Library/Logs/agentflow-computer-mcp.log
 }
 ```
 
-On first successful handshake the server returns `hello_ack` with a long-lived `device_secret`. The client persists it and drops the enrollment token.
+On first WS handshake the server returns `hello_ack` with a long-lived `device_secret`. The client persists it and drops the enrollment token.
 
-WebSocket headers on connect:
+WebSocket request headers:
 
-- `x-api-key`: AgentFlow API key
-- `x-device-id`: assigned by `POST /me/devices`
-- `x-device-secret` (after first connect) or `x-enrollment-token` (first connect only)
+- `x-api-key` — AgentFlow API key
+- `x-device-id` — UUID assigned at registration
+- `x-device-secret` after first connect, OR `x-enrollment-token` on first connect
 
-## Protocol
+## Protocol (MCP `ws` mode)
 
-JSON over WS:
+JSON over WebSocket:
 
 ```jsonc
 // server → client
@@ -97,27 +133,18 @@ max_actions_per_session = 50
 budget_usd = 2.0
 ```
 
-Hard rules (cannot be overridden by user config):
+Hard rules (config cannot override):
 
-- The five default deny_paths are always denied
+- The five default `deny_paths` are always denied
 - `fs.write` requires non-empty `allow_paths`
 - `shell.exec` requires non-empty `shell_whitelist`
 - Tools in `confirm_before` show a native macOS confirm dialog every call
-
-## Run manually
-
-```bash
-pip install -e .
-python -m agentflow_computer_mcp --version
-python -m agentflow_computer_mcp --mode stdio   # MCP stdio mode (for Claude Desktop etc.)
-python -m agentflow_computer_mcp --mode ws      # reverse-tunnel to AgentFlow
-```
 
 ## Dev
 
 ```bash
 pip install -e ".[dev]"
-pytest -v
+pytest -v          # 50 tests
 ruff check src tests
 ```
 

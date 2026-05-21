@@ -1,0 +1,95 @@
+# Preset task library for AgentFlow Desktop.
+# label  — chip text shown in the viewer UI (≤30 chars)
+# task   — the full instruction sent to the LLM driver.
+
+- label: "Screen + window report"
+  task: |
+    Сделай screen_capture, потом window_list. Сгруппируй окна по приложениям,
+    отметь какое окно сейчас в фокусе. Запиши markdown-отчёт в clipboard_write.
+    task_complete с двумя строками: focused app + общее число окон.
+
+- label: "HN top 5"
+  task: |
+    Открой headed Chromium на https://news.ycombinator.com, через browser_eval
+    достань top-5 постов из DOM (rank, title, host, score, comments). Сверстай
+    markdown-таблицу, положи её в clipboard_write. task_complete с краткой
+    сводкой (5 строк).
+
+- label: "GitHub trending"
+  task: |
+    browser_open → browser_navigate https://github.com/trending →
+    browser_eval достань top-10 репо с описанием и stars. Markdown в clipboard.
+    task_complete.
+
+- label: "Read iTerm"
+  task: |
+    read_terminal. Найди последний exit-code или ошибку. Если есть traceback —
+    сократи его до сути и положи в clipboard_write. task_complete с диагнозом
+    в 1-2 предложения.
+
+- label: "AF: list my projects"
+  task: |
+    Используй af_list_projects(limit=10). Сгруппируй по kind, посчитай статусы
+    (draft/active/preview). Markdown-таблицу в clipboard. task_complete.
+
+- label: "AF: list my devices"
+  task: |
+    Используй af_list_devices, перечисли все мои desktop-устройства с last_seen
+    и статусом. task_complete с компактным списком.
+
+- label: "AF: create landing"
+  task: |
+    af_create_project с brief: "Простой landing для моего пет-проекта по теме
+    локальный AI-агент на Mac. 1 экран, hero + 3 features + CTA waitlist."
+    Не approve. task_complete с id и slug проекта.
+
+- label: "AF: project status"
+  task: |
+    af_list_projects(limit=5) → возьми последний → af_list_project_events
+    (limit=10) → сжато перескажи последние 5 событий построчно. task_complete.
+
+- label: "Chrome tabs audit"
+  task: |
+    chrome_tabs. Сгруппируй tabs по доменам, отметь подозрительные (соцсети,
+    отвлекающие). Положи отчёт в clipboard_write. task_complete с числом
+    open tabs.
+
+- label: "Focus check"
+  task: |
+    activate_app("iTerm2"), wait 0.3, screen_region на окно iTerm.
+    Прочитай первые видимые строки, ответь — что сейчас делает пользователь?
+    task_complete с одной фразой.
+
+- label: "Compose tweet draft"
+  task: |
+    Подумай что я мог бы запостить про AgentFlow Desktop сегодня. Сформулируй
+    черновик ≤ 280 знаков, без эмодзи, без хайпа, без слов "really/simply/
+    actually/literally". clipboard_write → task_complete с самим черновиком.
+
+- label: "Idle - free RAM"
+  task: |
+    activate_app("Activity Monitor"), wait 0.6, screen_capture. Прочитай
+    значение Memory Pressure и Cached Files. task_complete с двумя числами.
+
+- label: "AF: ping agent"
+  task: |
+    af_list_agents(limit=5) → выбери первого → af_send_agent_message с текстом
+    "статус по проекту?". task_complete с id агента и его ответом (если был
+    синхронный) или подтверждением отправки.
+
+- label: "Mac uptime + cleanup"
+  task: |
+    activate_app("iTerm2"), wait 0.4, type "uptime && df -h /", press Return,
+    wait 1.5, read_terminal. Сжато перескажи. task_complete.
+
+- label: "Screenshot to clipboard"
+  task: |
+    screen_capture. Опиши что видишь в одном абзаце (≤500 знаков), положи
+    описание в clipboard_write. task_complete с описанием.
+
+- label: "Telegram broadcast (DRAFT)"
+  task: |
+    Сформулируй короткое уведомление мне в Telegram - "AgentFlow Desktop
+    запущен, могу слушать задачи". Подумай в text-блоке какой chat_id логичен
+    (если 1361064246 — это owner). af_send_telegram_message с chat_id=
+    "1361064246" и составленным текстом. task_complete.
