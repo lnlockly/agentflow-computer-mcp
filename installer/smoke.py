@@ -154,7 +154,67 @@ def check_auto_updater() -> None:
         fail("downloader called for an older release (should be skipped)")
     if result.get("status") != "current":
         fail(f"expected status=current, got {result!r}")
-    log(f"  ok — auto_updater stays put on {local_version} vs fake v0.0.1")
+    log(f"  ok -- auto_updater stays put on {local_version} vs fake v0.0.1")
+
+
+def check_os_aware_tool_filter() -> None:
+    """The driver builds the LLM tool catalog from the current host OS.
+    Mac-only tools must not leak onto Windows, and Windows-only tools must
+    not leak onto macOS — otherwise the agent will call commands the host
+    can't run.
+    """
+    log("os-aware tool filter: catalog respects current platform")
+    from unittest.mock import patch
+
+    from agentflow_computer_mcp.driver import desktop_tools
+
+    # Simulate a Windows host. PowerShell tool should be present; AppleScript
+    # tools (chrome_eval / chrome_tabs) should be filtered out.
+    with patch("agentflow_computer_mcp.driver.desktop_tools.platform.system", return_value="Windows"):
+        names = {t["name"] for t in desktop_tools.all_tool_descriptors()}
+        if "powershell_exec" not in names:
+            fail("powershell_exec missing from Windows tool catalog")
+        if "chrome_eval" in names:
+            fail("chrome_eval leaked into Windows tool catalog (mac-only)")
+        if "chrome_tabs" in names:
+            fail("chrome_tabs leaked into Windows tool catalog (mac-only)")
+
+    # Simulate a Mac host. AppleScript tools should be present; PowerShell
+    # tools should be filtered out.
+    with patch("agentflow_computer_mcp.driver.desktop_tools.platform.system", return_value="Darwin"):
+        names = {t["name"] for t in desktop_tools.all_tool_descriptors()}
+        if "chrome_eval" not in names:
+            fail("chrome_eval missing from macOS tool catalog")
+        if "powershell_exec" in names:
+            fail("powershell_exec leaked into macOS tool catalog (windows-only)")
+        if "winget_search" in names:
+            fail("winget_search leaked into macOS tool catalog (windows-only)")
+
+    # start_app + chrome_open_url are cross-platform — visible on both.
+    for sys_name in ("Darwin", "Windows", "Linux"):
+        with patch("agentflow_computer_mcp.driver.desktop_tools.platform.system", return_value=sys_name):
+            names = {t["name"] for t in desktop_tools.all_tool_descriptors()}
+            for cross in ("start_app", "chrome_open_url", "screen_capture", "browser_open"):
+                if cross not in names:
+                    fail(f"{cross} should be available on {sys_name}")
+
+    log("  ok — Windows hides AppleScript tools, macOS hides PowerShell tools")
+
+
+def check_os_aware_system_prompt() -> None:
+    """The driver loop injects the current host OS into the system prompt
+    so the LLM picks the right shell / clipboard / browser commands."""
+    log("os-aware system prompt: build_system_prompt includes host OS")
+    from agentflow_computer_mcp.driver.loop import HOST_OS, build_system_prompt
+
+    prompt = build_system_prompt("(no windows)", af_tools_present=False)
+    if "ОС хоста" not in prompt:
+        fail("system prompt missing host-OS context block")
+    if HOST_OS not in prompt:
+        fail(f"system prompt does not mention HOST_OS={HOST_OS!r}")
+    if "Codex" not in prompt:
+        fail("system prompt missing Codex / package-manager knowledge block")
+    log(f"  ok -- prompt declares host OS = {HOST_OS}")
 
 
 def main() -> None:
@@ -163,6 +223,8 @@ def main() -> None:
     check_auth_file_shape()
     check_daemon_entrypoint_imports()
     check_auto_updater()
+    check_os_aware_tool_filter()
+    check_os_aware_system_prompt()
     log("ALL GREEN")
 
 
