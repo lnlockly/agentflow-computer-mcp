@@ -1,0 +1,113 @@
+name: installer-e2e
+
+# End-to-end Windows install test. Builds the same setup .exe a release
+# would, then runs `installer/headless_install.py` against it — the
+# helper mimics clicking «Install» in the Tk wizard without bringing up
+# a desktop. The goal is to catch v0.3-style schtasks regressions
+# BEFORE they ship to users.
+
+on:
+  push:
+    paths:
+      - "installer/**"
+      - ".github/workflows/installer-e2e.yml"
+  workflow_dispatch:
+
+jobs:
+  e2e-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build deps + package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller pillow
+          python -m pip install -e .
+
+      - name: Build icon
+        run: python installer/make_icon.py
+
+      - name: Build setup.exe
+        run: pyinstaller installer/agentflow-setup.spec
+
+      - name: List artifacts
+        run: dir dist
+
+      - name: Headless install (runs the GUI's _run_install_steps without Tk)
+        shell: pwsh
+        env:
+          AF_SETUP_EXE_OVERRIDE: ${{ github.workspace }}\dist\agentflow-desktop-setup.exe
+          AF_INVITE_API_KEY: af_live_ci_placeholder
+          AF_INVITE_DEVICE_ID: 00000000-0000-0000-0000-000000000000
+          AF_INVITE_DEVICE_TOKEN: aft_ci_placeholder
+        run: |
+          python installer/headless_install.py
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "headless install failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
+
+      - name: Dump scheduled task XML (full)
+        shell: pwsh
+        run: |
+          schtasks /Query /TN AgentFlowDesktop /XML
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "schtasks /Query returned $LASTEXITCODE"
+            exit 1
+          }
+
+      - name: Assert <Command> points at installed daemon
+        shell: pwsh
+        run: |
+          $expected = Join-Path $env:LOCALAPPDATA "AgentFlow\agentflow-desktop.exe"
+          $xml = & schtasks /Query /TN AgentFlowDesktop /XML | Out-String
+          if (-not ($xml -like "*$expected*")) {
+            Write-Error "schtasks XML <Command> does not reference $expected"
+            Write-Output $xml
+            exit 1
+          }
+          Write-Output "OK: <Command> contains $expected"
+
+      - name: Verify daemon process spawned
+        shell: pwsh
+        run: |
+          # Give it 5s to boot — the daemon does a fair bit of import + WS setup.
+          Start-Sleep -Seconds 5
+          $procs = Get-Process -Name agentflow-desktop -ErrorAction SilentlyContinue
+          if (-not $procs) {
+            # Not strictly fatal — the daemon may be launching from the
+            # copied .exe under a different name. Be lenient: print
+            # everything matching agentflow* so the workflow log shows
+            # the truth, but only fail when there is NO match at all.
+            $any = Get-Process | Where-Object { $_.ProcessName -like "agentflow*" }
+            if (-not $any) {
+              Write-Error "no agentflow* process found after launch_daemon"
+              exit 1
+            }
+            Write-Output "found agentflow* processes (not exact name match):"
+            $any | Format-Table -AutoSize
+          } else {
+            Write-Output "agentflow-desktop running:"
+            $procs | Format-Table Id, ProcessName, StartTime -AutoSize
+          }
+
+      - name: Cleanup scheduled task
+        if: always()
+        shell: pwsh
+        run: |
+          schtasks /Delete /TN AgentFlowDesktop /F
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "schtasks /Delete returned $LASTEXITCODE (task may already be gone)"
+          }
+
+      - name: Cleanup daemon process
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process -Name agentflow-desktop -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Write-Output "done"

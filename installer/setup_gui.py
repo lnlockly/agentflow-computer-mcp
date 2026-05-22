@@ -180,7 +180,15 @@ def write_auth_file(creds: dict) -> Path:
 
 def _self_exe_path() -> Path:
     """Path to the currently running setup .exe (PyInstaller frozen) or
-    fallback to sys.executable + this script when running from source."""
+    fallback to sys.executable + this script when running from source.
+
+    Honors `AF_SETUP_EXE_OVERRIDE` so the CI headless e2e job can point at
+    the freshly built `dist/agentflow-desktop-setup.exe` without spawning
+    the Tk wizard. Production users never see this env var.
+    """
+    override = os.environ.get("AF_SETUP_EXE_OVERRIDE", "").strip()
+    if override:
+        return Path(override).resolve()
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve()
     # Dev mode — point at the .py file so smoke tests can still verify
@@ -302,6 +310,48 @@ def launch_daemon(executable: Path) -> None:
         close_fds=True,
         creationflags=creationflags,
     )
+
+
+def _run_install_steps(creds: dict, *, on_step=None) -> Path:
+    """Pure install logic — no Tk. Runs the same four steps the GUI's
+    Install button does:
+
+      1. copy this .exe to %LOCALAPPDATA%\\AgentFlow\\agentflow-desktop.exe
+      2. write %USERPROFILE%\\.agentflow\\auth.json
+      3. schtasks /Create /TN AgentFlowDesktop /XML
+      4. spawn the daemon
+
+    Returns the path to the installed daemon .exe so callers (CI / future
+    `--silent --invite=...` CLI) can verify the schtasks XML.
+
+    `on_step` is an optional callable that receives short progress strings
+    so the GUI can pipe them into its log view.
+    """
+
+    def _emit(msg: str) -> None:
+        if on_step is not None:
+            try:
+                on_step(msg)
+            except Exception:
+                pass
+
+    _emit("install_daemon_binary")
+    target = install_daemon_binary()
+    _emit(f"  → {target}")
+
+    _emit("write_auth_file")
+    auth_path = write_auth_file(creds)
+    _emit(f"  → {auth_path}")
+
+    _emit(f"register_scheduled_task ({TASK_NAME})")
+    register_scheduled_task(target)
+    _emit("  → task created")
+
+    _emit("launch_daemon")
+    launch_daemon(target)
+    _emit("  → spawned")
+
+    return target
 
 
 class SetupWindow:
@@ -525,20 +575,21 @@ class SetupWindow:
             self.log_queue.put("Шаг 1/4: проверяю invite-код")
             assert self.creds is not None
             self.log_queue.put(f"  → device_id={self.creds['device_id'][:18]}…")
-
-            self.log_queue.put("Шаг 2/4: копирую бинарь в %LOCALAPPDATA%")
-            target = install_daemon_binary()
-            self.log_queue.put(f"  → {target}")
-
-            self.log_queue.put("Шаг 3/4: сохраняю учётные данные")
-            auth_path = write_auth_file(self.creds)
             self.device_id = self.creds["device_id"]
-            self.log_queue.put(f"  → {auth_path}")
 
-            self.log_queue.put(f"Шаг 4/4: регистрирую автозапуск ({TASK_NAME})")
-            register_scheduled_task(target)
-            self.log_queue.put("  → задача создана, запускаю демон")
-            launch_daemon(target)
+            step_labels = {
+                "install_daemon_binary": "Шаг 2/4: копирую бинарь в %LOCALAPPDATA%",
+                "write_auth_file": "Шаг 3/4: сохраняю учётные данные",
+                f"register_scheduled_task ({TASK_NAME})": (
+                    f"Шаг 4/4: регистрирую автозапуск ({TASK_NAME})"
+                ),
+                "launch_daemon": "  → задача создана, запускаю демон",
+            }
+
+            def _bridge(msg: str) -> None:
+                self.log_queue.put(step_labels.get(msg, msg))
+
+            _run_install_steps(self.creds, on_step=_bridge)
 
             self.log_queue.put("Готово. Устройство онлайн.")
             self.root.after(0, self._on_success)
