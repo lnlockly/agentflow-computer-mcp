@@ -1,0 +1,53 @@
+name: release-installer
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller pillow
+          python -m pip install .
+
+      - name: Build icon
+        run: python installer/make_icon.py
+
+      - name: Build setup.exe
+        run: pyinstaller installer/agentflow-setup.spec
+
+      - name: List artifacts
+        run: dir dist
+
+      - name: Publish to tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/agentflow-desktop-setup.exe
+          fail_on_unmatched_files: true
+
+      - name: Publish to "latest" rolling release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: latest
+          files: dist/agentflow-desktop-setup.exe
+          fail_on_unmatched_files: true
+          prerelease: false
+          make_latest: false
