@@ -56,29 +56,42 @@ These run inline in the driver loop and let the LLM act on AgentFlow itself (cre
 
 ## Install
 
-From the AgentFlow cabinet at `https://agentflow.website/cabinet/devices`, click "Add device" — the modal prints a one-liner:
+From the AgentFlow cabinet at `https://agentflow.website/cabinet/devices`, click "Add device" — the modal prints the one-liner for the matching OS.
+
+### macOS
 
 ```bash
 curl -sSL https://agentflow.website/install/computer-mcp.sh | \
-  AF_KEY=<api-key> AF_DEVICE_TOKEN=<one-time-token> AF_DEVICE_ID=<uuid> bash
+  AF_KEY=<api-key> AF_DEVICE_ID=<uuid> AF_DEVICE_TOKEN=<one-time-token> bash
 ```
 
-The installer pip-installs the package, writes `~/.agentflow/auth.json` (mode 0600), drops a default `~/.agentflow/computer-scope.toml`, loads a launchd plist. After install you grant Accessibility + Screen Recording to your terminal in System Settings → Privacy & Security.
+Installs via pip-user, writes `~/.agentflow/auth.json` (mode 0600), drops a default `~/.agentflow/computer-scope.toml`, loads a launchd plist at `~/Library/LaunchAgents/com.agentflow.computer-mcp.plist`. After install, grant Accessibility + Screen Recording to your terminal in System Settings → Privacy & Security.
 
-### Linux / Windows installers
+### Linux (Debian/Ubuntu, Fedora, Arch)
 
 ```bash
-# Linux (Debian/Ubuntu) — same env vars, picks up wmctrl/xdotool/xclip, drops a systemd user unit
-curl -sSL https://agentflow.website/install/computer-mcp.sh | AF_KEY=... AF_DEVICE_TOKEN=... AF_DEVICE_ID=... bash
+curl -sSL https://agentflow.website/install/computer-mcp.sh | \
+  AF_KEY=<api-key> AF_DEVICE_ID=<uuid> AF_DEVICE_TOKEN=<token> bash
 ```
+
+Detects the package manager (apt / dnf / pacman), installs `wmctrl xdotool xclip xvfb` (and `grim wl-clipboard slurp` on Wayland), pip-installs the package, then drops a systemd user unit at `~/.config/systemd/user/agentflow-desktop.service` and enables it. Auth + scope live in `~/.agentflow/` with an XDG mirror at `~/.config/agentflow/`.
+
+### Windows (PowerShell)
 
 ```powershell
-# Windows — same env vars, registers a Task Scheduler entry
-$env:AF_KEY="..."; $env:AF_DEVICE_TOKEN="..."; $env:AF_DEVICE_ID="..."
-iwr https://agentflow.website/install/computer-mcp.ps1 -UseBasicParsing | iex
+$env:AF_KEY="..."; $env:AF_DEVICE_ID="..."; $env:AF_DEVICE_TOKEN="..."
+iwr -useb https://agentflow.website/install/computer-mcp.ps1 | iex
 ```
 
-Both wrappers live in `scripts/install.sh` and `scripts/install.ps1` of this repo. Matching `uninstall.sh` / `uninstall.ps1` remove the autostart unit and `~/.agentflow/auth.json`.
+For cmd.exe users:
+
+```bat
+curl -sSL https://agentflow.website/install/computer-mcp.bat -o install.bat && install.bat
+```
+
+Both pipe through PowerShell with `ExecutionPolicy Bypass`, pip-install the package, and register a Task Scheduler entry named `AgentFlowDesktop` that runs at logon.
+
+The canonical scripts are `install.sh` / `install.ps1` / `install.bat` at the repo root (and mirrored in `scripts/` for backward compat). Matching `scripts/uninstall.sh` / `scripts/uninstall.ps1` remove the autostart unit and `~/.agentflow/auth.json`.
 
 ## Run
 
