@@ -17,12 +17,39 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import fnmatch
 import json
 import os
+import secrets
 import sys
 import threading
 from pathlib import Path
 from typing import Any
+
+# Cookie-bearing domains the daemon must refuse to touch. Anything that
+# moves money or holds custody. Wildcard match via fnmatch.
+COOKIE_DENY_DOMAINS: tuple[str, ...] = (
+    "*.bank*",
+    "*bank*",
+    "*.kassa*",
+    "*kassa*",
+    "*.qiwi*",
+    "*qiwi*",
+    "*.binance.com",
+    "binance.com",
+    "*.coinbase.com",
+    "coinbase.com",
+    "*.cryptobot.live",
+    "cryptobot.live",
+    "paypal.*",
+    "*.paypal.com",
+    "paypal.com",
+)
+
+
+def _domain_is_denied(domain: str) -> bool:
+    d = domain.lower().lstrip(".")
+    return any(fnmatch.fnmatch(d, pat.lower()) for pat in COOKIE_DENY_DOMAINS)
 
 
 def _candidate_profile_roots() -> list[Path]:
@@ -203,6 +230,139 @@ class FirefoxHost:
 
         return self._submit(_e())
 
+    # --- Cookie tools ------------------------------------------------------
+    # The LLM never sees raw cookie values. `get_cookies` redacts long
+    # values and stashes the full record under an opaque token; the LLM
+    # passes the token back to `paste_cookie_into`, never the value.
+
+    def _cookie_store(self) -> dict[str, dict[str, Any]]:
+        if not hasattr(self, "_cookie_tokens"):
+            self._cookie_tokens: dict[str, dict[str, Any]] = {}
+        return self._cookie_tokens
+
+    @staticmethod
+    def _redact(value: str) -> str:
+        if value is None:
+            return ""
+        if len(value) <= 100:
+            return value
+        return f"<redacted {len(value)} chars>"
+
+    def get_cookies(self, domain: str) -> dict[str, Any]:
+        """Return cookies for `domain` from the user's profile. Raw values
+        stay in `_cookie_tokens`; only redacted summaries + opaque tokens
+        go to the LLM."""
+        if _domain_is_denied(domain):
+            return {"ok": False, "error": f"domain refused by deny-list: {domain}"}
+
+        self.ensure()
+        d = domain.lower().lstrip(".")
+        urls = [f"https://{d}/", f"https://www.{d}/"]
+
+        async def _g() -> list[dict[str, Any]]:
+            return await self._context.cookies(urls=urls)
+
+        try:
+            raw = self._submit(_g())
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"playwright cookies() failed: {exc}"}
+
+        store = self._cookie_store()
+        summary: list[dict[str, Any]] = []
+        tokens: list[str] = []
+        for c in raw:
+            tok = "t_" + secrets.token_hex(4)
+            store[tok] = {
+                "name": c.get("name", ""),
+                "value": c.get("value", ""),
+                "domain": c.get("domain", ""),
+                "path": c.get("path", "/"),
+                "secure": bool(c.get("secure", False)),
+                "http_only": bool(c.get("httpOnly", False)),
+                "expires": c.get("expires"),
+            }
+            tokens.append(tok)
+            summary.append(
+                {
+                    "token": tok,
+                    "name": c.get("name", ""),
+                    "domain": c.get("domain", ""),
+                    "path": c.get("path", "/"),
+                    "value_preview": self._redact(c.get("value", "") or ""),
+                    "secure": bool(c.get("secure", False)),
+                    "http_only": bool(c.get("httpOnly", False)),
+                    "expires": c.get("expires"),
+                }
+            )
+        return {"ok": True, "count": len(raw), "tokens": tokens, "cookies": summary}
+
+    def export_cookies_to(
+        self,
+        domain: str,
+        dest_field_selector: str,
+        fmt: str = "header",
+    ) -> dict[str, Any]:
+        """Grab `domain` cookies and paste them into `dest_field_selector`.
+        fmt: 'header' → `name=value; name=value`. 'netscape' → tab-separated
+        cookiejar lines (one cookie per line)."""
+        if _domain_is_denied(domain):
+            return {"ok": False, "error": f"domain refused by deny-list: {domain}"}
+
+        got = self.get_cookies(domain)
+        if not got.get("ok"):
+            return got
+        store = self._cookie_store()
+        items = [store[t] for t in got.get("tokens", []) if t in store]
+
+        if fmt == "netscape":
+            lines = []
+            for it in items:
+                expires = int(it.get("expires") or 0)
+                lines.append(
+                    "\t".join(
+                        [
+                            it["domain"],
+                            "TRUE",
+                            it["path"] or "/",
+                            "TRUE" if it.get("secure") else "FALSE",
+                            str(expires if expires > 0 else 0),
+                            it["name"],
+                            it["value"],
+                        ]
+                    )
+                )
+            payload = "\n".join(lines)
+        else:
+            payload = "; ".join(f"{it['name']}={it['value']}" for it in items)
+
+        self.ensure()
+
+        async def _fill() -> None:
+            await self._page.fill(dest_field_selector, payload, timeout=8000)
+
+        try:
+            self._submit(_fill())
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "ok": False,
+                "error": f"fill failed: {exc}",
+                "pasted": 0,
+                "skipped": len(items),
+            }
+        return {
+            "ok": True,
+            "pasted": len(items),
+            "skipped": 0,
+            "format": fmt,
+            "selector": dest_field_selector,
+        }
+
+    def drop_cookie_tokens(self) -> dict[str, Any]:
+        store = self._cookie_store()
+        n = len(store)
+        store.clear()
+        return {"ok": True, "dropped": n}
+
 
 # Tool descriptors mirror the Chromium browser_* surface 1:1 so the LLM
 # picks the prefix per intent: anon scraping → `browser_*`, logged-in
@@ -270,6 +430,50 @@ FIREFOX_TOOL_DESCRIPTORS: list[dict[str, Any]] = [
             "required": ["js"],
         },
     },
+    {
+        "name": "firefox_get_cookies",
+        "description": (
+            "Read cookies for a domain from the user's real Firefox profile. "
+            "Raw values stay in process memory; the LLM sees redacted previews "
+            "and opaque tokens that can be passed to firefox_export_cookies_to. "
+            "Refuses bank / payment / crypto-custody domains."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"domain": {"type": "string"}},
+            "required": ["domain"],
+        },
+    },
+    {
+        "name": "firefox_export_cookies_to",
+        "description": (
+            "Format the user's cookies for `domain` and paste them into a form "
+            "field selector inside the AgentFlow cabinet (or any other site). "
+            "A native macOS confirm dialog runs first. fmt='header' produces "
+            "`name=value; name=value`; fmt='netscape' produces a cookiejar."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "domain": {"type": "string"},
+                "dest_field_selector": {"type": "string"},
+                "fmt": {
+                    "type": "string",
+                    "enum": ["header", "netscape"],
+                    "default": "header",
+                },
+            },
+            "required": ["domain", "dest_field_selector"],
+        },
+    },
+    {
+        "name": "firefox_drop_cookie_tokens",
+        "description": (
+            "Flush the in-process cookie-token store. Call between tasks so "
+            "stale tokens never leak across user requests."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
 ]
 
 
@@ -294,4 +498,10 @@ def dispatch_firefox_tool(
         return host.press(args["key"]), None
     if name == "firefox_eval":
         return host.eval_js(args["js"]), None
+    if name == "firefox_get_cookies":
+        return json.dumps(host.get_cookies(args["domain"]), ensure_ascii=False), None
+    if name == "firefox_drop_cookie_tokens":
+        return json.dumps(host.drop_cookie_tokens(), ensure_ascii=False), None
+    # firefox_export_cookies_to is handled in the executor so it can fire
+    # the macOS confirm dialog before any cookie paste.
     return f"unknown firefox tool: {name}", None

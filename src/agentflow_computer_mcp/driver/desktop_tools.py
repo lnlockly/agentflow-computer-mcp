@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import io
 import json
 import subprocess
@@ -94,6 +95,11 @@ def app_activate(owner: str) -> str:
     out = backend.app_activate(owner)
     time.sleep(0.3)
     return out
+
+
+# TODO: chrome_get_cookies — read cookies from the user's real Chrome
+# profile via CDP (chrome.cookies). Mirror the Firefox cookie surface so
+# cookie-onboarding flows work for Chrome users too.
 
 
 def chrome_run_js(js: str, tab_index: int | None = None) -> str:
@@ -718,6 +724,26 @@ class ToolExecutor:
             return self._pw.press(args["key"]), None
         if name == "browser_eval":
             return self._pw.eval_js(args["js"]), None
+        if name == "firefox_export_cookies_to":
+            domain = args.get("domain", "")
+            selector = args.get("dest_field_selector", "")
+            summary = (
+                f"AgentFlow Desktop хочет вставить cookies для домена {domain!r} "
+                f"в форму {selector!r}."
+            )
+            if not self._confirm_blocking("computer.firefox.export_cookies", summary):
+                return json.dumps(
+                    {"ok": False, "error": "user denied firefox_export_cookies_to"}
+                ), None
+            try:
+                result = self._firefox.export_cookies_to(
+                    domain=domain,
+                    dest_field_selector=selector,
+                    fmt=args.get("fmt", "header"),
+                )
+                return json.dumps(result, ensure_ascii=False), None
+            except Exception as exc:  # noqa: BLE001
+                return json.dumps({"ok": False, "error": str(exc)}), None
         if name.startswith("firefox_"):
             try:
                 return dispatch_firefox_tool(self._firefox, name, args)
@@ -854,5 +880,9 @@ class ToolExecutor:
             except Exception as exc:  # noqa: BLE001
                 return json.dumps({"ok": False, "error": str(exc)}), None
         if name == "task_complete":
+            # Flush any cookie tokens we stashed so they don't leak across
+            # the next task. Best-effort — never block done.
+            with contextlib.suppress(Exception):
+                self._firefox.drop_cookie_tokens()
             return "__DONE__", None
         return f"unknown tool: {name}", None
