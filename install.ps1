@@ -80,22 +80,39 @@ budget_usd = 2.0
     Write-Host "[install] wrote default scope at $ScopePath"
 }
 
-# Find the entry-point script that pip --user dropped.
-$UserBase = & $PythonExe -c "import site; print(site.USER_BASE)"
-$Entrypoint = Join-Path $UserBase "Scripts\agentflow-desktop.exe"
-if (-not (Test-Path $Entrypoint)) {
-    $Entrypoint = Join-Path $UserBase "Scripts\agentflow-computer-mcp.exe"
-}
-if (-not (Test-Path $Entrypoint)) {
-    Write-Error "could not find AgentFlow Desktop entry point under $UserBase\Scripts"
-    exit 1
+# Locate the entry-point. `site.USER_BASE` returns empty on Windows
+# Store Python or with PYTHONNOUSERSITE set, which broke the install for
+# at least one early adopter (NULL Path → Join-Path crash). Try each
+# script dir Python knows about; if none has the .exe, fall back to
+# `python -m` which works regardless of where pip dropped the launcher.
+function Find-Scripts {
+    $candidates = @()
+    $userBase = & $PythonExe -c "import site; print(site.USER_BASE or '')" 2>$null
+    if ($userBase) { $candidates += (Join-Path $userBase 'Scripts') }
+    $userScripts = & $PythonExe -c "import sysconfig; print(sysconfig.get_path('scripts','nt_user') or '')" 2>$null
+    if ($userScripts) { $candidates += $userScripts }
+    $globalScripts = & $PythonExe -c "import sysconfig; print(sysconfig.get_path('scripts') or '')" 2>$null
+    if ($globalScripts) { $candidates += $globalScripts }
+    foreach ($dir in $candidates) {
+        $exe = Join-Path $dir 'agentflow-desktop.exe'
+        if (Test-Path $exe) { return $exe }
+        $exe = Join-Path $dir 'agentflow-computer-mcp.exe'
+        if (Test-Path $exe) { return $exe }
+    }
+    return $null
 }
 
+$Entrypoint = Find-Scripts
 $TaskName = "AgentFlowDesktop"
-$Args = "run"
-if ($Entrypoint -like "*agentflow-computer-mcp*") { $Args = "--mode ws" }
 
-$Action = New-ScheduledTaskAction -Execute $Entrypoint -Argument $Args
+if ($Entrypoint) {
+    $Args = "run"
+    if ($Entrypoint -like "*agentflow-computer-mcp*") { $Args = "--mode ws" }
+    $Action = New-ScheduledTaskAction -Execute $Entrypoint -Argument $Args
+} else {
+    Write-Host "[install] launcher .exe not visible — falling back to 'python -m agentflow_computer_mcp.desktop_cli'"
+    $Action = New-ScheduledTaskAction -Execute $PythonExe -Argument "-m agentflow_computer_mcp.desktop_cli run"
+}
 $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $Settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
