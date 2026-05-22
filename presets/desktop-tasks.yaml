@@ -87,6 +87,26 @@
     screen_capture. Опиши что видишь в одном абзаце (≤500 знаков), положи
     описание в clipboard_write. task_complete с описанием.
 
+- label: "Code review last commit"
+  task: |
+    code_run_command(cwd=$HOME, command="git log -1 --format='%h %s' && git show --stat HEAD")
+    в текущем репо где открыт редактор. Если cwd не известен — спроси через chrome_tabs /
+    read_terminal. Краткое резюме коммита + список изменённых файлов в clipboard_write.
+    task_complete.
+
+- label: "Add CI badge to README"
+  task: |
+    Найди README.md в текущем проекте (code_list_dir в $HOME с depth=2 чтобы выбрать),
+    прочитай через code_read_file. Если CI badge уже есть — task_complete с фразой
+    "badge present". Иначе code_edit_file с count=1, поставь badge сразу под заголовком.
+    task_complete с путём и diff-summary.
+
+- label: "Spawn AgentFlow project: <BRIEF>"
+  task: |
+    Замени <BRIEF> на реальный brief от юзера. af_spawn_subagent(brief="<BRIEF>",
+    kind="code_only"). Дождись возврата (≤60с), потом af_get_project_events(project_id=N,
+    limit=10). task_complete c project_id, slug, preview_url и тремя последними событиями.
+
 - label: "Telegram broadcast (DRAFT)"
   task: |
     Сформулируй короткое уведомление мне в Telegram - "AgentFlow Desktop
