@@ -17,7 +17,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from . import __version__
+from . import __version__, auto_updater
 from .config import load_auth, load_config
 from .driver import (
     AFClient,
@@ -162,6 +162,14 @@ def cmd_run(args: argparse.Namespace) -> int:
     bridge: tuple[threading.Thread, Any] | None = None
     if not args.no_ws:
         bridge = _start_ws_bridge(state, capture)
+
+    # Auto-update polling. Wrapped in a broad try/except so a flaky
+    # GitHub API can never take the daemon down.
+    if not getattr(args, "no_auto_update", False):
+        try:
+            auto_updater.start_in_background()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("auto-update: failed to start poller: %s", exc)
 
     selfmod_worker: SelfmodWorker | None = None
     if not args.no_selfmod:
@@ -449,6 +457,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=None,
         help="run `pip install --upgrade .` after a merge (else env SELFMOD_AUTOAPPLY)",
+    )
+    run.add_argument(
+        "--no-auto-update",
+        action="store_true",
+        help="disable the GitHub-releases auto-updater poller",
     )
     run.add_argument("--log-level", default="INFO")
     run.set_defaults(func=cmd_run)

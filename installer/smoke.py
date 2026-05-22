@@ -285,12 +285,62 @@ def check_autonomous_skeleton() -> None:
     log("  ok — autonomous skeleton wired end-to-end")
 
 
+def check_auto_updater() -> None:
+    """Verify the auto-update module imports + the no-op path runs.
+
+    The check_now() call is invoked with an injected fetch() that returns
+    a release OLDER than the current bundled version, so the updater MUST
+    NOT trigger a download. Any download attempt fails the smoke.
+    """
+    log("auto_updater: import + mocked older-release no-download path")
+    try:
+        from agentflow_computer_mcp import __version__ as local_version
+        from agentflow_computer_mcp.auto_updater import check_now
+    except Exception as exc:
+        fail(f"cannot import auto_updater: {exc}")
+
+    download_called = {"hit": False}
+
+    def fake_fetch() -> dict:
+        # Return a release tagged at v0.0.1 — older than anything we'd ship.
+        return {
+            "tag_name": "v0.0.1",
+            "body": "sha256: " + ("0" * 64),
+            "assets": [
+                {
+                    "name": "agentflow-desktop-setup.exe",
+                    "browser_download_url": "https://example.invalid/setup.exe",
+                }
+            ],
+        }
+
+    def fake_download(url: str, dest) -> None:  # noqa: ARG001, ANN001
+        download_called["hit"] = True
+        fail("auto_updater attempted a download for an older release")
+
+    def fake_apply(_path) -> None:  # noqa: ANN001
+        fail("auto_updater attempted to apply an older release")
+
+    result = check_now(
+        fetch=fake_fetch,
+        downloader=fake_download,
+        apply=fake_apply,
+        allow_unfrozen=True,
+    )
+    if download_called["hit"]:
+        fail("downloader called for an older release (should be skipped)")
+    if result.get("status") != "current":
+        fail(f"expected status=current, got {result!r}")
+    log(f"  ok — auto_updater stays put on {local_version} vs fake v0.0.1")
+
+
 def main() -> None:
     log("starting smoke for installer/setup_gui.py")
     check_invite_roundtrip()
     check_auth_file_shape()
     check_daemon_entrypoint_imports()
     check_autonomous_skeleton()
+    check_auto_updater()
     log("ALL GREEN")
 
 

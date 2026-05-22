@@ -90,12 +90,27 @@ jobs:
           }
           Write-Host "selftest passed"
 
+      - name: Compute sha256 for release body
+        # The auto-updater greps `sha256: <hex>` out of release notes to
+        # verify the download. Without this line in the body the updater
+        # refuses to apply the update (treated as untrusted blob).
+        id: sha
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Path dist/agentflow-desktop-setup.exe -Algorithm SHA256).Hash.ToLower()
+          Write-Host "sha256: $hash"
+          "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
       - name: Publish to tagged release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: dist/agentflow-desktop-setup.exe
           fail_on_unmatched_files: true
+          body: |
+            AgentFlow Desktop ${{ github.ref_name }}
+
+            sha256: ${{ steps.sha.outputs.sha256 }}
 
       - name: Publish to "latest" rolling release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -107,3 +122,7 @@ jobs:
           fail_on_unmatched_files: true
           prerelease: false
           make_latest: false
+          body: |
+            AgentFlow Desktop ${{ github.ref_name }}
+
+            sha256: ${{ steps.sha.outputs.sha256 }}

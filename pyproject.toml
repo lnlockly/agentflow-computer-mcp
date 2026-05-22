@@ -1,6 +1,6 @@
 [project]
 name = "agentflow-computer-mcp"
-version = "0.2.0"
+version = "0.4.3"
 description = "Local MCP server + desktop daemon for AgentFlow agents (macOS, Linux, Windows)"
 readme = "README.md"
 authors = [
