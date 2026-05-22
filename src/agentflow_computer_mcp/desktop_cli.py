@@ -26,11 +26,13 @@ from .driver import (
     PlaywrightHost,
     ToolExecutor,
     load_presets,
+    selfmod,
     start_viewer,
     task_worker,
 )
 from .driver.desktop_tools import grab_full_png
 from .driver.loop import DEFAULT_LLM_URL, DEFAULT_MODEL, run_task
+from .driver.selfmod_worker import SelfmodWorker
 
 log = logging.getLogger(__name__)
 
@@ -145,6 +147,14 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not args.no_ws:
         bridge = _start_ws_bridge(state, capture)
 
+    selfmod_worker: SelfmodWorker | None = None
+    if not args.no_selfmod:
+        selfmod_worker = SelfmodWorker(
+            automerge=args.selfmod_automerge,
+            autoapply=args.selfmod_autoapply,
+        )
+        selfmod_worker.start()
+
     print(
         f"\n{'=' * 70}\n"
         f"AgentFlow Desktop {__version__}\n"
@@ -190,6 +200,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             _, client = bridge
             with contextlib.suppress(Exception):
                 client.stop()
+        if selfmod_worker is not None:
+            selfmod_worker.stop()
     return 0
 
 
@@ -257,6 +269,32 @@ def cmd_selftest(_: argparse.Namespace) -> int:
     return 0 if failed == 0 else 1
 
 
+def cmd_selfmod(args: argparse.Namespace) -> int:
+    sub = args.selfmod_cmd
+    if sub == "list":
+        rows = selfmod.list_recent(limit=args.limit)
+        if not rows:
+            print("(no selfmod requests)")
+            return 0
+        for row in rows:
+            rid = row.get("request_id", "?")
+            status = row.get("status", "?")
+            reason = (row.get("reason") or "")[:60]
+            pr = row.get("pr_url") or ""
+            print(f"  {rid:18s}  {status:12s}  {reason}  {pr}")
+        return 0
+    if sub == "retry":
+        ok = selfmod.requeue(args.request_id)
+        print("requeued" if ok else "not found or already queued/in_progress")
+        return 0 if ok else 1
+    if sub == "cancel":
+        ok = selfmod.cancel(args.request_id)
+        print("cancelled" if ok else "not found or already running")
+        return 0 if ok else 1
+    print(f"unknown selfmod subcommand: {sub}", file=sys.stderr)
+    return 2
+
+
 def cmd_tools(args: argparse.Namespace) -> int:
     """List the tools the daemon exposes to the LLM."""
     from .driver.desktop_tools import all_tool_descriptors
@@ -315,6 +353,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="disable the cabinet WS reverse-tunnel (viewer/worker only)",
     )
+    run.add_argument(
+        "--no-selfmod",
+        action="store_true",
+        help="disable the self-modification worker",
+    )
+    run.add_argument(
+        "--selfmod-automerge",
+        action="store_true",
+        default=None,
+        help="auto-merge PRs opened by the selfmod worker (else env SELFMOD_AUTOMERGE)",
+    )
+    run.add_argument(
+        "--selfmod-autoapply",
+        action="store_true",
+        default=None,
+        help="run `pip install --upgrade .` after a merge (else env SELFMOD_AUTOAPPLY)",
+    )
     run.add_argument("--log-level", default="INFO")
     run.set_defaults(func=cmd_run)
 
@@ -337,6 +392,16 @@ def build_parser() -> argparse.ArgumentParser:
     health = sub.add_parser("health", help="probe capture + AF API")
     health.add_argument("--api-key", default=None)
     health.set_defaults(func=cmd_health)
+
+    sm = sub.add_parser("selfmod", help="inspect/manage the self-modification queue")
+    sm_sub = sm.add_subparsers(dest="selfmod_cmd", required=True)
+    sm_list = sm_sub.add_parser("list", help="show recent requests")
+    sm_list.add_argument("--limit", type=int, default=20)
+    sm_retry = sm_sub.add_parser("retry", help="re-dispatch a failed/rejected request")
+    sm_retry.add_argument("request_id")
+    sm_cancel = sm_sub.add_parser("cancel", help="remove a queued request")
+    sm_cancel.add_argument("request_id")
+    sm.set_defaults(func=cmd_selfmod)
 
     return p
 

@@ -169,6 +169,22 @@ Hard rules (config cannot override):
 - `shell.exec` requires non-empty `shell_whitelist`
 - Tools in `confirm_before` show a native macOS confirm dialog every call
 
+## Self-modification
+
+The daemon can request its own code to change via `selfmod_request_change`.
+Requests land in `~/.agentflow-desktop/selfmod-queue.jsonl`; a background
+worker spawns `claude -p` to drive the edit and open a PR. Both auto-merge
+and auto-`pip install --upgrade` are off by default.
+
+```bash
+agentflow-desktop selfmod list
+agentflow-desktop selfmod retry <request_id>
+agentflow-desktop selfmod cancel <request_id>
+agentflow-desktop run --selfmod-automerge --selfmod-autoapply
+```
+
+Full threat model + storage shape: [docs/SELFMOD.md](docs/SELFMOD.md).
+
 ## Dev
 
 ```bash
