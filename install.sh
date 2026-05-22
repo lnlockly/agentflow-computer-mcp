@@ -1,36 +1,69 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# AgentFlow Desktop — cross-platform installer (macOS + Linux).
+#
+# One-liner usage from the cabinet:
+#   curl -sSL https://agentflow.website/install/computer-mcp.sh | \
+#     AF_KEY=<key> AF_DEVICE_ID=<uuid> AF_DEVICE_TOKEN=<token> bash
+#
+# For Windows use install.ps1 (or install.bat for cmd.exe shells).
+
 set -euo pipefail
 
-# ---------------------------------------------------------------------------
-# AgentFlow Desktop installer — Mac + Linux
-# Required env vars: AF_KEY, AF_DEVICE_TOKEN, AF_DEVICE_ID
-# Optional env vars: AF_WS_URL, AF_PACKAGE_PATH
-# ---------------------------------------------------------------------------
-
-if [[ -z "${AF_KEY:-}" || -z "${AF_DEVICE_TOKEN:-}" || -z "${AF_DEVICE_ID:-}" ]]; then
-  echo "error: AF_KEY, AF_DEVICE_TOKEN, AF_DEVICE_ID env vars required" >&2
-  exit 1
-fi
-
-AF_WS_URL="${AF_WS_URL:-wss://agentflow.website/_agents/_devices/connect}"
 AF_DIR="${HOME}/.agentflow"
-LOG_DIR="${HOME}/Library/Logs"
+AF_CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/agentflow"
+AF_WS_URL="${AF_WS_URL:-wss://agentflow.website/_agents/_devices/connect}"
 
-mkdir -p "${AF_DIR}"
+log() { printf '[install] %s\n' "$*"; }
+fail() { printf '[install] error: %s\n' "$*" >&2; exit 1; }
 
-# ---------------------------------------------------------------------------
-# Install the Python package
-# ---------------------------------------------------------------------------
-if [[ -n "${AF_PACKAGE_PATH:-}" ]]; then
-  pip3 install --user --upgrade "${AF_PACKAGE_PATH}"
-else
-  pip3 install --user --upgrade "git+https://github.com/lnlockly/agentflow-computer-mcp.git"
-fi
+prompt_if_missing() {
+  local var="$1" prompt="$2" value=""
+  if [[ -z "${!var:-}" ]]; then
+    if [[ -t 0 || -r /dev/tty ]]; then
+      printf '%s: ' "$prompt" >&2
+      if [[ -r /dev/tty ]]; then
+        IFS= read -r value </dev/tty
+      else
+        IFS= read -r value
+      fi
+      printf -v "$var" '%s' "$value"
+      export "${var?}"
+    fi
+  fi
+  if [[ -z "${!var:-}" ]]; then
+    fail "$var is required (set env var or run from cabinet curl one-liner)"
+  fi
+}
 
-# ---------------------------------------------------------------------------
-# Write auth.json (mode 600)
-# ---------------------------------------------------------------------------
-cat > "${AF_DIR}/auth.json.tmp" <<EOF
+prompt_if_missing AF_KEY "AgentFlow API key (af_live_…)"
+prompt_if_missing AF_DEVICE_ID "Device ID (uuid from cabinet)"
+prompt_if_missing AF_DEVICE_TOKEN "One-time device token"
+
+mkdir -p "${AF_DIR}" "${AF_CONFIG_DIR}"
+
+install_pkg() {
+  local pip_target
+  if command -v pip3 >/dev/null 2>&1; then
+    pip_target="pip3"
+  elif command -v python3 >/dev/null 2>&1; then
+    pip_target="python3 -m pip"
+  else
+    fail "python3 not found on PATH; install Python 3.11+ first"
+  fi
+
+  if [[ -n "${AF_PACKAGE_PATH:-}" ]]; then
+    log "installing package from ${AF_PACKAGE_PATH}"
+    $pip_target install --user --upgrade "${AF_PACKAGE_PATH}"
+  else
+    log "installing agentflow-computer-mcp from GitHub"
+    $pip_target install --user --upgrade "git+https://github.com/lnlockly/agentflow-computer-mcp.git"
+  fi
+}
+
+write_auth() {
+  local target="${AF_DIR}/auth.json"
+  umask 077
+  cat > "${target}.tmp" <<EOF
 {
   "api_key": "${AF_KEY}",
   "device_id": "${AF_DEVICE_ID}",
@@ -39,13 +72,22 @@ cat > "${AF_DIR}/auth.json.tmp" <<EOF
   "ws_url": "${AF_WS_URL}"
 }
 EOF
-chmod 600 "${AF_DIR}/auth.json.tmp"
-mv "${AF_DIR}/auth.json.tmp" "${AF_DIR}/auth.json"
+  chmod 600 "${target}.tmp"
+  mv "${target}.tmp" "${target}"
+  log "wrote ${target}"
 
-# ---------------------------------------------------------------------------
-# Write default scope file if absent
-# ---------------------------------------------------------------------------
-if [[ ! -f "${AF_DIR}/computer-scope.toml" ]]; then
+  # XDG mirror so apps that look at $XDG_CONFIG_HOME find the same data.
+  if [[ "${AF_CONFIG_DIR}" != "${AF_DIR}" ]]; then
+    if [[ ! -e "${AF_CONFIG_DIR}/auth.json" && ! -L "${AF_CONFIG_DIR}/auth.json" ]]; then
+      ln -s "${target}" "${AF_CONFIG_DIR}/auth.json" 2>/dev/null || true
+    fi
+  fi
+}
+
+write_scope() {
+  if [[ -f "${AF_DIR}/computer-scope.toml" ]]; then
+    return
+  fi
   cat > "${AF_DIR}/computer-scope.toml" <<'EOF'
 allow_apps = []
 allow_paths = []
@@ -55,39 +97,64 @@ confirm_before = ["computer.fs.write", "computer.shell.exec"]
 max_actions_per_session = 50
 budget_usd = 2.0
 EOF
-fi
+  log "wrote default scope at ${AF_DIR}/computer-scope.toml"
+}
+
+success_banner() {
+  local url="https://agentflow.website/cabinet/devices/${AF_DEVICE_ID}/live"
+  cat <<EOF
+
+AgentFlow Desktop installed.
+
+  Cabinet:   ${url}
+  Auth file: ${AF_DIR}/auth.json
+  Scope:     ${AF_DIR}/computer-scope.toml
+
+EOF
+}
 
 # ---------------------------------------------------------------------------
-# Resolve entry-point binary
+# macOS
 # ---------------------------------------------------------------------------
-USER_BASE="$(python3 -m site --user-base)"
-ENTRYPOINT="${USER_BASE}/bin/agentflow-desktop"
-if [[ ! -f "${ENTRYPOINT}" ]]; then
-  # fallback: old package name
-  ENTRYPOINT="${USER_BASE}/bin/agentflow-computer-mcp"
-fi
 
-# ---------------------------------------------------------------------------
-# macOS — launchd user agent
-# ---------------------------------------------------------------------------
-if [[ "$(uname -s)" == "Darwin" ]]; then
-  mkdir -p "${LOG_DIR}"
-  LAUNCHD_DIR="${HOME}/Library/LaunchAgents"
-  mkdir -p "${LAUNCHD_DIR}"
-  PLIST_LABEL="com.agentflow.desktop"
-  PLIST_NAME="${PLIST_LABEL}.plist"
-  PLIST_PATH="${LAUNCHD_DIR}/${PLIST_NAME}"
+install_macos() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    if command -v brew >/dev/null 2>&1 && [[ -t 0 ]]; then
+      log "python3 missing — installing via Homebrew"
+      brew install python@3.11
+    else
+      fail "python3 not found; install via 'brew install python@3.11' or python.org"
+    fi
+  fi
 
-  cat > "${PLIST_PATH}" <<EOF
+  install_pkg
+  write_auth
+  write_scope
+
+  local log_dir="${HOME}/Library/Logs"
+  local launchd_dir="${HOME}/Library/LaunchAgents"
+  local plist_name="com.agentflow.computer-mcp.plist"
+  mkdir -p "${log_dir}" "${launchd_dir}"
+
+  local user_base entrypoint
+  user_base="$(python3 -m site --user-base)"
+  entrypoint="${user_base}/bin/agentflow-computer-mcp"
+
+  if [[ ! -x "${entrypoint}" ]]; then
+    fail "expected ${entrypoint} after pip install but it is not executable"
+  fi
+
+  cat > "${launchd_dir}/${plist_name}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>${PLIST_LABEL}</string>
+  <key>Label</key><string>com.agentflow.computer-mcp</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${ENTRYPOINT}</string>
-    <string>run</string>
+    <string>${entrypoint}</string>
+    <string>--mode</string>
+    <string>ws</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key>
@@ -98,118 +165,176 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   <key>ThrottleInterval</key><integer>10</integer>
   <key>ProcessType</key><string>Background</string>
   <key>LowPriorityIO</key><true/>
-  <key>StandardOutPath</key><string>${LOG_DIR}/agentflow-desktop.log</string>
-  <key>StandardErrorPath</key><string>${LOG_DIR}/agentflow-desktop.log</string>
+  <key>StandardOutPath</key><string>${log_dir}/agentflow-computer-mcp.log</string>
+  <key>StandardErrorPath</key><string>${log_dir}/agentflow-computer-mcp.log</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PATH</key><string>${USER_BASE}/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>PATH</key><string>${user_base}/bin:/usr/local/bin:/usr/bin:/bin</string>
     <key>HOME</key><string>${HOME}</string>
   </dict>
 </dict>
 </plist>
 EOF
 
-  # Validate the plist before registering it.
-  if ! plutil -lint "${PLIST_PATH}" > /dev/null 2>&1; then
-    echo "error: generated plist failed plutil -lint — aborting" >&2
-    exit 1
+  # Abort if the generated plist is malformed (catches quoting regressions).
+  if ! plutil -lint "${launchd_dir}/${plist_name}" >/dev/null 2>&1; then
+    fail "generated plist failed plutil -lint — aborting to avoid breaking launchd"
   fi
 
-  # Re-bootstrap the job (do NOT bootout — avoids permission prompts on re-install).
-  # launchctl bootstrap is idempotent: if already loaded it no-ops or bumps config.
-  LAUNCHCTL_UID="$(id -u)"
-  launchctl bootstrap "gui/${LAUNCHCTL_UID}" "${PLIST_PATH}" 2>/dev/null || \
-    launchctl kickstart -k "gui/${LAUNCHCTL_UID}/${PLIST_LABEL}" 2>/dev/null || \
-    true
+  launchctl unload "${launchd_dir}/${plist_name}" 2>/dev/null || true
+  launchctl load "${launchd_dir}/${plist_name}"
 
-  PYTHON_BIN="$(command -v python3)"
-  echo ""
-  echo "agentflow-desktop installed (macOS)."
-  echo ""
-  echo "Next steps:"
-  echo "  1. Open System Settings -> Privacy & Security"
-  echo "     - Accessibility: add your terminal and ${PYTHON_BIN}"
-  echo "     - Screen Recording: same"
-  echo "  2. Start now:"
-  echo "       launchctl start ${PLIST_LABEL}"
-  echo "  3. Tail logs:"
-  echo "       tail -f ${LOG_DIR}/agentflow-desktop.log"
-  echo "  4. Selftest:"
-  echo "       agentflow-desktop selftest"
-  echo "  5. The cabinet at https://agentflow.website/cabinet/devices should show your device online within 30s."
-  echo ""
+  success_banner
+  cat <<EOF
+Grant permissions:
+  System Settings -> Privacy & Security
+    Accessibility:    add Terminal / iTerm / the python binary
+    Screen Recording: same
 
-  # ---------------------------------------------------------------------------
-  # Selftest
-  # ---------------------------------------------------------------------------
-  if command -v agentflow-desktop &>/dev/null; then
-    echo "--- selftest ---"
+Logs:
+  tail -f ${log_dir}/agentflow-computer-mcp.log
+
+Selftest:
+  agentflow-desktop selftest
+EOF
+
+  if command -v agentflow-desktop >/dev/null 2>&1; then
+    log "running selftest..."
     if agentflow-desktop selftest; then
-      echo "selftest: PASS"
+      log "selftest: PASS"
     else
-      echo "selftest: FAIL (see above — grant Accessibility + Screen Recording and retry)"
+      log "selftest: FAIL — grant Accessibility + Screen Recording in System Settings, then retry"
     fi
   fi
-
-  exit 0
-fi
+}
 
 # ---------------------------------------------------------------------------
-# Linux — systemd user service
+# Linux
 # ---------------------------------------------------------------------------
-if [[ "$(uname -s)" == "Linux" ]]; then
-  SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
-  mkdir -p "${SYSTEMD_USER_DIR}"
-  SERVICE_FILE="${SYSTEMD_USER_DIR}/agentflow-desktop.service"
 
-  cat > "${SERVICE_FILE}" <<EOF
+linux_sudo() {
+  if [[ "${EUID}" -eq 0 ]]; then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    log "no sudo available; skipping: $*"
+    return 1
+  fi
+}
+
+install_linux_deps() {
+  local wayland=0
+  if [[ "${XDG_SESSION_TYPE:-}" == "wayland" || -n "${WAYLAND_DISPLAY:-}" ]]; then
+    wayland=1
+  fi
+
+  if command -v apt-get >/dev/null 2>&1; then
+    log "apt-get detected; installing wmctrl xdotool xclip xvfb"
+    linux_sudo apt-get update -y || true
+    linux_sudo apt-get install -y python3 python3-pip wmctrl xdotool xclip xvfb || true
+    if [[ "${wayland}" -eq 1 ]]; then
+      linux_sudo apt-get install -y grim wl-clipboard slurp || true
+    fi
+  elif command -v dnf >/dev/null 2>&1; then
+    log "dnf detected; installing wmctrl xdotool xclip"
+    linux_sudo dnf install -y python3 python3-pip wmctrl xdotool xclip || true
+    if [[ "${wayland}" -eq 1 ]]; then
+      linux_sudo dnf install -y grim wl-clipboard slurp || true
+    fi
+  elif command -v pacman >/dev/null 2>&1; then
+    log "pacman detected; installing wmctrl xdotool xclip"
+    linux_sudo pacman -Sy --noconfirm python python-pip wmctrl xdotool xclip || true
+    if [[ "${wayland}" -eq 1 ]]; then
+      linux_sudo pacman -Sy --noconfirm grim wl-clipboard slurp || true
+    fi
+  else
+    log "no known package manager (apt/dnf/pacman); ensure wmctrl xdotool xclip are installed"
+  fi
+}
+
+install_linux() {
+  install_linux_deps
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    fail "python3 not found after dependency install; install Python 3.11+ manually"
+  fi
+
+  install_pkg
+  write_auth
+  write_scope
+
+  local systemd_dir="${HOME}/.config/systemd/user"
+  mkdir -p "${systemd_dir}"
+
+  local user_base entrypoint
+  user_base="$(python3 -m site --user-base)"
+  entrypoint="${user_base}/bin/agentflow-computer-mcp"
+
+  if [[ ! -x "${entrypoint}" ]]; then
+    fail "expected ${entrypoint} after pip install but it is not executable"
+  fi
+
+  cat > "${systemd_dir}/agentflow-desktop.service" <<EOF
 [Unit]
 Description=AgentFlow Desktop daemon
-After=network.target
+After=network.target graphical-session.target
 
 [Service]
-ExecStart=${ENTRYPOINT} run
+Type=simple
+ExecStart=${entrypoint} --mode ws
 Restart=on-failure
 RestartSec=10
 StartLimitIntervalSec=0
-StandardOutput=journal
-StandardError=journal
+Environment=PATH=${user_base}/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=default.target
 EOF
 
-  systemctl --user daemon-reload
-  systemctl --user enable --now agentflow-desktop.service
-
-  # Enable linger so the user service survives across reboots without a login session.
-  CURRENT_USER="$(id -un)"
-  if loginctl enable-linger "${CURRENT_USER}" 2>/dev/null; then
-    echo "[linger] enabled for ${CURRENT_USER} — service will start at boot."
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user daemon-reload || true
+    systemctl --user enable --now agentflow-desktop.service || \
+      log "systemctl --user enable failed; start manually: systemctl --user start agentflow-desktop.service"
   else
-    echo "[hint] systemd-linger requires sudo on this distro."
-    echo "       Run: sudo loginctl enable-linger ${CURRENT_USER}"
-    echo "       Without it, the service starts only after you log in."
+    log "systemctl not available; start manually: ${entrypoint} --mode ws"
   fi
 
-  echo ""
-  echo "agentflow-desktop installed (Linux)."
-  echo "  Status:    systemctl --user status agentflow-desktop"
-  echo "  Logs:      journalctl --user -u agentflow-desktop -f"
-  echo "  Selftest:  agentflow-desktop selftest"
-  echo ""
-
-  if command -v agentflow-desktop &>/dev/null; then
-    echo "--- selftest ---"
-    if agentflow-desktop selftest; then
-      echo "selftest: PASS"
-    else
-      echo "selftest: FAIL"
-    fi
+  # Enable linger so the user service starts at boot (not just on first login).
+  local current_user
+  current_user="$(id -un)"
+  if loginctl enable-linger "${current_user}" 2>/dev/null; then
+    log "loginctl linger enabled for ${current_user} — service will start at system boot"
+  else
+    log "[hint] loginctl enable-linger requires sudo on this distro."
+    log "       Run: sudo loginctl enable-linger ${current_user}"
+    log "       Without linger the service only starts after you log in interactively."
   fi
 
-  exit 0
-fi
+  success_banner
+  cat <<EOF
+Service:
+  systemctl --user status agentflow-desktop.service
+  journalctl --user -u agentflow-desktop -f
+  agentflow-desktop selftest
+EOF
+}
 
-echo "unsupported OS: $(uname -s)" >&2
-exit 1
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+main() {
+  case "$(uname -s)" in
+    Darwin) install_macos ;;
+    Linux)  install_linux ;;
+    MINGW*|MSYS*|CYGWIN*)
+      fail "use install.ps1 on Windows (iwr -useb https://agentflow.website/install/computer-mcp.ps1 | iex)"
+      ;;
+    *)
+      fail "unsupported OS: $(uname -s)"
+      ;;
+  esac
+}
+
+main "$@"
