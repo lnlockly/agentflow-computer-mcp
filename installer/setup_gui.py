@@ -290,8 +290,8 @@ class SetupWindow:
         self.root = tk.Tk()
         self.root.title(WINDOW_TITLE)
         self.root.configure(bg=BG)
-        self.root.geometry("480x260")
-        self.root.minsize(480, 260)
+        self.root.geometry("520x440")
+        self.root.minsize(520, 440)
         self._build_styles()
         self._build_widgets()
         self.log_queue: queue.Queue[str] = queue.Queue()
@@ -396,6 +396,30 @@ class SetupWindow:
             _bind_paste_anywhere(entry)
             self.fields[key] = entry
 
+        # Live log — scrolling text + animated progressbar. The pip
+        # install warmup pulls the whole git history (~30-60s of silent
+        # work in the original GUI), which looked frozen. Now the bar
+        # spins, the latest 6 lines of pip output stream in real-time.
+        self.progressbar = ttk.Progressbar(
+            wrap, mode="indeterminate", length=100, style="AF.Horizontal.TProgressbar"
+        )
+        self.progressbar.pack(fill="x", pady=(8, 4))
+
+        self.log_view = tk.Text(
+            wrap,
+            height=6,
+            bg=FIELD_BG,
+            fg=MUTED,
+            insertbackground=FG,
+            relief="flat",
+            font=("Consolas", 8),
+            wrap="none",
+            state="disabled",
+        )
+        self.log_view.pack(fill="x", pady=(0, 6))
+        self.log_view.tag_configure("step", foreground=ACCENT, font=("Consolas", 8, "bold"))
+        self.log_view.tag_configure("dim", foreground=MUTED)
+
         bottom = tk.Frame(wrap, bg=BG)
         bottom.pack(fill="x", side="bottom", pady=(8, 0))
 
@@ -421,11 +445,11 @@ class SetupWindow:
         if self.adv_open:
             self.advanced_toggle.configure(text="▾ Расширенные настройки")
             self.advanced_frame.pack(fill="x", pady=(4, 0), after=self.advanced_toggle)
-            self.root.geometry("480x380")
+            self.root.geometry("520x540")
         else:
             self.advanced_toggle.configure(text="▸ Расширенные настройки")
             self.advanced_frame.pack_forget()
-            self.root.geometry("480x260")
+            self.root.geometry("520x440")
 
     def _collect_creds(self) -> dict:
         blob = self.invite.get("1.0", "end").strip()
@@ -443,7 +467,15 @@ class SetupWindow:
         return manual
 
     def _log(self, msg: str) -> None:
+        # short single-line summary at the bottom
         self.progress.configure(text=msg)
+        # full multi-line log above
+        self.log_view.configure(state="normal")
+        # Highlight step headers («Шаг N/4: ...») in accent colour.
+        is_step = msg.startswith("Шаг ")
+        self.log_view.insert("end", msg + "\n", "step" if is_step else "dim")
+        self.log_view.see("end")
+        self.log_view.configure(state="disabled")
         self.root.update_idletasks()
 
     def _drain_log_queue(self) -> None:
@@ -463,6 +495,7 @@ class SetupWindow:
             messagebox.showerror(WINDOW_TITLE, str(exc))
             return
         self.action_btn.state(["disabled"])
+        self.progressbar.start(12)  # animate the indeterminate bar
         self._log("Запуск установки…")
         self._install_thread = threading.Thread(target=self._install_worker, daemon=True)
         self._install_thread.start()
@@ -470,10 +503,11 @@ class SetupWindow:
 
     def _install_worker(self) -> None:
         try:
+            self.log_queue.put("Шаг 1/4: ищу Python")
             python_exe = find_python()
-            self.log_queue.put(f"Python: {python_exe}")
+            self.log_queue.put(f"  → {python_exe}")
 
-            self.log_queue.put("pip install agentflow-computer-mcp…")
+            self.log_queue.put("Шаг 2/4: качаю agentflow-computer-mcp с GitHub (≈30-60 сек)")
             proc = subprocess.Popen(
                 [
                     python_exe,
@@ -482,6 +516,9 @@ class SetupWindow:
                     "install",
                     "--user",
                     "--upgrade",
+                    "--progress-bar",
+                    "off",
+                    "--verbose",
                     PACKAGE_GIT_URL,
                 ],
                 stdout=subprocess.PIPE,
@@ -497,21 +534,26 @@ class SetupWindow:
                 if not line:
                     continue
                 last_line = line
-                self.log_queue.put(line[:180])
+                # Trim pip's noisy `Collecting / Downloading / Using cached`
+                # prefixes — keep the line readable in a 6-row log box.
+                short = line[:140]
+                self.log_queue.put(f"  · {short}")
             rc = proc.wait()
             if rc != 0:
                 raise RuntimeError(f"pip install failed (rc={rc}): {last_line}")
 
+            self.log_queue.put("Шаг 3/4: сохраняю учётные данные")
             assert self.creds is not None
             auth_path = write_auth_file(self.creds)
             self.device_id = self.creds["device_id"]
-            self.log_queue.put(f"Записан {auth_path}")
+            self.log_queue.put(f"  → {auth_path}")
 
             executable, args = locate_launcher(python_exe)
-            self.log_queue.put(f"Регистрирую задачу {TASK_NAME}…")
-            register_scheduled_task(executable, args)
+            self.log_queue.put(f"  → launcher: {executable}")
 
-            self.log_queue.put("Запускаю демон…")
+            self.log_queue.put(f"Шаг 4/4: регистрирую автозапуск ({TASK_NAME})")
+            register_scheduled_task(executable, args)
+            self.log_queue.put("  → задача создана, запускаю демон")
             launch_daemon(executable, args)
 
             self.log_queue.put("Готово. Устройство онлайн.")
@@ -523,11 +565,20 @@ class SetupWindow:
             self.root.after(0, lambda: self._on_failure(str(exc)))
 
     def _on_failure(self, msg: str) -> None:
+        try:
+            self.progressbar.stop()
+        except Exception:
+            pass
         self.action_btn.state(["!disabled"])
         self._log(f"Ошибка: {msg[:200]}")
         messagebox.showerror(WINDOW_TITLE, msg)
 
     def _on_success(self) -> None:
+        try:
+            self.progressbar.stop()
+            self.progressbar.configure(mode="determinate", value=100)
+        except Exception:
+            pass
         self.action_btn.configure(text="Открыть кабинет", command=self._open_cabinet)
         self.action_btn.state(["!disabled"])
         self._log("Установка завершена. Открой кабинет — устройство уже там.")
