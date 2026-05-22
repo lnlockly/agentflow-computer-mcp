@@ -40,6 +40,34 @@ jobs:
       - name: List artifacts
         run: dir dist
 
+      - name: Seed dummy creds for selftest
+        # selftest checks for auth.json + computer-scope.toml under
+        # %USERPROFILE%\.agentflow. On a fresh runner those don't
+        # exist, so we write minimal placeholders before invoking
+        # --selftest. The values are bogus on purpose — selftest
+        # only verifies the files PARSE, never makes a real call.
+        shell: pwsh
+        run: |
+          $afDir = Join-Path $env:USERPROFILE ".agentflow"
+          New-Item -ItemType Directory -Force -Path $afDir | Out-Null
+          $auth = @{
+            api_key          = "af_live_ci_placeholder"
+            device_id        = "00000000-0000-0000-0000-000000000000"
+            enrollment_token = "aft_ci_placeholder"
+            device_secret    = ""
+            ws_url           = "wss://agentflow.website/_agents/_devices/connect"
+          } | ConvertTo-Json
+          Set-Content -Path (Join-Path $afDir "auth.json") -Value $auth -Encoding UTF8
+          @"
+          allow_apps = []
+          allow_paths = []
+          deny_paths = []
+          shell_whitelist = []
+          confirm_before = ["computer.fs.write", "computer.shell.exec"]
+          max_actions_per_session = 50
+          budget_usd = 2.0
+          "@ | Set-Content -Path (Join-Path $afDir "computer-scope.toml") -Encoding UTF8
+
       - name: Self-test — bundled daemon must boot
         # Runs the artifact itself in --daemon --selftest mode. This
         # catches PyInstaller `collect_all` misses (missing hidden
