@@ -50,8 +50,27 @@ class AppConfig:
 def load_scope(path: Path = SCOPE_FILE) -> Scope:
     if not path.exists():
         return Scope()
-    with path.open("rb") as fp:
-        raw = tomllib.load(fp)
+    # The v0.3.x install.ps1 wrote computer-scope.toml via PowerShell's
+    # `Set-Content -Encoding UTF8`, which adds a UTF-8 BOM by default.
+    # tomllib chokes on the BOM with «Invalid statement (at line 1,
+    # column 1)» — the daemon then crashes on every boot. Strip the
+    # BOM + any leading whitespace before parsing, and on any remaining
+    # parse error fall through to defaults instead of taking down the
+    # daemon (user can delete the file and the GUI will write a clean
+    # one).
+    content = path.read_bytes()
+    if content.startswith(b"\xef\xbb\xbf"):
+        content = content[3:]
+    text = content.decode("utf-8", "replace").lstrip()
+    try:
+        raw = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        print(
+            f"[config] WARNING: {path} is not valid TOML ({exc}); "
+            "using default scope. Delete the file to clear this warning.",
+            flush=True,
+        )
+        raw = {}
 
     user_deny = tuple(raw.get("deny_paths", ()))
     merged_deny = tuple(dict.fromkeys((*HARD_DENY_PATHS, *user_deny)))
