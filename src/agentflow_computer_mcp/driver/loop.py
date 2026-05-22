@@ -80,6 +80,10 @@ def build_system_prompt(window_summary: str, af_tools_present: bool) -> str:
             "  • af_send_telegram_message(chat_id, text) — отправить TG-сообщение через MCP.\n"
             "      chat_id='me' → Saved Messages. chat_id='1361064246' → owner.\n"
             "  • af_post_matrix_room(room_id, text) — Matrix-сообщение через MCP.\n"
+            "  • af_recall(tags=[...], limit=20) — на старте задачи вспомни уроки прошлых "
+            "прогонов в этом домене (kwork, mail, captcha). Newest-first.\n"
+            "  • af_remember(kind='lesson'|'observation'|'fact', text=..., tags=[...]) — "
+            "в конце задачи запиши что сработало / что нет.\n"
         )
 
     # Concrete mapping from common user phrases to the right tool. The model
@@ -94,8 +98,11 @@ def build_system_prompt(window_summary: str, af_tools_present: bool) -> str:
         "  • «напиши в TG юзеру X / chat_id N» → af_send_telegram_message(chat_id=N, text=...).\n"
         "  • «напиши в Matrix / в комнату X» → af_post_matrix_room(room_id=..., text=...).\n"
         f"{_OS_INTENT_BLOCK[_current_os()]}"
-        "  • «открой kwork / kwork.ru / посмотри заказы на kwork» → browser_open → "
-        "browser_navigate https://kwork.ru/projects → browser_snapshot → browser_eval для DOM-извлечения.\n"
+        "  • «открой kwork / kwork.ru / посмотри заказы на kwork / посмотри письма в браузере / "
+        "открой Firefox / Telegram Web» → firefox_open → firefox_navigate <url> → "
+        "firefox_snapshot → firefox_eval. firefox_* запускает РЕАЛЬНЫЙ Firefox юзера с его "
+        "профилем — он уже залогинен в kwork / TG Web / mail. browser_* (headed Chromium) — "
+        "только для анонимного скрейпа.\n"
         "  • «открой документ X / напиши в файл» → fs.write (с подтверждением), либо открой через "
         "activate_app соответствующего редактора, потом keypress/type.\n"
         "  • «прочитай экран / что сейчас открыто» → screen_capture + краткое описание.\n"
@@ -121,6 +128,16 @@ def build_system_prompt(window_summary: str, af_tools_present: bool) -> str:
         "пиши руками на десктопе.\n"
     )
 
+    memory_block = ""
+    if af_tools_present:
+        memory_block = (
+            "\nПамять задач (af_remember / af_recall):\n"
+            "  • На старте долгой/повторяющейся задачи (kwork, mail, captcha-обходы) — "
+            "af_recall(tags=['<domain>']) и прочти 5-10 свежих lessons.\n"
+            "  • В конце задачи — af_remember(kind='lesson', tags=['<domain>', '<action>'], "
+            "text='короткое утверждение: что сделал и что узнал'). Тэги — короткие, в нижнем регистре.\n"
+        )
+
     visibility_block = (
         "\nВизуализация для юзера:\n"
         "  • Перед каждым tool_use делай text-блок с одной строкой что ты сейчас будешь делать "
@@ -144,6 +161,7 @@ def build_system_prompt(window_summary: str, af_tools_present: bool) -> str:
         "Google Chrome с его сессией.\n"
         f"{af_block}"
         f"{intent_map}"
+        f"{memory_block}"
         f"{coding_workflow}"
         f"{visibility_block}"
         "Scope hard rules: paths `~/.ssh`, `~/.config`, `~/Library/Keychains`, `~/.aws`, `~/.gnupg` всегда запрещены "

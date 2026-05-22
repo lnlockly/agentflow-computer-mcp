@@ -24,6 +24,11 @@ from ..scope import requires_confirm
 from ..tools import clipboard, keyboard, mouse, screen, window
 from ..tools import code as code_tool
 from .af_client import AF_TOOL_DESCRIPTORS, AFClient, dispatch_af_tool
+from .firefox import (
+    FIREFOX_TOOL_DESCRIPTORS,
+    FirefoxHost,
+    dispatch_firefox_tool,
+)
 
 NOISY_OWNERS: frozenset[str] = frozenset(
     {
@@ -569,8 +574,8 @@ DESKTOP_TOOLS: list[dict[str, Any]] = [
 
 
 def all_tool_descriptors() -> list[dict[str, Any]]:
-    """Desktop tools + AgentFlow API tools, in one flat list for the Anthropic API."""
-    return DESKTOP_TOOLS + AF_TOOL_DESCRIPTORS
+    """Desktop tools + Firefox tools + AgentFlow API tools, in one flat list for the Anthropic API."""
+    return DESKTOP_TOOLS + FIREFOX_TOOL_DESCRIPTORS + AF_TOOL_DESCRIPTORS
 
 
 class ToolExecutor:
@@ -579,12 +584,17 @@ class ToolExecutor:
         last_cursor_ref: list[int],
         af_client: AFClient | None = None,
         pw: PlaywrightHost | None = None,
+        firefox: FirefoxHost | None = None,
         scope: Scope | None = None,
         state: Any = None,
     ) -> None:
         self._cursor = last_cursor_ref
         self._af = af_client
         self._pw = pw or PlaywrightHost()
+        # Firefox attaches to the user's real profile so logged-in sites
+        # (kwork, TG Web, mail) just work without re-auth. Lazy-init via
+        # firefox_open so a missing profile doesn't crash the daemon.
+        self._firefox = firefox or FirefoxHost()
         self._scope = scope if scope is not None else load_scope()
         # Optional DriverState reference for emitting "task_action" frames
         # BEFORE long-running code tool dispatch so the cabinet timeline
@@ -672,6 +682,11 @@ class ToolExecutor:
             return self._pw.press(args["key"]), None
         if name == "browser_eval":
             return self._pw.eval_js(args["js"]), None
+        if name.startswith("firefox_"):
+            try:
+                return dispatch_firefox_tool(self._firefox, name, args)
+            except Exception as exc:  # noqa: BLE001 — surface as tool_result, never crash the loop
+                return f"firefox error: {exc}", None
         if name == "selfmod_request_change":
             from . import selfmod
 

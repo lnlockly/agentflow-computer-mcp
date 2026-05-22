@@ -47,6 +47,17 @@ def _resolve_api_key(cli_value: str | None) -> str:
     return auth.api_key or ""
 
 
+def _resolve_device_id() -> str | None:
+    """Read the enrolled device UUID from ~/.agentflow/auth.json. Used as the
+    default for af_remember / af_recall so the LLM can omit the device_id arg.
+    Returns None if no auth file exists or the field is empty."""
+    env = os.environ.get("AGENTFLOW_DEVICE_ID")
+    if env:
+        return env
+    auth = load_auth()
+    return auth.device_id or None
+
+
 def _start_ws_bridge(
     state: DriverState,
     capture: CaptureLoop,
@@ -171,7 +182,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         flush=True,
     )
 
-    af = AFClient(api_key) if not args.no_af_tools else None
+    af = (
+        AFClient(api_key, device_id=_resolve_device_id())
+        if not args.no_af_tools
+        else None
+    )
     executor = ToolExecutor(state.last_cursor, af_client=af, pw=PlaywrightHost(), state=state)
 
     shutdown = threading.Event()
@@ -222,7 +237,11 @@ def cmd_drive(args: argparse.Namespace) -> int:
         return 2
 
     state = DriverState()
-    af = AFClient(api_key) if not args.no_af_tools else None
+    af = (
+        AFClient(api_key, device_id=_resolve_device_id())
+        if not args.no_af_tools
+        else None
+    )
     executor = ToolExecutor(state.last_cursor, af_client=af, pw=PlaywrightHost(), state=state)
     answer = run_task(args.task, state, executor, api_key, llm_url=args.llm_url, model=args.model)
     print(answer)
