@@ -14,6 +14,7 @@ from .tools import fs as fs_tool
 from .tools import keyboard as keyboard_tool
 from .tools import mouse as mouse_tool
 from .tools import screen as screen_tool
+from .tools import screen_record as screen_record_tool
 from .tools import shell as shell_tool
 from .tools import window as window_tool
 
@@ -41,6 +42,9 @@ TOOL_NAMES: list[str] = [
     "computer.code.edit_file",
     "computer.code.run_command",
     "computer.code.list_dir",
+    "computer.screen_record.start",
+    "computer.screen_record.stop",
+    "computer.screen_record.status",
 ]
 
 
@@ -159,6 +163,25 @@ def build_mcp(config: AppConfig) -> FastMCP:
             path, scope=config.scope, depth=depth, ignore_globs=ignore_globs
         )
 
+    @mcp.tool(name="computer.screen_record.start")
+    def screen_record_start(
+        path: str,
+        fps: int = 10,
+        width_cap: int = 1280,
+        max_duration_s: int = 120,
+    ) -> dict[str, Any]:
+        return screen_record_tool.get_recorder().start(
+            path, fps=fps, width_cap=width_cap, max_duration_s=max_duration_s
+        )
+
+    @mcp.tool(name="computer.screen_record.stop")
+    def screen_record_stop() -> dict[str, Any]:
+        return screen_record_tool.get_recorder().stop()
+
+    @mcp.tool(name="computer.screen_record.status")
+    def screen_record_status() -> dict[str, Any]:
+        return screen_record_tool.get_recorder().status()
+
     return mcp
 
 
@@ -257,6 +280,17 @@ async def _dispatch_tool(name: str, args: dict[str, Any], config: AppConfig) -> 
             depth=int(args.get("depth", 1)),
             ignore_globs=args.get("ignore_globs"),
         )
+    if name == "computer.screen_record.start":
+        return screen_record_tool.get_recorder().start(
+            args["path"],
+            fps=int(args.get("fps", 10)),
+            width_cap=int(args.get("width_cap", 1280)),
+            max_duration_s=int(args.get("max_duration_s", 120)),
+        )
+    if name == "computer.screen_record.stop":
+        return screen_record_tool.get_recorder().stop()
+    if name == "computer.screen_record.status":
+        return screen_record_tool.get_recorder().status()
     raise LookupError(f"unknown tool: {name}")
 
 

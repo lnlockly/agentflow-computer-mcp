@@ -23,6 +23,7 @@ from ..platform import PLATFORM, backend
 from ..scope import requires_confirm
 from ..tools import clipboard, keyboard, mouse, screen, window
 from ..tools import code as code_tool
+from ..tools import screen_record as screen_record_tool
 from .af_client import AF_TOOL_DESCRIPTORS, AFClient, dispatch_af_tool
 from .firefox import (
     FIREFOX_TOOL_DESCRIPTORS,
@@ -562,6 +563,41 @@ DESKTOP_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "screen_record_start",
+        "description": (
+            "Start recording a short screen-video to a local .mp4 file. "
+            "Use ONLY when the user explicitly asks for a video / clip / запись экрана. "
+            "Path must live under ~/Movies, ~/tmp, ~/Downloads, or a recordings/ subdir. "
+            "Auto-stops at max_duration_s (default 120s) so a forgotten stop can't fill the disk."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "fps": {"type": "integer", "default": 10},
+                "width_cap": {"type": "integer", "default": 1280},
+                "max_duration_s": {"type": "integer", "default": 120},
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "screen_record_stop",
+        "description": (
+            "Stop the current screen recording. Returns final path, duration_ms, "
+            "and file_bytes. Call right after the demoed action completes."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "screen_record_status",
+        "description": (
+            "Check whether a recording is currently active and how many frames "
+            "have been written so far."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "task_complete",
         "description": "Finish with answer.",
         "input_schema": {
@@ -781,6 +817,40 @@ class ToolExecutor:
                     ignore_globs=args.get("ignore_globs"),
                 )
                 return json.dumps(result, ensure_ascii=False)[:4000], None
+            except Exception as exc:  # noqa: BLE001
+                return json.dumps({"ok": False, "error": str(exc)}), None
+        if name == "screen_record_start":
+            path_arg = args.get("path", "")
+            fps = int(args.get("fps", 10))
+            self._announce(
+                "screen_record_start", f"path={path_arg} fps={fps}"
+            )
+            try:
+                result = screen_record_tool.get_recorder().start(
+                    path_arg,
+                    fps=fps,
+                    width_cap=int(args.get("width_cap", 1280)),
+                    max_duration_s=int(args.get("max_duration_s", 120)),
+                )
+                return json.dumps(result, ensure_ascii=False), None
+            except Exception as exc:  # noqa: BLE001
+                return json.dumps({"ok": False, "error": str(exc)}), None
+        if name == "screen_record_stop":
+            try:
+                result = screen_record_tool.get_recorder().stop()
+            except Exception as exc:  # noqa: BLE001
+                return json.dumps({"ok": False, "error": str(exc)}), None
+            detail = (
+                f"path={result.get('path')} "
+                f"duration_ms={result.get('duration_ms')} "
+                f"bytes={result.get('file_bytes')}"
+            )
+            self._announce("screen_record_stop", detail)
+            return json.dumps(result, ensure_ascii=False), None
+        if name == "screen_record_status":
+            try:
+                result = screen_record_tool.get_recorder().status()
+                return json.dumps(result, ensure_ascii=False), None
             except Exception as exc:  # noqa: BLE001
                 return json.dumps({"ok": False, "error": str(exc)}), None
         if name == "task_complete":
