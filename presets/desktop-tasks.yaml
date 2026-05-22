@@ -113,3 +113,28 @@
     запущен, могу слушать задачи". Подумай в text-блоке какой chat_id логичен
     (если 1361064246 — это owner). af_send_telegram_message с chat_id=
     "1361064246" и составленным текстом. task_complete.
+
+- label: "Иди зарабатывай (kwork)"
+  task: |
+    Цикл по поиску оплачиваемых заказов на kwork. Юзер уже залогинен в
+    Firefox — используй firefox_*, не browser_*.
+
+    1. af_recall(tags=['kwork','earn'], limit=20) — вытащи lessons прошлых
+       прогонов. Если есть — учитывай (какие категории отвечают лучше,
+       какие шаблоны офферов сработали).
+    2. firefox_open → firefox_navigate https://kwork.ru/projects.
+    3. firefox_eval — достань первые 5 свежих заказов: title, budget,
+       deadline, url. JSON-массив.
+    4. Для каждого заказа в text-блоке оцени: могу ли я реально это
+       сделать (no если требует физического присутствия / лицензии /
+       долгого ресёрча).
+    5. Для каждого "да": firefox_navigate на страницу заказа →
+       firefox_click "ответить" (или подходящий селектор) →
+       составь оффер 2-3 фразы без штампов, без слов
+       "really/simply/actually/literally" → firefox_fill в textarea →
+       firefox_click "Отправить".
+    6. После каждого отправленного оффера: af_remember(kind='lesson',
+       tags=['kwork','offer'], text='отправил оффер на <project_id>:
+       <короткий тейк-эвей что сработало в копи или что не сработало>').
+    7. task_complete со списком отправленных офферов (id + краткий
+       summary каждого).

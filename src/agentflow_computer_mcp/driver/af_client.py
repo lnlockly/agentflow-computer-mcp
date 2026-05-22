@@ -25,12 +25,26 @@ class AFResponse:
 
 
 class AFClient:
-    def __init__(self, api_key: str, base: str = DEFAULT_BASE, timeout_s: int = 30) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        base: str = DEFAULT_BASE,
+        timeout_s: int = 30,
+        device_id: str | None = None,
+    ) -> None:
         if not api_key:
             raise ValueError("AFClient requires an API key (af_live_*)")
         self._key = api_key
         self._base = base.rstrip("/")
         self._timeout = timeout_s
+        # Default device id used by af_remember / af_recall when the LLM
+        # doesn't pass one. Resolved from ~/.agentflow/auth.json at daemon
+        # startup by the desktop_cli wiring.
+        self._device_id = device_id
+
+    @property
+    def device_id(self) -> str | None:
+        return self._device_id
 
     def _req(
         self,
@@ -198,6 +212,41 @@ class AFClient:
             "POST", "/me/matrix/send", body={"room_id": room_id, "text": text}
         )
 
+    # --- Per-device memory log (af_remember / af_recall) -------------------
+
+    def remember(
+        self,
+        device_id: str,
+        kind: str,
+        text: str,
+        tags: list[str] | None = None,
+    ) -> AFResponse:
+        """Append one memory row for a device. `kind` is one of
+        'observation' | 'lesson' | 'fact'. The autonomous loop calls this
+        at task end so the next task can recall lessons by tag."""
+        body: dict[str, Any] = {"kind": kind, "text": text}
+        if tags:
+            body["tags"] = tags
+        return self._req("POST", f"/me/devices/{device_id}/memories", body=body)
+
+    def recall(
+        self,
+        device_id: str,
+        tags: list[str] | None = None,
+        limit: int = 50,
+        kind: str | None = None,
+    ) -> AFResponse:
+        """Fetch the newest memories for a device. `tags` is OR-matched
+        (any overlap wins). `kind` filters by row kind when set."""
+        params: dict[str, str] = {"limit": str(limit)}
+        if tags:
+            params["tags"] = ",".join(tags)
+        if kind:
+            params["kind"] = kind
+        return self._req(
+            "GET", f"/me/devices/{device_id}/memories", params=params
+        )
+
     # --- User-editable skills (cabinet → daemon system prompt) ------------
 
     def get_skills_prompt_block(self, device_id: str | None = None) -> AFResponse:
@@ -355,6 +404,71 @@ AF_TOOL_DESCRIPTORS: list[dict[str, Any]] = [
             "required": ["room_id", "text"],
         },
     },
+    {
+        "name": "af_remember",
+        "description": (
+            "Append one memory row for this device. Use at task end to "
+            "record what worked / what did not so the next task can "
+            "recall by tag. `kind` is 'observation' | 'lesson' | 'fact'. "
+            "`tags` should be a short list of domain words like "
+            "['kwork', 'offer'] or ['captcha', 'mail']."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "device_id": {
+                    "type": "string",
+                    "description": (
+                        "UUID of the device this memory belongs to. "
+                        "Defaults to the running daemon's device id when "
+                        "omitted."
+                    ),
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["observation", "lesson", "fact"],
+                    "default": "lesson",
+                },
+                "text": {"type": "string"},
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "default": [],
+                },
+            },
+            "required": ["kind", "text"],
+        },
+    },
+    {
+        "name": "af_recall",
+        "description": (
+            "Fetch this device's memories matching any of the given tags. "
+            "Returns newest-first. Use at task start to recover lessons "
+            "from prior runs in the same domain."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "device_id": {
+                    "type": "string",
+                    "description": (
+                        "UUID of the device. Defaults to the running "
+                        "daemon's device id when omitted."
+                    ),
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "default": [],
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["observation", "lesson", "fact"],
+                },
+                "limit": {"type": "integer", "default": 50},
+            },
+        },
+    },
 ]
 
 
@@ -398,6 +512,30 @@ def dispatch_af_tool(client: AFClient, name: str, args: dict[str, Any]) -> str:
         r = client.send_telegram_message(args["chat_id"], args["text"])
     elif name == "af_post_matrix_room":
         r = client.post_matrix_room(args["room_id"], args["text"])
+    elif name == "af_remember":
+        device_id = args.get("device_id") or client.device_id
+        if not device_id:
+            return json.dumps(
+                {"ok": False, "error": "no device_id (set in auth.json or pass explicitly)"}
+            )
+        r = client.remember(
+            device_id=device_id,
+            kind=args.get("kind", "lesson"),
+            text=args["text"],
+            tags=args.get("tags") or [],
+        )
+    elif name == "af_recall":
+        device_id = args.get("device_id") or client.device_id
+        if not device_id:
+            return json.dumps(
+                {"ok": False, "error": "no device_id (set in auth.json or pass explicitly)"}
+            )
+        r = client.recall(
+            device_id=device_id,
+            tags=args.get("tags") or [],
+            limit=int(args.get("limit", 50)),
+            kind=args.get("kind"),
+        )
     else:
         return json.dumps({"ok": False, "error": f"unknown af tool: {name}"})
 
