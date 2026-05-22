@@ -21,7 +21,8 @@ from ..config import Scope, load_scope
 from ..confirm import confirm, confirm_summary
 from ..platform import PLATFORM, backend
 from ..scope import requires_confirm
-from ..tools import clipboard, code as code_tool, keyboard, mouse, screen, window
+from ..tools import clipboard, keyboard, mouse, screen, window
+from ..tools import code as code_tool
 from .af_client import AF_TOOL_DESCRIPTORS, AFClient, dispatch_af_tool
 
 NOISY_OWNERS: frozenset[str] = frozenset(

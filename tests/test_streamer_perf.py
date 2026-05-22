@@ -9,17 +9,14 @@ from __future__ import annotations
 import io
 import threading
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-import pytest
 from PIL import Image
 
 from agentflow_computer_mcp.driver.streamer import (
     CaptureLoop,
-    _frame_hash,
     fast_capture_jpeg,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -135,9 +132,8 @@ def test_adaptive_rate_backoff_on_failure() -> None:
         outbound_publisher=failing_publisher,
     )
 
-    from agentflow_computer_mcp.driver.streamer import WS_STREAM_MIN_INTERVAL_S, _WS_EMIT_MAX_INTERVAL_S
+    from agentflow_computer_mcp.driver.streamer import _WS_EMIT_MAX_INTERVAL_S
 
-    fake_frame = _make_fake_frame()
     different_frames = [_make_fake_frame(color=(i * 10 % 255, 80, 80)) for i in range(8)]
 
     initial_interval = loop._ws_emit_interval

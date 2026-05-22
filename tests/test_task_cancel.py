@@ -7,7 +7,6 @@ Covers:
 """
 from __future__ import annotations
 
-import asyncio
 import json
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -17,7 +16,6 @@ import pytest
 from agentflow_computer_mcp.config import AppConfig, Auth, Scope
 from agentflow_computer_mcp.driver.state import DriverState
 from agentflow_computer_mcp.ws_client import WSClient
-
 
 # ─── helpers shared with test_ws_dispatch ────────────────────────────────────
 
