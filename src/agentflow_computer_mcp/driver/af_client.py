@@ -198,6 +198,21 @@ class AFClient:
             "POST", "/me/matrix/send", body={"room_id": room_id, "text": text}
         )
 
+    # --- User-editable skills (cabinet → daemon system prompt) ------------
+
+    def get_skills_prompt_block(self, device_id: str | None = None) -> AFResponse:
+        """Pre-rendered text block of the user's enabled intent skills.
+
+        Server returns `{block: "• Когда юзер говорит «X» → instruction\\n…"}`
+        or `{block: ""}` if the user has no enabled skills. The daemon
+        prepends this verbatim to its system prompt so user-defined
+        phrase → action mappings override the hardcoded ones.
+        """
+        params: dict[str, str] = {}
+        if device_id:
+            params["device_id"] = device_id
+        return self._req("GET", "/me/devices/skills/prompt-block", params=params or None)
+
 
 # Tool descriptors for the LLM (Anthropic tool schema). These mirror AFClient methods
 # 1:1 so the driver can advertise them in the system prompt.
