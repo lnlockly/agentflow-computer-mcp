@@ -66,14 +66,25 @@ def test_non_ascii_routes_through_clipboard_paste(
 
         monkeypatch.setattr(platform_mod, "_osa", fake_osa)
     elif sys.platform.startswith("linux"):
-        import pyautogui
+        # On Linux CI without python3-tk, importing pyautogui aborts.
+        # Force the xdotool path so we never hit the pyautogui fallback,
+        # and capture the subprocess.run invocation.
+        monkeypatch.setattr(platform_mod, "_has", lambda cmd: cmd == "xdotool")
+        real_run = platform_mod.subprocess.run
 
-        monkeypatch.setattr(pyautogui, "typewrite", lambda *a, **kw: typewrite_calls.append(a[0] if a else ""))
-        monkeypatch.setattr(platform_mod, "_has", lambda cmd: False)
-        # On Linux without xdotool we fall back to pyautogui.hotkey('ctrl','v').
-        monkeypatch.setattr(
-            pyautogui, "hotkey", lambda *a, **kw: pasted.append(state["value"])
-        )
+        def fake_run(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd[:2] == ["xdotool", "key"]:
+                pasted.append(state["value"])
+
+                class _R:
+                    returncode = 0
+                    stdout = b""
+                    stderr = b""
+
+                return _R()
+            return real_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(platform_mod.subprocess, "run", fake_run)
     elif sys.platform == "win32":
         import pyautogui
 
@@ -99,9 +110,17 @@ def test_ascii_keeps_keystroke_path(
     typed: list[str] = []
     pasted: list[bool] = []
 
-    import pyautogui
+    # Importing pyautogui on Linux without tkinter calls sys.exit at import
+    # time, so we stub the module before keyboard_type tries to use it.
+    import sys as _sys
+    import types
 
-    monkeypatch.setattr(pyautogui, "typewrite", lambda text, interval=0.0: typed.append(text))
+    fake_pyautogui = _sys.modules.get("pyautogui")
+    if fake_pyautogui is None:
+        fake_pyautogui = types.ModuleType("pyautogui")
+        _sys.modules["pyautogui"] = fake_pyautogui
+    fake_pyautogui.typewrite = lambda text, interval=0.0: typed.append(text)
+    fake_pyautogui.hotkey = lambda *a, **kw: pasted.append(True)
 
     if sys.platform == "darwin":
         def fake_osa(script: str, timeout: int = 8) -> tuple[int, str]:
@@ -110,10 +129,6 @@ def test_ascii_keeps_keystroke_path(
             return 0, "ok"
 
         monkeypatch.setattr(platform_mod, "_osa", fake_osa)
-    else:
-        monkeypatch.setattr(
-            pyautogui, "hotkey", lambda *a, **kw: pasted.append(True)
-        )
 
     result = backend.keyboard_type("hello world")
 
@@ -133,14 +148,21 @@ def test_clipboard_restored_after_paste(
     if sys.platform == "darwin":
         monkeypatch.setattr(platform_mod, "_osa", lambda script, timeout=8: (0, "ok"))
     elif sys.platform.startswith("linux"):
-        monkeypatch.setattr(platform_mod, "_has", lambda cmd: False)
-        import pyautogui
+        monkeypatch.setattr(platform_mod, "_has", lambda cmd: cmd == "xdotool")
 
-        monkeypatch.setattr(pyautogui, "hotkey", lambda *a, **kw: None)
+        class _R:
+            returncode = 0
+            stdout = b""
+            stderr = b""
+
+        monkeypatch.setattr(platform_mod.subprocess, "run", lambda *a, **kw: _R())
     elif sys.platform == "win32":
-        import pyautogui
+        import sys as _sys
+        import types
 
-        monkeypatch.setattr(pyautogui, "hotkey", lambda *a, **kw: None)
+        fake = _sys.modules.get("pyautogui") or types.ModuleType("pyautogui")
+        fake.hotkey = lambda *a, **kw: None
+        _sys.modules["pyautogui"] = fake
 
     backend.keyboard_type("тест")
 
