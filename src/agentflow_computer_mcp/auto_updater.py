@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import json
 import logging
 import os
 import re
@@ -46,10 +45,11 @@ from . import __version__
 
 log = logging.getLogger(__name__)
 
-GITHUB_API_LATEST = (
-    "https://api.github.com/repos/lnlockly/agentflow-computer-mcp/releases/latest"
-)
+GITHUB_RELEASES = "https://github.com/lnlockly/agentflow-computer-mcp/releases"
+GITHUB_LATEST_PAGE = f"{GITHUB_RELEASES}/latest"
+GITHUB_LATEST_ASSET = f"{GITHUB_RELEASES}/latest/download"
 ASSET_NAME = "agentflow-desktop-setup.exe"
+SHA256SUMS_NAME = "SHA256SUMS"
 DEFAULT_INTERVAL_MIN = 30
 MAX_INTERVAL_MIN = 24 * 60  # cap exponential backoff at 24h
 USER_AGENT = f"agentflow-desktop/{__version__}"
@@ -102,10 +102,25 @@ def _sha256_from_body(body: str) -> str | None:
     return m.group(1).lower() if m else None
 
 
-def _http_get_json(url: str, *, timeout: float = 15.0) -> dict:
+def _http_get_text(url: str, *, timeout: float = 15.0) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
-        return json.loads(resp.read().decode("utf-8"))
+        return resp.read().decode("utf-8", "replace")
+
+
+def _http_resolve_redirect(url: str, *, timeout: float = 15.0) -> str:
+    """Follow a single redirect (HEAD if server allows) and return the
+    final URL — used to extract the latest tag from
+    `releases/latest` → `releases/tag/v0.4.5`. GitHub serves this
+    without authentication and without an API rate limit, so it's the
+    only path that works from un-authenticated daemons sitting behind
+    shared IPs (corporate NAT, multi-user homes)."""
+    # We can't use HEAD reliably (GitHub sometimes returns 404 for HEAD
+    # on the redirect target), so issue a GET but discard the body once
+    # we have the final URL.
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+        return resp.geturl()
 
 
 def _http_download(url: str, dest: Path, *, timeout: float = 300.0) -> None:
@@ -122,9 +137,56 @@ def _sha256_of_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def fetch_latest_release(*, _http=_http_get_json) -> dict:
-    """Return the parsed `releases/latest` payload. Injectable for tests."""
-    return _http(GITHUB_API_LATEST)
+def fetch_latest_release(*, _resolve=_http_resolve_redirect, _get_text=_http_get_text) -> dict:
+    """Return a release dict with the same shape callers expect, but
+    sourced from the public `releases/latest` redirect and a published
+    `SHA256SUMS` asset instead of the rate-limited GitHub API.
+
+    Output keys:
+      - `tag_name`     — e.g. `v0.4.5`, parsed from the redirect Location.
+      - `body`         — line `sha256: <hex>` reconstructed from the
+                         SHA256SUMS asset for the current ASSET_NAME, so
+                         the existing `_sha256_from_body` helper keeps
+                         working.
+      - `assets`       — single-entry list pointing at the
+                         `releases/latest/download/<ASSET_NAME>` URL
+                         which itself redirects to the versioned blob.
+    Raises URLError / OSError on network failure; the caller swallows
+    those into a status='error' return.
+    """
+    final_url = _resolve(GITHUB_LATEST_PAGE)
+    # final_url looks like https://github.com/<org>/<repo>/releases/tag/v0.4.5
+    m = re.search(r"/releases/tag/([^/?#]+)", final_url)
+    if not m:
+        raise UpdateError(f"could not parse tag from redirect URL {final_url!r}")
+    tag = m.group(1)
+
+    body = ""
+    try:
+        sums = _get_text(f"{GITHUB_LATEST_ASSET}/{SHA256SUMS_NAME}")
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError) as exc:
+        log.warning("auto-update: SHA256SUMS unavailable (%s)", exc)
+        sums = ""
+    if sums:
+        # Standard `sha256sum` format: `<hex>  <filename>\n`. Pluck the
+        # line for our asset, reformat as `sha256: <hex>` so
+        # _sha256_from_body can read it unchanged.
+        for line in sums.splitlines():
+            parts = line.strip().split()
+            if len(parts) == 2 and parts[1] == ASSET_NAME and re.fullmatch(r"[0-9a-fA-F]{64}", parts[0]):
+                body = f"sha256: {parts[0].lower()}"
+                break
+
+    return {
+        "tag_name": tag,
+        "body": body,
+        "assets": [
+            {
+                "name": ASSET_NAME,
+                "browser_download_url": f"{GITHUB_LATEST_ASSET}/{ASSET_NAME}",
+            }
+        ],
+    }
 
 
 def _find_asset(release: dict) -> dict | None:
@@ -376,7 +438,9 @@ def start_in_background(stop_event: threading.Event | None = None) -> threading.
 
 __all__ = [
     "ASSET_NAME",
-    "GITHUB_API_LATEST",
+    "GITHUB_LATEST_ASSET",
+    "GITHUB_LATEST_PAGE",
+    "SHA256SUMS_NAME",
     "UpdateError",
     "check_now",
     "fetch_latest_release",

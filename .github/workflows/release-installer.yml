@@ -90,22 +90,29 @@ jobs:
           }
           Write-Host "selftest passed"
 
-      - name: Compute sha256 for release body
-        # The auto-updater greps `sha256: <hex>` out of release notes to
-        # verify the download. Without this line in the body the updater
-        # refuses to apply the update (treated as untrusted blob).
+      - name: Compute sha256 + write SHA256SUMS
+        # SHA256SUMS is the asset the auto-updater downloads to verify the
+        # exe (un-authenticated, no GitHub API rate limit). Owner hit a
+        # 403 «rate limit exceeded» on daemons polling the JSON API; the
+        # public release-asset download path doesn't have that cap.
+        # Release body still carries `sha256: <hex>` as a human-readable
+        # backup.
         id: sha
         shell: pwsh
         run: |
           $hash = (Get-FileHash -Path dist/agentflow-desktop-setup.exe -Algorithm SHA256).Hash.ToLower()
           Write-Host "sha256: $hash"
           "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          # GNU sha256sum format — `<hex>  <filename>\n` (two spaces).
+          "$hash  agentflow-desktop-setup.exe" | Out-File -FilePath dist/SHA256SUMS -Encoding ascii
 
       - name: Publish to tagged release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/agentflow-desktop-setup.exe
+          files: |
+            dist/agentflow-desktop-setup.exe
+            dist/SHA256SUMS
           fail_on_unmatched_files: true
           body: |
             AgentFlow Desktop ${{ github.ref_name }}
@@ -118,7 +125,9 @@ jobs:
         with:
           tag_name: latest
           name: latest
-          files: dist/agentflow-desktop-setup.exe
+          files: |
+            dist/agentflow-desktop-setup.exe
+            dist/SHA256SUMS
           fail_on_unmatched_files: true
           prerelease: false
           make_latest: false
