@@ -172,7 +172,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
 
     af = AFClient(api_key) if not args.no_af_tools else None
-    executor = ToolExecutor(state.last_cursor, af_client=af, pw=PlaywrightHost())
+    executor = ToolExecutor(state.last_cursor, af_client=af, pw=PlaywrightHost(), state=state)
 
     shutdown = threading.Event()
 
@@ -223,7 +223,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
 
     state = DriverState()
     af = AFClient(api_key) if not args.no_af_tools else None
-    executor = ToolExecutor(state.last_cursor, af_client=af, pw=PlaywrightHost())
+    executor = ToolExecutor(state.last_cursor, af_client=af, pw=PlaywrightHost(), state=state)
     answer = run_task(args.task, state, executor, api_key, llm_url=args.llm_url, model=args.model)
     print(answer)
     return 0

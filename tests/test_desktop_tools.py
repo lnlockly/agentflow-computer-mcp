@@ -18,8 +18,9 @@ def test_all_tool_descriptors_includes_desktop_and_af() -> None:
     assert "task_complete" in names
     assert "af_list_devices" in names
     assert "af_create_project" in names
-    # 22 desktop + 11 af currently
-    assert len(tools) == len(DESKTOP_TOOLS) + 11
+    from agentflow_computer_mcp.driver.af_client import AF_TOOL_DESCRIPTORS
+
+    assert len(tools) == len(DESKTOP_TOOLS) + len(AF_TOOL_DESCRIPTORS)
 
 
 def test_executor_routes_af_tool_when_client_present() -> None:

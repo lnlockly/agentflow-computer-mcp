@@ -17,8 +17,11 @@ from typing import Any
 
 from PIL import Image
 
+from ..config import Scope, load_scope
+from ..confirm import confirm, confirm_summary
 from ..platform import PLATFORM, backend
-from ..tools import clipboard, keyboard, mouse, screen, window
+from ..scope import requires_confirm
+from ..tools import clipboard, code as code_tool, keyboard, mouse, screen, window
 from .af_client import AF_TOOL_DESCRIPTORS, AFClient, dispatch_af_tool
 
 NOISY_OWNERS: frozenset[str] = frozenset(
@@ -473,6 +476,86 @@ DESKTOP_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "code_read_file",
+        "description": (
+            "Read a project file as the LLM's source-of-truth before editing. "
+            "Returns up to max_lines lines and the total line count."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "max_lines": {"type": "integer", "default": 2000},
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "code_write_file",
+        "description": (
+            "Write or append a file. mode='replace' overwrites; mode='append' tails. "
+            "Triggers the macOS confirm dialog through the fs.write gate."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"},
+                "mode": {"type": "string", "enum": ["replace", "append"], "default": "replace"},
+            },
+            "required": ["path", "content"],
+        },
+    },
+    {
+        "name": "code_edit_file",
+        "description": (
+            "Find/replace edit on a file. count=1 by default; pass count='all' to "
+            "replace every occurrence. Errors if find is missing or more frequent than count."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "find": {"type": "string"},
+                "replace": {"type": "string"},
+                "count": {"oneOf": [{"type": "integer"}, {"type": "string"}], "default": 1},
+            },
+            "required": ["path", "find", "replace"],
+        },
+    },
+    {
+        "name": "code_run_command",
+        "description": (
+            "Run a shell command from a chosen cwd (defaults to $HOME). Returns stdout, "
+            "stderr, exit_code, duration_ms. Goes through the shell.exec confirm gate."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+                "cwd": {"type": "string"},
+                "timeout": {"type": "integer", "default": 120},
+            },
+            "required": ["command"],
+        },
+    },
+    {
+        "name": "code_list_dir",
+        "description": (
+            "List files under a directory with depth limit. Ignores .git, node_modules, "
+            "dist, .venv, __pycache__ by default."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "depth": {"type": "integer", "default": 1},
+                "ignore_globs": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["path"],
+        },
+    },
+    {
         "name": "task_complete",
         "description": "Finish with answer.",
         "input_schema": {
@@ -495,10 +578,37 @@ class ToolExecutor:
         last_cursor_ref: list[int],
         af_client: AFClient | None = None,
         pw: PlaywrightHost | None = None,
+        scope: Scope | None = None,
+        state: Any = None,
     ) -> None:
         self._cursor = last_cursor_ref
         self._af = af_client
         self._pw = pw or PlaywrightHost()
+        self._scope = scope if scope is not None else load_scope()
+        # Optional DriverState reference for emitting "task_action" frames
+        # BEFORE long-running code tool dispatch so the cabinet timeline
+        # shows the action while it's in flight, not only after completion.
+        self._state = state
+
+    def _announce(self, action: str, detail: str = "") -> None:
+        if self._state is None:
+            return
+        try:
+            from .loop import update_live
+
+            update_live(self._state, action, detail)
+        except Exception:  # noqa: BLE001 — visualization is best-effort
+            pass
+
+    def _confirm_blocking(self, tool_name: str, summary: str) -> bool:
+        try:
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(confirm(tool_name, summary))
+            finally:
+                loop.close()
+        except Exception:  # noqa: BLE001
+            return False
 
     def execute(self, name: str, args: dict[str, Any]) -> tuple[str, dict[str, str] | None]:
         # AgentFlow API tools
@@ -579,6 +689,82 @@ class ToolExecutor:
             try:
                 rows = selfmod.list_recent(int(args.get("limit", 10)))
                 return json.dumps({"items": rows}, ensure_ascii=False), None
+            except Exception as exc:  # noqa: BLE001
+                return json.dumps({"ok": False, "error": str(exc)}), None
+        if name == "code_read_file":
+            self._announce("code_read_file", f"path={args.get('path', '')}")
+            try:
+                result = code_tool.read_file(
+                    args["path"],
+                    scope=self._scope,
+                    max_lines=int(args.get("max_lines", 2000)),
+                )
+                return json.dumps(result, ensure_ascii=False)[:4000], None
+            except Exception as exc:  # noqa: BLE001
+                return json.dumps({"ok": False, "error": str(exc)}), None
+        if name == "code_write_file":
+            mode = args.get("mode", "replace")
+            self._announce("code_write_file", f"path={args.get('path', '')} mode={mode}")
+            if requires_confirm("computer.fs.write", self._scope):
+                summary = confirm_summary("code.write_file", {"path": args["path"], "mode": mode})
+                if not self._confirm_blocking("computer.code.write_file", summary):
+                    return json.dumps({"ok": False, "error": "user denied code_write_file"}), None
+            try:
+                result = code_tool.write_file(
+                    args["path"], args["content"], scope=self._scope, mode=mode
+                )
+                return json.dumps(result, ensure_ascii=False), None
+            except Exception as exc:  # noqa: BLE001
+                return json.dumps({"ok": False, "error": str(exc)}), None
+        if name == "code_edit_file":
+            count = args.get("count", 1)
+            self._announce("code_edit_file", f"path={args.get('path', '')} count={count}")
+            if requires_confirm("computer.fs.write", self._scope):
+                summary = confirm_summary("code.edit_file", {"path": args["path"], "count": count})
+                if not self._confirm_blocking("computer.code.edit_file", summary):
+                    return json.dumps({"ok": False, "error": "user denied code_edit_file"}), None
+            try:
+                result = code_tool.edit_file(
+                    args["path"],
+                    args["find"],
+                    args["replace"],
+                    scope=self._scope,
+                    count=count,
+                )
+                return json.dumps(result, ensure_ascii=False), None
+            except Exception as exc:  # noqa: BLE001
+                return json.dumps({"ok": False, "error": str(exc)}), None
+        if name == "code_run_command":
+            cwd = args.get("cwd") or str(__import__("pathlib").Path.home())
+            cmd = args["command"]
+            self._announce("code_run_command", f"cwd={cwd} cmd={cmd[:120]}")
+            if requires_confirm("computer.shell.exec", self._scope):
+                summary = confirm_summary("code.run_command", {"cwd": cwd, "command": cmd})
+                if not self._confirm_blocking("computer.code.run_command", summary):
+                    return json.dumps({"ok": False, "error": "user denied code_run_command"}), None
+            try:
+                result = asyncio.run(
+                    code_tool.run_command(
+                        cmd,
+                        scope=self._scope,
+                        cwd=args.get("cwd"),
+                        timeout=int(args.get("timeout", 120)),
+                    )
+                )
+                # Truncate noisy output so the LLM tool_result stays under ~4 KB.
+                return json.dumps(result, ensure_ascii=False)[:4000], None
+            except Exception as exc:  # noqa: BLE001
+                return json.dumps({"ok": False, "error": str(exc)}), None
+        if name == "code_list_dir":
+            self._announce("code_list_dir", f"path={args.get('path', '')}")
+            try:
+                result = code_tool.list_dir(
+                    args["path"],
+                    scope=self._scope,
+                    depth=int(args.get("depth", 1)),
+                    ignore_globs=args.get("ignore_globs"),
+                )
+                return json.dumps(result, ensure_ascii=False)[:4000], None
             except Exception as exc:  # noqa: BLE001
                 return json.dumps({"ok": False, "error": str(exc)}), None
         if name == "task_complete":

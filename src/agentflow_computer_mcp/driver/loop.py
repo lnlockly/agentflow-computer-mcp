@@ -63,6 +63,26 @@ def build_system_prompt(window_summary: str, af_tools_present: bool) -> str:
         "keypress Cmd+N → wait 0.3 → type адрес → keypress Tab → type тему → keypress Tab → "
         "type тело письма. НЕ нажимай Send без явного подтверждения юзера: остановись на "
         "task_complete с превью того что собрано в окне.\n"
+        "  • «напиши код для X / сделай скрипт Y» → активируй редактор (Cursor / VSCode / iTerm), "
+        "читай существующий код через code_read_file, правь через code_edit_file/code_write_file "
+        "(с подтверждением). Перед изменением — короткий план в text-блоке.\n"
+        "  • «сделай проект Y / реализуй X как отдельный сервис» → af_spawn_subagent(brief=...) "
+        "и стриминг прогресса через af_get_project_events. Не пытайся сделать всё внутри одного "
+        "task если scope большой.\n"
+        "  • «запусти под-агента / делегируй X» → af_spawn_subagent(brief=...). После старта верни "
+        "project_id и slug, не жди до конца если время > 60с.\n"
+    )
+
+    coding_workflow = (
+        "\nCoding workflow:\n"
+        "  1. Read first: code_list_dir для обзора, code_read_file для конкретных файлов. "
+        "Не редактируй вслепую.\n"
+        "  2. Batch edits: один code_edit_file per logical change. Большие новые файлы → "
+        "code_write_file(mode='replace'). Дописать в конец → mode='append'.\n"
+        "  3. Run + react: после code_run_command всегда читай stderr. Если exit_code != 0 — "
+        "fix по stderr перед следующим шагом, не повторяй ту же команду.\n"
+        "  4. Delegate when big: фича на 3+ файла или новый сервис — af_spawn_subagent, не "
+        "пиши руками на десктопе.\n"
     )
 
     visibility_block = (
@@ -87,6 +107,7 @@ def build_system_prompt(window_summary: str, af_tools_present: bool) -> str:
         "Google Chrome с его сессией.\n"
         f"{af_block}"
         f"{intent_map}"
+        f"{coding_workflow}"
         f"{visibility_block}"
         "Scope hard rules: paths `~/.ssh`, `~/.config`, `~/Library/Keychains`, `~/.aws`, `~/.gnupg` всегда запрещены "
         "к чтению/записи. fs.write и shell.exec требуют подтверждения. Не пытайся это обходить.\n"

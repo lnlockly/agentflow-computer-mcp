@@ -6,6 +6,7 @@ to keep the driver loop simple; calls are typically ≤2s and run inside a threa
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -82,6 +83,90 @@ class AFClient:
         return self._req(
             "GET", f"/me/projects/{project_id}/events", params={"limit": str(limit)}
         )
+
+    def get_project_events(
+        self,
+        project_id: int | str,
+        since_event_id: int | str | None = None,
+        limit: int = 50,
+    ) -> AFResponse:
+        params: dict[str, str] = {"limit": str(limit)}
+        if since_event_id is not None:
+            params["since_id"] = str(since_event_id)
+        return self._req("GET", f"/me/projects/{project_id}/events", params=params)
+
+    def spawn_project_task(
+        self,
+        brief: str,
+        kind: str = "code_only",
+        auto_approve: bool = True,
+        poll_seconds: int = 60,
+    ) -> dict[str, Any]:
+        """Create + (optionally) approve a project. Polls events ≤ poll_seconds for a
+        ``project_ready``-shaped event; returns whatever the project has after that.
+
+        Returns ``{ok, project_id, slug, kind, preview_url, status, error?}``.
+        """
+        kind = kind or "code_only"
+        body: dict[str, Any] = {"brief": brief}
+        if kind:
+            body["kind_hint"] = kind
+        created = self._req("POST", "/me/projects", body=body)
+        if not created.ok:
+            return {
+                "ok": False,
+                "error": f"create_failed: {created.status} {created.body!r}",
+            }
+
+        proj = created.body if isinstance(created.body, dict) else {}
+        project_id = proj.get("id") or proj.get("project_id")
+        slug = proj.get("slug")
+        if project_id is None:
+            return {"ok": False, "error": f"create returned no id: {proj!r}"}
+
+        if auto_approve:
+            approved = self.approve_project(project_id)
+            if not approved.ok:
+                return {
+                    "ok": False,
+                    "project_id": project_id,
+                    "slug": slug,
+                    "error": f"approve_failed: {approved.status} {approved.body!r}",
+                }
+
+        deadline = time.time() + max(0, poll_seconds)
+        last_status: str | None = None
+        preview_url: str | None = None
+        ready_kinds = {"project_ready", "preview_ready", "build_complete", "deploy_caddy"}
+        while time.time() < deadline:
+            ev = self.list_project_events(project_id, limit=30)
+            if ev.ok and isinstance(ev.body, dict):
+                items = ev.body.get("items") or ev.body.get("events") or []
+                for item in items:
+                    k = item.get("kind") if isinstance(item, dict) else None
+                    if k in ready_kinds:
+                        payload = item.get("payload") if isinstance(item, dict) else None
+                        if isinstance(payload, dict):
+                            preview_url = payload.get("preview_url") or preview_url
+                        last_status = "ready"
+                        break
+                if last_status == "ready":
+                    break
+            time.sleep(2)
+
+        info = self.get_project(project_id)
+        if info.ok and isinstance(info.body, dict):
+            preview_url = info.body.get("preview_url") or preview_url
+            last_status = info.body.get("status") or last_status
+
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "slug": slug,
+            "kind": proj.get("kind") or proj.get("kind_classification") or kind,
+            "preview_url": preview_url,
+            "status": last_status or "pending",
+        }
 
     # --- Devices ----------------------------------------------------------
 
@@ -211,6 +296,39 @@ AF_TOOL_DESCRIPTORS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "af_spawn_subagent",
+        "description": (
+            "Spawn a new AgentFlow project to delegate a sub-task. Creates + approves + "
+            "waits ≤60s for a ready signal. Use when scope is too big for one desktop task "
+            "(building a landing, a bot, a service)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "brief": {"type": "string"},
+                "kind": {"type": "string", "default": "code_only"},
+                "auto_approve": {"type": "boolean", "default": True},
+            },
+            "required": ["brief"],
+        },
+    },
+    {
+        "name": "af_get_project_events",
+        "description": (
+            "Stream progress events for a spawned project so they surface in the desktop "
+            "action timeline. Pass since_event_id to page forward."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "integer"},
+                "since_event_id": {"type": "integer"},
+                "limit": {"type": "integer", "default": 50},
+            },
+            "required": ["project_id"],
+        },
+    },
+    {
         "name": "af_post_matrix_room",
         "description": "Post a message into a Matrix room via the user's bound Matrix account.",
         "input_schema": {
@@ -245,6 +363,22 @@ def dispatch_af_tool(client: AFClient, name: str, args: dict[str, Any]) -> str:
         r = client.list_agents(limit=int(args.get("limit", 20)))
     elif name == "af_send_agent_message":
         r = client.send_agent_message(args["agent_id"], args["text"])
+    elif name == "af_spawn_subagent":
+        result = client.spawn_project_task(
+            brief=args["brief"],
+            kind=args.get("kind", "code_only"),
+            auto_approve=bool(args.get("auto_approve", True)),
+        )
+        s = json.dumps(result, ensure_ascii=False, default=str)
+        if len(s) > 4000:
+            s = s[:4000] + "...<truncated>"
+        return s
+    elif name == "af_get_project_events":
+        r = client.get_project_events(
+            args["project_id"],
+            since_event_id=args.get("since_event_id"),
+            limit=int(args.get("limit", 50)),
+        )
     elif name == "af_send_telegram_message":
         r = client.send_telegram_message(args["chat_id"], args["text"])
     elif name == "af_post_matrix_room":

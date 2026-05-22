@@ -9,6 +9,7 @@ from .config import AppConfig, load_config
 from .confirm import confirm, confirm_summary
 from .scope import requires_confirm
 from .tools import clipboard as clipboard_tool
+from .tools import code as code_tool
 from .tools import fs as fs_tool
 from .tools import keyboard as keyboard_tool
 from .tools import mouse as mouse_tool
@@ -35,6 +36,11 @@ TOOL_NAMES: list[str] = [
     "computer.shell.exec",
     "computer.clipboard.read",
     "computer.clipboard.write",
+    "computer.code.read_file",
+    "computer.code.write_file",
+    "computer.code.edit_file",
+    "computer.code.run_command",
+    "computer.code.list_dir",
 ]
 
 
@@ -109,6 +115,50 @@ def build_mcp(config: AppConfig) -> FastMCP:
     async def clipboard_write(text: str) -> dict[str, int]:
         return await clipboard_tool.write(text)
 
+    @mcp.tool(name="computer.code.read_file")
+    def code_read_file(path: str, max_lines: int = 2000) -> dict[str, Any]:
+        return code_tool.read_file(path, scope=config.scope, max_lines=max_lines)
+
+    @mcp.tool(name="computer.code.write_file")
+    async def code_write_file(
+        path: str, content: str, mode: str = "replace"
+    ) -> dict[str, Any]:
+        if requires_confirm("computer.fs.write", config.scope):
+            summary = confirm_summary("code.write_file", {"path": path, "mode": mode})
+            if not await confirm("computer.code.write_file", summary):
+                raise PermissionError("user denied code.write_file")
+        return code_tool.write_file(path, content, scope=config.scope, mode=mode)
+
+    @mcp.tool(name="computer.code.edit_file")
+    async def code_edit_file(
+        path: str, find: str, replace: str, count: int | str = 1
+    ) -> dict[str, Any]:
+        if requires_confirm("computer.fs.write", config.scope):
+            summary = confirm_summary("code.edit_file", {"path": path, "count": count})
+            if not await confirm("computer.code.edit_file", summary):
+                raise PermissionError("user denied code.edit_file")
+        return code_tool.edit_file(path, find, replace, scope=config.scope, count=count)
+
+    @mcp.tool(name="computer.code.run_command")
+    async def code_run_command(
+        command: str, cwd: str | None = None, timeout: int = 120
+    ) -> dict[str, Any]:
+        if requires_confirm("computer.shell.exec", config.scope):
+            summary = confirm_summary("code.run_command", {"cwd": cwd or "~", "command": command})
+            if not await confirm("computer.code.run_command", summary):
+                raise PermissionError("user denied code.run_command")
+        return await code_tool.run_command(command, scope=config.scope, cwd=cwd, timeout=timeout)
+
+    @mcp.tool(name="computer.code.list_dir")
+    def code_list_dir(
+        path: str,
+        depth: int = 1,
+        ignore_globs: list[str] | None = None,
+    ) -> dict[str, Any]:
+        return code_tool.list_dir(
+            path, scope=config.scope, depth=depth, ignore_globs=ignore_globs
+        )
+
     return mcp
 
 
@@ -156,6 +206,57 @@ async def _dispatch_tool(name: str, args: dict[str, Any], config: AppConfig) -> 
         return await clipboard_tool.read()
     if name == "computer.clipboard.write":
         return await clipboard_tool.write(args["text"])
+    if name == "computer.code.read_file":
+        return code_tool.read_file(
+            args["path"], scope=config.scope, max_lines=int(args.get("max_lines", 2000))
+        )
+    if name == "computer.code.write_file":
+        if requires_confirm("computer.fs.write", config.scope):
+            summary = confirm_summary(
+                "code.write_file",
+                {"path": args["path"], "mode": args.get("mode", "replace")},
+            )
+            if not await confirm("computer.code.write_file", summary):
+                raise PermissionError("user denied code.write_file")
+        return code_tool.write_file(
+            args["path"], args["content"], scope=config.scope, mode=args.get("mode", "replace")
+        )
+    if name == "computer.code.edit_file":
+        if requires_confirm("computer.fs.write", config.scope):
+            summary = confirm_summary(
+                "code.edit_file",
+                {"path": args["path"], "count": args.get("count", 1)},
+            )
+            if not await confirm("computer.code.edit_file", summary):
+                raise PermissionError("user denied code.edit_file")
+        return code_tool.edit_file(
+            args["path"],
+            args["find"],
+            args["replace"],
+            scope=config.scope,
+            count=args.get("count", 1),
+        )
+    if name == "computer.code.run_command":
+        if requires_confirm("computer.shell.exec", config.scope):
+            summary = confirm_summary(
+                "code.run_command",
+                {"cwd": args.get("cwd") or "~", "command": args["command"]},
+            )
+            if not await confirm("computer.code.run_command", summary):
+                raise PermissionError("user denied code.run_command")
+        return await code_tool.run_command(
+            args["command"],
+            scope=config.scope,
+            cwd=args.get("cwd"),
+            timeout=int(args.get("timeout", 120)),
+        )
+    if name == "computer.code.list_dir":
+        return code_tool.list_dir(
+            args["path"],
+            scope=config.scope,
+            depth=int(args.get("depth", 1)),
+            ignore_globs=args.get("ignore_globs"),
+        )
     raise LookupError(f"unknown tool: {name}")
 
 
