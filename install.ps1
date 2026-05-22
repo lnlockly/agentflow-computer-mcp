@@ -61,14 +61,21 @@ $Auth = [PSCustomObject]@{
     ws_url           = $AfWsUrl
 } | ConvertTo-Json -Depth 3
 
+# Write files without BOM — tomllib chokes on UTF-8 BOM with «Invalid
+# statement (at line 1, column 1)», which broke v0.3.x daemons.
+# PowerShell 5.1's `Set-Content -Encoding UTF8` adds a BOM by default;
+# use [System.IO.File]::WriteAllText with explicit UTF8Encoding($false)
+# which omits the BOM on all PS versions.
+$Utf8NoBom = New-Object System.Text.UTF8Encoding $false
+
 $AuthPath = Join-Path $AfDir "auth.json"
-Set-Content -Path $AuthPath -Value $Auth -Encoding UTF8
+[System.IO.File]::WriteAllText($AuthPath, $Auth, $Utf8NoBom)
 icacls $AuthPath /inheritance:r /grant:r "${env:USERNAME}:F" | Out-Null
 Write-Host "[install] wrote $AuthPath"
 
 $ScopePath = Join-Path $AfDir "computer-scope.toml"
 if (-not (Test-Path $ScopePath)) {
-    @"
+    $ScopeBody = @"
 allow_apps = []
 allow_paths = []
 deny_paths = ["%USERPROFILE%/.ssh", "%USERPROFILE%/AppData/Roaming/Microsoft/Crypto"]
@@ -76,7 +83,8 @@ shell_whitelist = []
 confirm_before = ["computer.fs.write", "computer.shell.exec"]
 max_actions_per_session = 50
 budget_usd = 2.0
-"@ | Set-Content -Path $ScopePath -Encoding UTF8
+"@
+    [System.IO.File]::WriteAllText($ScopePath, $ScopeBody, $Utf8NoBom)
     Write-Host "[install] wrote default scope at $ScopePath"
 }
 
