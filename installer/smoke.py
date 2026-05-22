@@ -489,11 +489,18 @@ def check_loop_checkpoint_abort() -> None:
                 return ("ok", None)
 
         # Force checkpoint to fire fast (every 3 steps, min steps is 3).
+        # Patch the screen-grab helpers too — headless CI (Linux runners,
+        # Windows CI without an attached display) raises XError / equivalent
+        # on the first screenshot call, which would crash run_task before
+        # the checkpoint code ever runs.
         with (
             patch.object(driver_loop, "LOOP_CHECKPOINT_EVERY", 3),
             patch.object(driver_loop, "LOOP_MAX_STEPS", 50),
             patch.object(driver_loop, "LOOP_MAX_USD", 999.0),
             patch.object(driver_loop, "post_llm_cancellable", fake_post_llm),
+            patch.object(driver_loop, "jpeg_b64_full", lambda *a, **kw: ""),
+            patch.object(driver_loop, "get_window_list", lambda *a, **kw: []),
+            patch.object(driver_loop, "update_live", lambda *a, **kw: None),
             # Force memory + budget into the temp DB. They auto-mkdir.
             patch(
                 "agentflow_computer_mcp.autonomous.schema.DEFAULT_DB_PATH",
