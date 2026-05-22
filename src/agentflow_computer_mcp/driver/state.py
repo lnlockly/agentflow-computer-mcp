@@ -54,11 +54,17 @@ class DriverState:
             pub(payload)
 
     def request_abort(self, task_id: str | None = None) -> None:
-        """Signal the running task to abort between iterations.
+        """Signal the running task to abort within ~2s.
 
         If *task_id* is given, the abort fires only when it matches the
         currently running task.  Pass ``None`` (or omit) to cancel whatever
         task is running unconditionally.
+
+        Side effect: when the abort fires and a remote task_id is in flight,
+        an immediate ``task_action: cancel_received`` frame is published so
+        the cabinet UI shows "Останавливаю задачу..." within milliseconds.
+        Real interruption follows once ``run_task`` reaches its next poll
+        boundary (between SSE chunks or before the next tool dispatch).
 
         Idempotent: safe to call when no task is running — sets the flag which
         the idle worker will clear immediately on the next queue-drain cycle.
@@ -78,6 +84,19 @@ class DriverState:
             )
             return
         self.abort_flag.set()
+        # Immediate ACK so the UI flips to "stopping" within <500 ms even
+        # though the actual interrupt (LLM stream close / next tool gate)
+        # may still take up to ~2 s to land.
+        if self.current_task_id and self.outbound_publisher is not None:
+            self.publish_outbound(
+                {
+                    "type": "task_action",
+                    "task_id": self.current_task_id,
+                    "ts": int(time.time() * 1000),
+                    "action": "cancel_received",
+                    "detail": "Останавливаю задачу...",
+                }
+            )
 
     def enqueue_task(self, task: str, task_id: str = "") -> str:
         """Queue a task with an optional pre-assigned id. Returns the id."""

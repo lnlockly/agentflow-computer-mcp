@@ -701,7 +701,20 @@ class ToolExecutor:
         if name == "clipboard_read":
             return json.dumps(asyncio.run(clipboard.read()), ensure_ascii=False), None
         if name == "wait":
-            time.sleep(min(float(args["seconds"]), 5))
+            # Sleep is the canonical long-pole inside a tool dispatch. Slice
+            # into 0.2 s polls so a mid-task cancel signal lands within that
+            # interval instead of after the full 5 s.
+            total = min(float(args["seconds"]), 5)
+            remaining = total
+            slept = 0.0
+            abort = getattr(self._state, "abort_flag", None) if self._state else None
+            while remaining > 0:
+                if abort is not None and abort.is_set():
+                    return f"aborted after {slept:.1f}s of {total}s", None
+                step = 0.2 if remaining > 0.2 else remaining
+                time.sleep(step)
+                slept += step
+                remaining -= step
             return f"slept {args['seconds']}s", None
         if name == "browser_open":
             return self._pw.ensure(), None

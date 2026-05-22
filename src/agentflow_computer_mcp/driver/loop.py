@@ -209,6 +209,16 @@ def build_system_prompt(window_summary: str, af_tools_present: bool) -> str:
     )
 
 
+class TaskCancelled(Exception):
+    """Raised inside run_task when state.abort_flag fires mid-flight.
+
+    The handler in run_task catches this, publishes task_error, and returns.
+    Keeping it as an exception (instead of a sentinel return) makes every
+    code path that goes through the LLM call or tool dispatch unwind
+    immediately, including those nested inside helper functions.
+    """
+
+
 def post_llm(
     url: str,
     api_key: str,
@@ -228,6 +238,201 @@ def post_llm(
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode())
+
+
+def _assemble_anthropic_sse(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Reassemble an Anthropic /v1/messages SSE stream into the non-stream
+    response shape that the rest of run_task expects.
+
+    Anthropic streaming protocol:
+      - message_start            → carries the skeleton (id, role, model)
+      - content_block_start      → declares a content block (text or tool_use)
+      - content_block_delta      → text_delta { text } | input_json_delta { partial_json }
+      - content_block_stop
+      - message_delta            → carries stop_reason, usage
+      - message_stop
+    """
+    skeleton: dict[str, Any] = {
+        "id": "",
+        "type": "message",
+        "role": "assistant",
+        "model": "",
+        "content": [],
+        "stop_reason": None,
+        "stop_sequence": None,
+        "usage": {},
+    }
+    # block index → assembled block dict (text accumulator or tool_use w/ json buffer)
+    blocks: dict[int, dict[str, Any]] = {}
+    tool_input_buffers: dict[int, str] = {}
+
+    for ev in events:
+        et = ev.get("type")
+        if et == "message_start":
+            msg = ev.get("message", {}) or {}
+            skeleton["id"] = msg.get("id", "")
+            skeleton["model"] = msg.get("model", "")
+            if msg.get("role"):
+                skeleton["role"] = msg["role"]
+            if msg.get("usage"):
+                skeleton["usage"] = msg["usage"]
+        elif et == "content_block_start":
+            idx = ev.get("index", 0)
+            block = dict(ev.get("content_block") or {})
+            if block.get("type") == "text":
+                block.setdefault("text", "")
+            elif block.get("type") == "tool_use":
+                block.setdefault("input", {})
+                tool_input_buffers[idx] = ""
+            blocks[idx] = block
+        elif et == "content_block_delta":
+            idx = ev.get("index", 0)
+            delta = ev.get("delta", {}) or {}
+            block = blocks.get(idx)
+            if block is None:
+                continue
+            dt = delta.get("type")
+            if dt == "text_delta":
+                block["text"] = block.get("text", "") + delta.get("text", "")
+            elif dt == "input_json_delta":
+                tool_input_buffers[idx] = tool_input_buffers.get(idx, "") + delta.get(
+                    "partial_json", ""
+                )
+        elif et == "content_block_stop":
+            idx = ev.get("index", 0)
+            block = blocks.get(idx)
+            if block is None:
+                continue
+            if block.get("type") == "tool_use":
+                raw = tool_input_buffers.get(idx, "")
+                if raw:
+                    try:
+                        block["input"] = json.loads(raw)
+                    except json.JSONDecodeError:
+                        block["input"] = {}
+        elif et == "message_delta":
+            delta = ev.get("delta", {}) or {}
+            if "stop_reason" in delta:
+                skeleton["stop_reason"] = delta["stop_reason"]
+            if "stop_sequence" in delta:
+                skeleton["stop_sequence"] = delta["stop_sequence"]
+            usage = ev.get("usage")
+            if usage:
+                skeleton["usage"] = {**skeleton.get("usage", {}), **usage}
+        # message_stop: nothing to assemble
+
+    # Preserve block order by index
+    skeleton["content"] = [blocks[i] for i in sorted(blocks.keys())]
+    return skeleton
+
+
+def post_llm_cancellable(
+    url: str,
+    api_key: str,
+    payload: dict[str, Any],
+    abort_flag: Any,
+    timeout: int = 180,
+    poll_interval: float = 0.2,
+) -> dict[str, Any]:
+    """POST /v1/messages with stream=true and tear the connection down
+    within ~poll_interval seconds when ``abort_flag`` fires.
+
+    The Anthropic SDK has no first-class cancel; the urllib socket does.
+    We register a watchdog thread that closes the response object the
+    instant the flag is set, which surfaces as a read error on the main
+    thread; we then translate it to ``TaskCancelled``.
+
+    On normal completion, the SSE event list is folded back into the
+    standard /v1/messages response shape so the caller sees the same
+    ``{content: [...], stop_reason, ...}`` dict it would have seen from
+    the blocking ``post_llm``.
+    """
+    streamed = dict(payload)
+    streamed["stream"] = True
+    body = json.dumps(streamed).encode()
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "x-api-key": api_key,
+            "content-type": "application/json",
+            "anthropic-version": "2023-06-01",
+            "user-agent": "agentflow-desktop/0.2",
+            "accept": "text/event-stream",
+        },
+    )
+
+    resp = urllib.request.urlopen(req, timeout=timeout)
+
+    # Watchdog: closes the response socket within poll_interval of an abort.
+    import threading as _th
+
+    stop_watch = _th.Event()
+    aborted = _th.Event()
+
+    def _watch() -> None:
+        while not stop_watch.is_set():
+            if abort_flag.is_set():
+                aborted.set()
+                with contextlib.suppress(Exception):
+                    resp.close()
+                return
+            stop_watch.wait(poll_interval)
+
+    watcher = _th.Thread(target=_watch, name="llm-cancel-watch", daemon=True)
+    watcher.start()
+
+    events: list[dict[str, Any]] = []
+    current_event: str | None = None
+    buffer = b""
+    try:
+        # Read SSE line by line. We do not trust the upstream to flush
+        # promptly, but Anthropic streaming flushes per event which gives
+        # us ~10-50 ms granularity in practice.
+        while True:
+            if abort_flag.is_set():
+                raise TaskCancelled()
+            try:
+                chunk = resp.read(4096)
+            except Exception as exc:  # noqa: BLE001
+                if aborted.is_set() or abort_flag.is_set():
+                    raise TaskCancelled() from exc
+                raise
+            if not chunk:
+                break
+            buffer += chunk
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                s = line.decode("utf-8", errors="replace").rstrip("\r")
+                if not s:
+                    current_event = None
+                    continue
+                if s.startswith(":"):
+                    continue  # SSE comment / keepalive
+                if s.startswith("event:"):
+                    current_event = s[len("event:"):].strip()
+                    continue
+                if s.startswith("data:"):
+                    data = s[len("data:"):].strip()
+                    if not data or data == "[DONE]":
+                        continue
+                    try:
+                        ev = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    if current_event and "type" not in ev:
+                        ev["type"] = current_event
+                    events.append(ev)
+                    if ev.get("type") == "error":
+                        return {"type": "error", "error": ev.get("error") or ev}
+    finally:
+        stop_watch.set()
+        with contextlib.suppress(Exception):
+            resp.close()
+
+    if abort_flag.is_set():
+        raise TaskCancelled()
+    return _assemble_anthropic_sse(events)
 
 
 def update_live(state: DriverState, action: str, detail: str = "", thinking: str = "") -> None:
@@ -331,28 +536,33 @@ def run_task(
         }
     ]
 
+    def _emit_cancel() -> str:
+        state.abort_flag.clear()
+        update_live(state, "cancelled", "task cancelled by user")
+        print("\n=== CANCELLED ===", flush=True)
+        if state.current_task_id:
+            state.publish_outbound(
+                {
+                    "type": "task_error",
+                    "task_id": state.current_task_id,
+                    "error": "cancelled_by_user",
+                }
+            )
+        return ""
+
     final_answer = ""
     iterations = 0
     for i in range(max_iters):
-        # Check for cancel signal between iterations (never mid-tool-call).
+        # Iteration-boundary check: fast path for tasks cancelled while idle
+        # between iterations. The mid-stream and pre-tool-dispatch checks
+        # below cover the long-pole cases.
         if state.abort_flag.is_set():
-            state.abort_flag.clear()
-            update_live(state, "cancelled", "task cancelled by user")
-            print("\n=== CANCELLED ===", flush=True)
-            if state.current_task_id:
-                state.publish_outbound(
-                    {
-                        "type": "task_error",
-                        "task_id": state.current_task_id,
-                        "error": "cancelled_by_user",
-                    }
-                )
-            return ""
+            return _emit_cancel()
 
         iterations = i + 1
         print(f"\n--- iter {iterations} ---", flush=True)
         try:
-            resp = post_llm(
+            resp = post_llm_cancellable(
                 llm_url,
                 api_key,
                 {
@@ -362,7 +572,10 @@ def run_task(
                     "tools": tools,
                     "messages": messages,
                 },
+                state.abort_flag,
             )
+        except TaskCancelled:
+            return _emit_cancel()
         except urllib.error.HTTPError as exc:
             body = exc.read().decode()[:300]
             print(f"http {exc.code}: {body}", flush=True)
@@ -389,6 +602,11 @@ def run_task(
         results: list[dict[str, Any]] = []
         done = False
         for tu in tool_uses:
+            # Pre-dispatch abort gate: covers the case where cancel arrives
+            # while the LLM was responding and we already started iterating
+            # over its tool_use blocks.
+            if state.abort_flag.is_set():
+                return _emit_cancel()
             args_preview = json.dumps(tu["input"], ensure_ascii=False)[:160]
             print(f"  → {tu['name']}({args_preview})", flush=True)
             try:
