@@ -23,6 +23,11 @@ dependencies = [
 [project.optional-dependencies]
 linux = []
 windows = []
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.7",
+]
 
 [project.scripts]
 agentflow-computer-mcp = "agentflow_computer_mcp.__main__:main"
