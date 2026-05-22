@@ -436,6 +436,43 @@ DESKTOP_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "selfmod_request_change",
+        "description": (
+            "Request a code change to the agentflow-computer-mcp daemon itself. "
+            "Queues the request; a background worker spawns a code agent that opens a PR. "
+            "Rate-limited to 1 accepted request per 15 minutes."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Why this change matters (1-2 sentences).",
+                },
+                "suggested_change": {
+                    "type": "string",
+                    "description": "Concrete description of what to change. Files, behaviour, acceptance.",
+                },
+                "urgency": {
+                    "type": "string",
+                    "enum": ["low", "normal", "high"],
+                    "default": "normal",
+                },
+            },
+            "required": ["reason", "suggested_change"],
+        },
+    },
+    {
+        "name": "selfmod_list_recent",
+        "description": "List recent self-modification requests with status. Use to verify a previous request landed.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "default": 10, "minimum": 1, "maximum": 50},
+            },
+        },
+    },
+    {
         "name": "task_complete",
         "description": "Finish with answer.",
         "input_schema": {
@@ -524,6 +561,26 @@ class ToolExecutor:
             return self._pw.press(args["key"]), None
         if name == "browser_eval":
             return self._pw.eval_js(args["js"]), None
+        if name == "selfmod_request_change":
+            from . import selfmod
+
+            try:
+                result = selfmod.request_change(
+                    reason=args["reason"],
+                    suggested_change=args["suggested_change"],
+                    urgency=args.get("urgency", "normal"),
+                )
+                return json.dumps(result, ensure_ascii=False), None
+            except Exception as exc:  # noqa: BLE001
+                return json.dumps({"ok": False, "error": str(exc)}), None
+        if name == "selfmod_list_recent":
+            from . import selfmod
+
+            try:
+                rows = selfmod.list_recent(int(args.get("limit", 10)))
+                return json.dumps({"items": rows}, ensure_ascii=False), None
+            except Exception as exc:  # noqa: BLE001
+                return json.dumps({"ok": False, "error": str(exc)}), None
         if name == "task_complete":
             return "__DONE__", None
         return f"unknown tool: {name}", None
