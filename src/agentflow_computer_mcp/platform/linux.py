@@ -119,10 +119,46 @@ class LinuxBackend:
 
     # ---- Keyboard -----------------------------------------------------------
     def keyboard_type(self, text: str, interval: float = 0.0) -> dict[str, int]:
+        # See mac.py: pyautogui.typewrite on Linux also goes through the active
+        # XKB layout, so Cyrillic / CJK lose data when the user is in EN.
+        # Route non-ASCII through clipboard-paste; ASCII keeps the fast path.
+        if any(ord(c) > 127 for c in text):
+            self._type_via_clipboard(text)
+            return {"length": len(text)}
         import pyautogui
 
         pyautogui.typewrite(text, interval=interval)
         return {"length": len(text)}
+
+    def _type_via_clipboard(self, text: str) -> None:
+        """Paste ``text`` at the current focus, preserving the user's clipboard."""
+        import contextlib
+
+        saved = ""
+        try:
+            saved = self.clipboard_read()
+        except Exception:  # noqa: BLE001
+            saved = ""
+        try:
+            self.clipboard_write(text)
+            import time
+
+            time.sleep(0.05)
+            if _has("xdotool"):
+                subprocess.run(
+                    ["xdotool", "key", "ctrl+v"],
+                    capture_output=True,
+                    timeout=4,
+                    check=False,
+                )
+            else:
+                import pyautogui
+
+                pyautogui.hotkey("ctrl", "v")
+            time.sleep(0.05)
+        finally:
+            with contextlib.suppress(Exception):
+                self.clipboard_write(saved)
 
     def keyboard_key(self, name: str) -> dict[str, str]:
         import pyautogui
