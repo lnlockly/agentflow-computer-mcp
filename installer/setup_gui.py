@@ -220,29 +220,71 @@ def install_daemon_binary() -> Path:
 
 
 def register_scheduled_task(executable: Path) -> None:
-    """Register the daemon to autostart at user logon via schtasks. The
-    .exe is fully self-contained so the task command is just
-    `<executable> --daemon` — no python, no pip, no PATH lookup."""
-    tr_value = f'"{executable}" --daemon'
-    subprocess.run(
-        [
-            "schtasks",
-            "/Create",
-            "/TN",
-            TASK_NAME,
-            "/TR",
-            tr_value,
-            "/SC",
-            "ONLOGON",
-            "/F",
-            "/RL",
-            "LIMITED",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    """Register the daemon to autostart at user logon.
+
+    Uses schtasks /XML instead of /TR because /TR's quoting is broken
+    when the executable path contains spaces (e.g. `C:\\Users\\Mick
+    Thomson\\…`). XML schema sidesteps all quoting and is the same
+    format the Windows Task Scheduler UI exports.
+    """
+    import tempfile
+    from xml.sax.saxutils import escape as xml_escape
+
+    xml = (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
+        "  <Triggers>\n"
+        "    <LogonTrigger>\n"
+        "      <Enabled>true</Enabled>\n"
+        "    </LogonTrigger>\n"
+        "  </Triggers>\n"
+        "  <Principals>\n"
+        '    <Principal id="Author">\n'
+        "      <RunLevel>LeastPrivilege</RunLevel>\n"
+        "    </Principal>\n"
+        "  </Principals>\n"
+        "  <Settings>\n"
+        "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n"
+        "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n"
+        "    <StartWhenAvailable>true</StartWhenAvailable>\n"
+        "    <Enabled>true</Enabled>\n"
+        "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n"
+        "    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n"
+        "  </Settings>\n"
+        '  <Actions Context="Author">\n'
+        "    <Exec>\n"
+        f"      <Command>{xml_escape(str(executable))}</Command>\n"
+        "      <Arguments>--daemon</Arguments>\n"
+        "    </Exec>\n"
+        "  </Actions>\n"
+        "</Task>\n"
     )
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".xml", delete=False, encoding="utf-16"
+    ) as fp:
+        fp.write(xml)
+        xml_path = fp.name
+    try:
+        subprocess.run(
+            [
+                "schtasks",
+                "/Create",
+                "/TN",
+                TASK_NAME,
+                "/XML",
+                xml_path,
+                "/F",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    finally:
+        try:
+            os.unlink(xml_path)
+        except OSError:
+            pass
 
 
 def launch_daemon(executable: Path) -> None:
