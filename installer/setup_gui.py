@@ -509,6 +509,21 @@ class SetupWindow:
         )
         self.action_btn.pack(side="right")
 
+        # «Проверить обновление» link — calls auto_updater.check_now()
+        # synchronously and writes the result into the log view. Placed
+        # under the install card so it's visible before AND after install.
+        self.update_link = tk.Label(
+            wrap,
+            text="Проверить обновление",
+            bg=BG,
+            fg=MUTED,
+            font=("Segoe UI", 9, "underline"),
+            cursor="hand2",
+            anchor="w",
+        )
+        self.update_link.pack(fill="x", pady=(2, 0))
+        self.update_link.bind("<Button-1>", lambda _e: self._on_check_update())
+
     def _toggle_advanced(self) -> None:
         self.adv_open = not self.adv_open
         if self.adv_open:
@@ -622,6 +637,39 @@ class SetupWindow:
         device_id = self.device_id or ""
         url = f"https://agentflow.website/cabinet/devices/{device_id}/live"
         webbrowser.open(url)
+
+    def _on_check_update(self) -> None:
+        """Call auto_updater.check_now() synchronously and surface the
+        result. Runs in the GUI thread because the call is short (single
+        HTTPS GET to api.github.com) — no need to spawn a worker."""
+        try:
+            from agentflow_computer_mcp import __version__ as local_version
+            from agentflow_computer_mcp.auto_updater import check_now
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"Не получилось загрузить модуль обновления: {exc}")
+            return
+
+        self._log("Проверяю обновление…")
+        try:
+            # allow_unfrozen=True so the link works when the wizard runs
+            # outside the PyInstaller bundle (manual `python setup_gui.py`).
+            result = check_now(allow_unfrozen=True)
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"Ошибка проверки: {exc}")
+            return
+
+        status = result.get("status", "")
+        latest = result.get("latest") or ""
+        if status == "current":
+            self._log(f"Версия {local_version} актуальна")
+        elif status == "available":
+            self._log(f"Доступна версия {latest}, скачиваю…")
+        elif status == "applied":
+            self._log(f"Обновлено до {latest}. Перезапусти приложение.")
+        elif status == "skipped":
+            self._log(f"Пропущено: {result.get('reason', '')}")
+        else:
+            self._log(f"Не получилось: {result.get('reason', '')}")
 
     def run(self) -> None:
         self.root.mainloop()
