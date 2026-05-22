@@ -15,11 +15,15 @@ from websockets.exceptions import ConnectionClosed
 from . import __version__
 from .auth import build_connect_headers, save_auth
 from .config import AUTH_FILE, AppConfig
+from .health import get_health
 
 log = logging.getLogger(__name__)
 
 HEARTBEAT_INTERVAL_S = 15
 HEARTBEAT_TIMEOUT_S = 45
+WS_OPEN_TIMEOUT_S = 30
+RECONNECT_BACKOFF_CAP_S = 30
+DEGRADED_FAILURE_THRESHOLD = 5
 
 ToolHandler = Callable[[str, dict[str, Any]], Awaitable[Any]]
 TaskDispatchHandler = Callable[[str, str, dict[str, Any] | None], None]
@@ -60,21 +64,42 @@ class WSClient:
         self._last_recv_ts: float = 0.0
         self._stop = asyncio.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._handshake_completed: bool = False
 
     async def run(self) -> None:
         self._loop = asyncio.get_running_loop()
+        health = get_health()
         backoff = 1.0
+        degraded_logged = False
         while not self._stop.is_set():
+            health.mark_connecting()
+            self._handshake_completed = False
             try:
                 await self._connect_once()
                 backoff = 1.0
+                degraded_logged = False
             except Exception as exc:
                 log.warning("ws session ended: %s", exc)
-                sleep_s = min(backoff, 60) + random.uniform(0, 0.5)
+                # If the previous session completed the handshake, treat this as
+                # a fresh failure cycle: start backoff at 1s rather than doubling
+                # whatever value was left over from an earlier outage.
+                if self._handshake_completed:
+                    backoff = 1.0
+                health.mark_reconnecting(str(exc))
+                if (
+                    health.consecutive_failures >= DEGRADED_FAILURE_THRESHOLD
+                    and not degraded_logged
+                ):
+                    log.warning(
+                        "ws degraded — restart recommended (%d consecutive failures)",
+                        health.consecutive_failures,
+                    )
+                    degraded_logged = True
+                sleep_s = min(backoff, RECONNECT_BACKOFF_CAP_S) + random.uniform(0, 0.5)
                 log.info("reconnecting in %.1fs", sleep_s)
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(self._stop.wait(), timeout=sleep_s)
-                backoff = min(backoff * 2, 60)
+                backoff = min(backoff * 2, RECONNECT_BACKOFF_CAP_S)
 
     def stop(self) -> None:
         self._stop.set()
@@ -115,6 +140,7 @@ class WSClient:
             additional_headers=headers,
             ping_interval=None,
             max_size=16 * 1024 * 1024,
+            open_timeout=WS_OPEN_TIMEOUT_S,
         ) as ws:
             self._ws = ws
             self._last_recv_ts = time.time()
@@ -209,6 +235,8 @@ class WSClient:
             log.exception("stream subscribe handler failed: %s", exc)
 
     async def _handle_hello_ack(self, msg: dict[str, Any]) -> None:
+        self._handshake_completed = True
+        get_health().mark_connected()
         new_secret = msg.get("device_secret")
         if new_secret and new_secret != self._config.auth.device_secret:
             self._config.auth.device_secret = new_secret

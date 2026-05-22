@@ -6,6 +6,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
+from ..health import get_health
 from .state import DriverState
 
 INDEX_HTML = """<!doctype html><html><head><meta charset="utf-8">
@@ -197,6 +198,9 @@ def make_handler(state: DriverState, presets: list[dict[str, str]]) -> type[Base
                 return
             if self.path.startswith("/presets.json"):
                 self._json(presets)
+                return
+            if self.path.startswith("/api/health"):
+                self._json(get_health().to_dict())
                 return
             self.send_response(404)
             self.end_headers()
