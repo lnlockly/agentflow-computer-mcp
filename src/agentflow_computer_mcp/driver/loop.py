@@ -116,6 +116,29 @@ def build_system_prompt(window_summary: str, af_tools_present: bool) -> str:
         "project_id и slug, не жди до конца если время > 60с.\n"
     )
 
+    browser_efficiency = (
+        "\nBrowser efficiency (use these patterns, not screenshot+click):\n"
+        "  • Чтобы извлечь данные с веба — browser_eval с JS-выражением, не screenshot+OCR:\n"
+        "    browser_eval(\"Array.from(document.querySelectorAll('.card')).map(c => c.innerText).slice(0,10)\")\n"
+        "  • Чтобы заполнить форму — browser_fill(selector, value), не activate_app + type.\n"
+        "  • Чтобы нажать кнопку — browser_click(selector с aria-label или text content).\n"
+        "  • Когда сайт уже открыт у юзера в браузере (kwork.ru, Telegram Web) — это другой\n"
+        "    реальный браузер с сессией; используй chrome_eval / chrome_open_url (не headed\n"
+        "    Chromium). browser_* открывает чистую сессию без логина юзера.\n"
+        "  • Перед browser_click — всегда browser_snapshot чтобы убедиться элемент существует.\n"
+        "    Не кликай по координатам — клик по селектору идемпотентен.\n"
+    )
+
+    task_efficiency = (
+        "\nЭффективность простых задач:\n"
+        "  • Прочитать что в Telegram — af_recall(tags=['tg']) или browser_eval на Telegram Web,\n"
+        "    НЕ activate_app + screenshot.\n"
+        "  • Открыть kwork — chrome_open_url https://kwork.ru/projects если юзер залогинен\n"
+        "    в Chrome, иначе browser_open + DOM extraction.\n"
+        "  • Не больше 3 итераций на простое чтение. Если 3 шага не дали результат — task_complete\n"
+        "    с честным «не получилось, нужно X» вместо бесконечного цикла.\n"
+    )
+
     coding_workflow = (
         "\nCoding workflow:\n"
         "  1. Read first: code_list_dir для обзора, code_read_file для конкретных файлов. "
@@ -161,8 +184,10 @@ def build_system_prompt(window_summary: str, af_tools_present: bool) -> str:
         "Google Chrome с его сессией.\n"
         f"{af_block}"
         f"{intent_map}"
+        f"{browser_efficiency}"
         f"{memory_block}"
         f"{coding_workflow}"
+        f"{task_efficiency}"
         f"{visibility_block}"
         "Scope hard rules: paths `~/.ssh`, `~/.config`, `~/Library/Keychains`, `~/.aws`, `~/.gnupg` всегда запрещены "
         "к чтению/записи. fs.write и shell.exec требуют подтверждения. Не пытайся это обходить.\n"

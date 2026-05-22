@@ -1,6 +1,7 @@
 """macOS backend: Quartz / CoreGraphics + AppleScript + pyautogui + pbpaste/pbcopy."""
 from __future__ import annotations
 
+import contextlib
 import io
 import subprocess
 import time
@@ -131,8 +132,37 @@ class MacBackend:
 
     # ---- Keyboard -----------------------------------------------------------
     def keyboard_type(self, text: str, interval: float = 0.0) -> dict[str, int]:
+        # pyautogui.typewrite on macOS routes through the active keyboard layout's
+        # character map. Russian / Greek / Chinese chars come out as garbage when
+        # the user is in EN layout (the typewrite path can only send keycodes that
+        # exist in the active layout). Clipboard-paste sidesteps the layout map
+        # entirely — pasted text lands as-is no matter what layout is active.
+        if any(ord(c) > 127 for c in text):
+            self._type_via_clipboard(text)
+            return {"length": len(text)}
         pyautogui.typewrite(text, interval=interval)
         return {"length": len(text)}
+
+    def _type_via_clipboard(self, text: str) -> None:
+        """Paste ``text`` at the current focus, preserving the user's clipboard.
+
+        Used for non-ASCII content where the keystroke path would be filtered
+        through the active keyboard layout and produce garbage.
+        """
+        saved = ""
+        try:
+            saved = self.clipboard_read()
+        except Exception:  # noqa: BLE001
+            saved = ""
+        try:
+            self.clipboard_write(text)
+            # Small delay so pbcopy commits before Cmd+V reads the pasteboard.
+            time.sleep(0.05)
+            _osa('tell application "System Events" to keystroke "v" using command down')
+            time.sleep(0.05)
+        finally:
+            with contextlib.suppress(Exception):
+                self.clipboard_write(saved)
 
     def keyboard_key(self, name: str) -> dict[str, str]:
         pyautogui.press(name)

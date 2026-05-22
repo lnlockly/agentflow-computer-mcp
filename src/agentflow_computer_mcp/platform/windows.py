@@ -79,10 +79,37 @@ class WindowsBackend:
 
     # ---- Keyboard -----------------------------------------------------------
     def keyboard_type(self, text: str, interval: float = 0.0) -> dict[str, int]:
+        # pyautogui.typewrite on Windows uses SendInput which respects the
+        # active keyboard layout. Cyrillic / Greek typed under an EN layout
+        # comes out as ???. Clipboard-paste bypasses the layout map.
+        if any(ord(c) > 127 for c in text):
+            self._type_via_clipboard(text)
+            return {"length": len(text)}
         import pyautogui
 
         pyautogui.typewrite(text, interval=interval)
         return {"length": len(text)}
+
+    def _type_via_clipboard(self, text: str) -> None:
+        """Paste ``text`` at the current focus, preserving the user's clipboard."""
+        import contextlib
+        import time
+
+        import pyautogui
+
+        saved = ""
+        try:
+            saved = self.clipboard_read()
+        except Exception:  # noqa: BLE001
+            saved = ""
+        try:
+            self.clipboard_write(text)
+            time.sleep(0.05)
+            pyautogui.hotkey("ctrl", "v")
+            time.sleep(0.05)
+        finally:
+            with contextlib.suppress(Exception):
+                self.clipboard_write(saved)
 
     def keyboard_key(self, name: str) -> dict[str, str]:
         import pyautogui
