@@ -26,13 +26,45 @@ def build_system_prompt(window_summary: str, af_tools_present: bool) -> str:
     af_block = ""
     if af_tools_present:
         af_block = (
-            "\nAgentFlow API tools (`af_*`):\n"
-            "  • af_list_projects / af_get_project / af_create_project / af_approve_project — manage user's projects.\n"
-            "  • af_list_devices / af_get_device — see this user's enrolled desktop machines.\n"
-            "  • af_list_agents / af_send_agent_message — talk to project agents.\n"
-            "  • af_send_telegram_message / af_post_matrix_room — broadcast to bound channels.\n"
-            "Prefer af_* when the task is platform-side (create a project, ping agent) — no need to open a browser.\n"
+            "\nAgentFlow API tools (`af_*`) — используй их вместо UI-кликов когда возможно:\n"
+            "  • af_list_projects / af_get_project / af_create_project / af_approve_project — проекты.\n"
+            "  • af_list_devices / af_get_device — мои desktop-машины.\n"
+            "  • af_list_agents / af_send_agent_message — общение с агентами маркетплейса.\n"
+            "  • af_send_telegram_message(chat_id, text) — отправить TG-сообщение через MCP.\n"
+            "      chat_id='me' → Saved Messages. chat_id='1361064246' → owner.\n"
+            "  • af_post_matrix_room(room_id, text) — Matrix-сообщение через MCP.\n"
         )
+
+    # Concrete mapping from common user phrases to the right tool. The model
+    # needs this because "напиши в TG" used to trigger UI-driven Telegram-app
+    # automation, which was slow, brittle, and visually noisy. The af_* path
+    # is silent, idempotent, and works even when the Telegram window is
+    # closed.
+    intent_map = (
+        "\nКонкретные сопоставления (запрос юзера → инструмент):\n"
+        "  • «напиши в TG / отправь сообщение в Telegram / в Saved» → "
+        "af_send_telegram_message(chat_id='me', text=...). НЕ открывай приложение Telegram.\n"
+        "  • «напиши в TG юзеру X / chat_id N» → af_send_telegram_message(chat_id=N, text=...).\n"
+        "  • «напиши в Matrix / в комнату X» → af_post_matrix_room(room_id=..., text=...).\n"
+        "  • «открой Terminal / iTerm» → activate_app('iTerm2') ИЛИ activate_app('Terminal'); "
+        "после wait 0.4 → read_terminal чтобы убедиться что вкладка активна.\n"
+        "  • «открой kwork / kwork.ru / посмотри заказы на kwork» → browser_open → "
+        "browser_navigate https://kwork.ru/projects → browser_snapshot → browser_eval для DOM-извлечения.\n"
+        "  • «открой документ X / напиши в файл» → fs.write (с подтверждением), либо открой через "
+        "activate_app соответствующего редактора, потом keypress/type.\n"
+        "  • «прочитай экран / что сейчас открыто» → screen_capture + краткое описание.\n"
+    )
+
+    visibility_block = (
+        "\nВизуализация для юзера:\n"
+        "  • Перед каждым tool_use делай text-блок с одной строкой что ты сейчас будешь делать "
+        "(«открываю kwork.ru», «пишу в Saved Messages», «читаю iTerm»). Юзер видит это в action timeline.\n"
+        "  • Между шагами — короткие констатации факта («нашёл 10 заказов», «отправлено, message_id=…»). "
+        "Не пиши простыни рассуждений. Никаких 'really/simply/actually/literally'.\n"
+        "  • Когда задача про сообщение — task_complete с message_id или подтверждением, а не пересказ "
+        "того что ты написал.\n"
+    )
+
     return (
         "Ты управляешь Mac пользователя. Перед действием — короткая мысль в text-блоке. "
         "Не извиняйся, не повторяй очевидное. Стратегия:\n"
@@ -44,6 +76,8 @@ def build_system_prompt(window_summary: str, af_tools_present: bool) -> str:
         "  • для авторизованного веба (где у юзера уже залогинено): chrome_eval / chrome_open_url — реальный "
         "Google Chrome с его сессией.\n"
         f"{af_block}"
+        f"{intent_map}"
+        f"{visibility_block}"
         "Scope hard rules: paths `~/.ssh`, `~/.config`, `~/Library/Keychains`, `~/.aws`, `~/.gnupg` всегда запрещены "
         "к чтению/записи. fs.write и shell.exec требуют подтверждения. Не пытайся это обходить.\n"
         f"Окна Mac сейчас:\n{window_summary}\n"
