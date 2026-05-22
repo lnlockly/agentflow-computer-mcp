@@ -217,6 +217,39 @@ agentflow-desktop run --selfmod-automerge --selfmod-autoapply
 
 Full threat model + storage shape: [docs/SELFMOD.md](docs/SELFMOD.md).
 
+## Autonomous mode (Phase 0 — skeleton)
+
+The `agentflow_computer_mcp.autonomous` package adds the scaffolding for long-horizon goals: type a goal, the planner splits it into milestones, each morning the daily-wake cycle drafts and dispatches today's tasks, each evening reflection extracts lessons into a local memory store. Everything persists in `~/.agentflow/autonomous.db` (SQLite).
+
+What ships now:
+
+- SQL schema: `goals`, `milestones`, `daily_plans`, `lessons`, `skills`, `budget_ledger`, `sub_agents`.
+- Planner: `decompose_goal`, `plan_today`, `reflect_on_day` — all gated through an injectable `llm_fn` (default posts to `https://agentflow.website/_agents/llm/v1/messages`).
+- Memory: `recall` (token-overlap, no embeddings), `record_skill`, `top_skills`, `record_skill_outcome` (failed skills decay).
+- Budget: per-model USD estimates, `today_spent`, `alert_if_over` (enqueues a `system_alert` task on the user's device when the cap trips).
+- Daily cycle: `wake_cycle.wake` runs the plan + dispatch loop; `run_forever` fires it once per day at the wake hour.
+- Sub-agents: intent rows only — `spawn(role, brief)` records the request; actual multi-process spawning is Phase 2.
+
+CLI:
+
+```bash
+python -m agentflow_computer_mcp.autonomous.cli init
+python -m agentflow_computer_mcp.autonomous.cli goal add "ship MVP" --target-metric=users --target-value=100 --deadline=2026-08-01
+python -m agentflow_computer_mcp.autonomous.cli plan --goal=1 --decompose
+python -m agentflow_computer_mcp.autonomous.cli today
+python -m agentflow_computer_mcp.autonomous.cli reflect --plan=1 --outcomes="task 1 done, task 2 blocked"
+python -m agentflow_computer_mcp.autonomous.cli status
+```
+
+What does NOT ship in Phase 0 (be honest about it):
+
+- No real money-earning workflows. The planner outputs «research niches», «build landing», «launch» — it does not have any execution recipe that reliably produces revenue.
+- No multi-month coherence guarantees. The planner re-reads the goal each day but there is no long-term memory consolidation, no spaced-repetition over lessons, no goal-drift detector.
+- No true self-improvement. Reflection writes lessons, but nothing yet feeds those lessons back into the prompts of subsequent planner calls.
+- No real money-spending tools (no Stripe checkout, no broker APIs, no auto-purchase). By design — adding those needs explicit owner sign-off.
+
+If you set `goal = "earn $1M by 2027"`, what you'll actually get on Phase 0 is a sensible milestone tree and daily task lists, dispatched to your desktop device for you (the human) to execute. The «autonomous for a year» loop is a Phase 2+ goal.
+
 ## Dev
 
 ```bash
