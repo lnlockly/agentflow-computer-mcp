@@ -32,6 +32,7 @@ class WSClient:
     Routes server-initiated frames:
       • `tool_call_request` → tool handler (existing behavior)
       • `task_dispatch`     → `on_task_dispatch(task_id, task, scope)`
+      • `task_cancel`       → `on_task_cancel(task_id?)`
       • `subscribe_stream`  → `on_stream_subscribe(True)`
       • `unsubscribe_stream` → `on_stream_subscribe(False)`
 
@@ -47,12 +48,14 @@ class WSClient:
         *,
         on_task_dispatch: TaskDispatchHandler | None = None,
         on_stream_subscribe: StreamSubscribeHandler | None = None,
+        on_task_cancel: Callable[[str | None], None] | None = None,
     ) -> None:
         self._config = config
         self._handler = tool_handler
         self._tool_names = tool_names
         self._on_task_dispatch = on_task_dispatch
         self._on_stream_subscribe = on_stream_subscribe
+        self._on_task_cancel = on_task_cancel
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._last_recv_ts: float = 0.0
         self._stop = asyncio.Event()
@@ -160,6 +163,9 @@ class WSClient:
             if mtype == "task_dispatch":
                 self._handle_task_dispatch(msg)
                 continue
+            if mtype == "task_cancel":
+                self._handle_task_cancel(msg)
+                continue
             if mtype == "subscribe_stream":
                 self._handle_stream_subscription(True)
                 continue
@@ -182,6 +188,16 @@ class WSClient:
             self._on_task_dispatch(task_id, task, scope)
         except Exception as exc:  # noqa: BLE001
             log.exception("task_dispatch handler failed: %s", exc)
+
+    def _handle_task_cancel(self, msg: dict[str, Any]) -> None:
+        task_id: str | None = msg.get("task_id") or None
+        if self._on_task_cancel is None:
+            log.warning("task_cancel received but no handler registered (task_id=%s)", task_id)
+            return
+        try:
+            self._on_task_cancel(task_id)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("task_cancel handler failed: %s", exc)
 
     def _handle_stream_subscription(self, subscribe: bool) -> None:
         if self._on_stream_subscribe is None:

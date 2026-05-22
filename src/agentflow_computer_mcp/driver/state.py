@@ -36,6 +36,9 @@ class DriverState:
     # on WS disconnect. Capture loop polls this to decide whether to push
     # `stream_frame` frames over the wire.
     stream_subscribed: threading.Event = field(default_factory=threading.Event)
+    # Set by `request_abort` when a task_cancel WS frame arrives. The run_task
+    # loop checks this between iterations and exits early. Cleared after abort.
+    abort_flag: threading.Event = field(default_factory=threading.Event)
 
     def __post_init__(self) -> None:
         self.live_dir.mkdir(parents=True, exist_ok=True)
@@ -49,6 +52,32 @@ class DriverState:
         # never crash the AI loop on a flaky socket
         with contextlib.suppress(Exception):
             pub(payload)
+
+    def request_abort(self, task_id: str | None = None) -> None:
+        """Signal the running task to abort between iterations.
+
+        If *task_id* is given, the abort fires only when it matches the
+        currently running task.  Pass ``None`` (or omit) to cancel whatever
+        task is running unconditionally.
+
+        Idempotent: safe to call when no task is running — sets the flag which
+        the idle worker will clear immediately on the next queue-drain cycle.
+        """
+        if task_id is not None and self.current_task_id and task_id != self.current_task_id:
+            import logging
+            logging.getLogger(__name__).warning(
+                "request_abort: task_id=%s does not match current_task_id=%s — ignored",
+                task_id,
+                self.current_task_id,
+            )
+            return
+        if not self.busy:
+            import logging
+            logging.getLogger(__name__).warning(
+                "request_abort called but no task is running (task_id=%s) — no-op", task_id
+            )
+            return
+        self.abort_flag.set()
 
     def enqueue_task(self, task: str, task_id: str = "") -> str:
         """Queue a task with an optional pre-assigned id. Returns the id."""

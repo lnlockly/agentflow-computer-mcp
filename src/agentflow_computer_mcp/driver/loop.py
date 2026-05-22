@@ -141,6 +141,21 @@ def run_task(
     final_answer = ""
     iterations = 0
     for i in range(max_iters):
+        # Check for cancel signal between iterations (never mid-tool-call).
+        if state.abort_flag.is_set():
+            state.abort_flag.clear()
+            update_live(state, "cancelled", "task cancelled by user")
+            print("\n=== CANCELLED ===", flush=True)
+            if state.current_task_id:
+                state.publish_outbound(
+                    {
+                        "type": "task_error",
+                        "task_id": state.current_task_id,
+                        "error": "cancelled_by_user",
+                    }
+                )
+            return ""
+
         iterations = i + 1
         print(f"\n--- iter {iterations} ---", flush=True)
         try:
