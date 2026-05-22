@@ -23,7 +23,7 @@ def _mock_resp(body: dict[str, Any], status: int = 200):
         def read(self) -> bytes:
             return json.dumps(body).encode()
 
-        def __enter__(self) -> "_R":
+        def __enter__(self) -> _R:
             return self
 
         def __exit__(self, *args: object) -> None:

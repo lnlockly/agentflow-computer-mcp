@@ -16,7 +16,6 @@ from typing import Any
 
 from ..config import Scope
 from ..scope import check_path, check_shell
-from . import fs as fs_tool
 from . import shell as shell_tool
 
 DEFAULT_IGNORE: tuple[str, ...] = (".git", "node_modules", "dist", ".venv", "__pycache__")
