@@ -5,33 +5,19 @@ on:
     branches: [main]
   pull_request:
 
-jobs:
-  test-macos:
-    runs-on: macos-latest
-    strategy:
-      matrix:
-        python-version: ["3.11", "3.12"]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-      - name: Install
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
-      - name: Lint
-        run: ruff check src tests
-      - name: Test
-        run: pytest -v
-      - name: Selftest
-        run: agentflow-desktop selftest
+# CI runs on the self-hosted runner at ff-france (labels:
+# self-hosted,Linux,X64,computer-mcp). lnlockly GitHub Actions billing
+# is currently blocked, so hosted ubuntu/macos/windows runners would
+# error before the workflow could start. macOS and Windows test jobs
+# stay commented until matching self-hosted runners exist.
 
+jobs:
   test-linux:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, computer-mcp]
     strategy:
       matrix:
         python-version: ["3.11", "3.12"]
+      fail-fast: false
     steps:
       - uses: actions/checkout@v4
       - name: Install system deps
@@ -54,23 +40,44 @@ jobs:
         run: |
           xvfb-run -a agentflow-desktop selftest || echo "selftest may report partial results without a real desktop session"
 
-  test-windows:
-    runs-on: windows-latest
-    strategy:
-      matrix:
-        python-version: ["3.11", "3.12"]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-      - name: Install
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
-      - name: Lint
-        run: ruff check src tests
-      - name: Test
-        run: pytest -v
-      - name: Selftest
-        run: agentflow-desktop selftest
+  # test-macos:
+  #   runs-on: [self-hosted, macOS]   # enable once a macOS runner is registered for this repo
+  #   strategy:
+  #     matrix:
+  #       python-version: ["3.11", "3.12"]
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: actions/setup-python@v5
+  #       with:
+  #         python-version: ${{ matrix.python-version }}
+  #     - name: Install
+  #       run: |
+  #         python -m pip install --upgrade pip
+  #         pip install -e ".[dev]"
+  #     - name: Lint
+  #       run: ruff check src tests
+  #     - name: Test
+  #       run: pytest -v
+  #     - name: Selftest
+  #       run: agentflow-desktop selftest
+
+  # test-windows:
+  #   runs-on: [self-hosted, Windows]  # enable once a Windows runner is registered for this repo
+  #   strategy:
+  #     matrix:
+  #       python-version: ["3.11", "3.12"]
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: actions/setup-python@v5
+  #       with:
+  #         python-version: ${{ matrix.python-version }}
+  #     - name: Install
+  #       run: |
+  #         python -m pip install --upgrade pip
+  #         pip install -e ".[dev]"
+  #     - name: Lint
+  #       run: ruff check src tests
+  #     - name: Test
+  #       run: pytest -v
+  #     - name: Selftest
+  #       run: agentflow-desktop selftest
