@@ -44,7 +44,10 @@ jobs:
           # sudo prompts: if apt fails (eg already-installed lock), the
           # subsequent pytest step still validates what we actually need.
           sudo -n apt-get update -y || true
-          sudo -n apt-get install -y wmctrl xdotool xclip xvfb || true
+          # python3-tk + python3-dev are required by pyautogui's MouseInfo
+          # init; without them the import raises SystemExit("install tkinter")
+          # which makes any test that touches pyautogui fail at collection.
+          sudo -n apt-get install -y wmctrl xdotool xclip xvfb python3-tk python3-dev || true
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}

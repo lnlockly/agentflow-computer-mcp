@@ -27,6 +27,11 @@ dev = [
     "pytest>=8",
     "pytest-asyncio>=0.24",
     "ruff>=0.7",
+    # playwright is imported by tests/test_firefox_driver.py at module
+    # load time; mark it as a dev dep so CI installs it across all
+    # platforms. The runtime daemon only uses it when the Firefox
+    # driver is actually instantiated.
+    "playwright>=1.40",
 ]
 
 [project.scripts]
@@ -61,4 +66,5 @@ dev = [
     "pytest>=8",
     "pytest-asyncio>=0.24",
     "ruff>=0.7",
+    "playwright>=1.40",
 ]
