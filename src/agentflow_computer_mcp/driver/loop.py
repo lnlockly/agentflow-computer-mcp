@@ -53,6 +53,16 @@ def build_system_prompt(window_summary: str, af_tools_present: bool) -> str:
         "  • «открой документ X / напиши в файл» → fs.write (с подтверждением), либо открой через "
         "activate_app соответствующего редактора, потом keypress/type.\n"
         "  • «прочитай экран / что сейчас открыто» → screen_capture + краткое описание.\n"
+        "  • «проверь почту / посмотри inbox / есть письма?» → activate_app('Mail') → wait 0.5 → "
+        "screen_region на список писем; перечисли последние 5–10 (отправитель, тема, время). "
+        "Если письма нет — скажи прямо.\n"
+        "  • «открой письмо от X / прочитай письмо про Y» → activate_app('Mail') → wait 0.4 → "
+        "browser_eval-стиль нет, используй keypress: Cmd+F → type query → Return → стрелка вниз → "
+        "screen_region на превью.\n"
+        "  • «напиши email / отправь письмо на X с темой Y» → activate_app('Mail') → wait 0.4 → "
+        "keypress Cmd+N → wait 0.3 → type адрес → keypress Tab → type тему → keypress Tab → "
+        "type тело письма. НЕ нажимай Send без явного подтверждения юзера: остановись на "
+        "task_complete с превью того что собрано в окне.\n"
     )
 
     visibility_block = (
