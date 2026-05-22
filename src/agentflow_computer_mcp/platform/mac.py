@@ -90,7 +90,7 @@ class MacBackend:
     name = "mac"
 
     # ---- Screen capture -----------------------------------------------------
-    def capture_screen_fast(self, width_cap: int = 1400, quality: int = 68) -> bytes:
+    def capture_screen_fast(self, width_cap: int = 1280, quality: int = 58) -> bytes:
         img = _capture_quartz_full() if _HAS_QUARTZ else pyautogui.screenshot()
         if img.width > width_cap:
             ratio = width_cap / img.width

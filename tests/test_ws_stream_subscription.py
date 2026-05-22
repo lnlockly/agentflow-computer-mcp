@@ -115,15 +115,15 @@ def test_capture_loop_only_emits_frames_when_subscribed() -> None:
     loop._maybe_publish_ws(b"\xff\xd8\xff\xd9", time.time())
     assert len(sent) == 1
 
-    # after the cooldown → emission allowed again
+    # after the cooldown → emission allowed again (different frame bytes so dedup passes)
     loop._last_ws_emit_at = time.time() - (WS_STREAM_MIN_INTERVAL_S + 0.01)
-    loop._maybe_publish_ws(b"\xff\xd8\xff\xd9", time.time())
+    loop._maybe_publish_ws(b"\xff\xd8\xff\xe0", time.time())
     assert len(sent) == 2
 
     # cleared → no further emission
     state.stream_subscribed.clear()
     loop._last_ws_emit_at = 0.0
-    loop._maybe_publish_ws(b"\xff\xd8\xff\xd9", time.time())
+    loop._maybe_publish_ws(b"\xff\xd8\xff\xe1", time.time())
     assert len(sent) == 2
 
 
