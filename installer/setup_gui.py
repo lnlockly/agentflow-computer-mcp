@@ -28,6 +28,7 @@ import subprocess
 import sys
 import sysconfig
 import threading
+import time
 import tkinter as tk
 import webbrowser
 from pathlib import Path
@@ -507,10 +508,22 @@ class SetupWindow:
             python_exe = find_python()
             self.log_queue.put(f"  → {python_exe}")
 
-            self.log_queue.put("Шаг 2/4: качаю agentflow-computer-mcp с GitHub (≈30-60 сек)")
+            self.log_queue.put("Шаг 2/4: качаю agentflow-computer-mcp с GitHub")
+            self.log_queue.put("  · клонирую репозиторий через git (≈30-60 сек первый запуск)")
+            # PyInstaller's frozen runtime + subprocess on Windows
+            # buffers pip output by default — the log stayed empty even
+            # though pip was working. Force unbuffered IO via `python -u`
+            # + PYTHONUNBUFFERED + raw byte reads so every newline shows
+            # up in real time.
+            env = os.environ.copy()
+            env["PYTHONUNBUFFERED"] = "1"
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["PIP_NO_INPUT"] = "1"
+            env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
             proc = subprocess.Popen(
                 [
                     python_exe,
+                    "-u",
                     "-m",
                     "pip",
                     "install",
@@ -518,26 +531,48 @@ class SetupWindow:
                     "--upgrade",
                     "--progress-bar",
                     "off",
-                    "--verbose",
+                    "-v",
                     PACKAGE_GIT_URL,
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
+                bufsize=0,
+                env=env,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             assert proc.stdout is not None
             last_line = ""
-            for line in proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                last_line = line
-                # Trim pip's noisy `Collecting / Downloading / Using cached`
-                # prefixes — keep the line readable in a 6-row log box.
-                short = line[:140]
-                self.log_queue.put(f"  · {short}")
+            buf = bytearray()
+            last_heartbeat = [time.monotonic()]
+
+            def heartbeat() -> None:
+                if proc.poll() is None:
+                    if time.monotonic() - last_heartbeat[0] > 10:
+                        self.log_queue.put("  · всё ещё работаю, не закрывай окно")
+                        last_heartbeat[0] = time.monotonic()
+                    threading.Timer(5.0, heartbeat).start()
+
+            heartbeat()
+
+            while True:
+                chunk = proc.stdout.read(1)
+                if not chunk:
+                    break
+                if chunk in (b"\n", b"\r"):
+                    if buf:
+                        line = buf.decode("utf-8", "replace").strip()
+                        buf.clear()
+                        if line:
+                            last_line = line
+                            last_heartbeat[0] = time.monotonic()
+                            self.log_queue.put(f"  · {line[:140]}")
+                else:
+                    buf.extend(chunk)
+            if buf:
+                line = buf.decode("utf-8", "replace").strip()
+                if line:
+                    last_line = line
+                    self.log_queue.put(f"  · {line[:140]}")
             rc = proc.wait()
             if rc != 0:
                 raise RuntimeError(f"pip install failed (rc={rc}): {last_line}")
