@@ -1,21 +1,20 @@
-"""AgentFlow Desktop · Windows setup wizard.
+"""AgentFlow Desktop · Windows self-contained installer + daemon.
 
-Single-window Tkinter GUI. User pastes an invite code (base64url JSON
-blob containing the three credentials) or expands the advanced
-disclosure to enter api_key / device_id / device_token by hand.
+Two roles in one binary:
 
-On Install we:
-  1. Decode the invite (if used) and validate the fields.
-  2. pip install --user the package from GitHub, streaming output to a
-     progress label.
-  3. Write %USERPROFILE%\\.agentflow\\auth.json.
-  4. Locate the launcher script (try nt_user scripts, then global,
-     then fall back to `python -m agentflow_computer_mcp.desktop_cli`).
-  5. Register a scheduled task `AgentFlowDesktop` at logon via
-     `schtasks /Create` (no PowerShell).
-  6. Launch the daemon once so the user sees it work.
-  7. Swap the Install button for «Открыть кабинет» that opens the
-     device live page in the default browser.
+1. Default (no args / `--setup`): show the Tkinter wizard. The user pastes
+   an invite code, we write `%USERPROFILE%\\.agentflow\\auth.json`, copy
+   THIS .exe to `%LOCALAPPDATA%\\AgentFlow\\agentflow-desktop.exe`,
+   register a logon scheduled task that points at the copied .exe with
+   `--daemon`, then spawn the daemon immediately.
+
+2. `--daemon`: boot the agent runtime directly (no GUI). The same .exe
+   is used here because PyInstaller already bundles CPython + the whole
+   `agentflow_computer_mcp` package, so the user never needs Python.
+
+3. `--daemon --selftest`: run the platform backend selftest and exit. CI
+   uses this to validate the bundled daemon actually starts before
+   publishing the release artifact.
 """
 
 from __future__ import annotations
@@ -24,11 +23,10 @@ import base64
 import json
 import os
 import queue
+import shutil
 import subprocess
 import sys
-import sysconfig
 import threading
-import time
 import tkinter as tk
 import webbrowser
 from pathlib import Path
@@ -42,9 +40,10 @@ FIELD_BG = "#16161D"
 MUTED = "#7A7A85"
 
 WINDOW_TITLE = "AgentFlow Desktop · Установка"
-PACKAGE_GIT_URL = "git+https://github.com/lnlockly/agentflow-computer-mcp.git"
 DEFAULT_WS_URL = "wss://agentflow.website/_agents/_devices/connect"
 TASK_NAME = "AgentFlowDesktop"
+DAEMON_DIR_NAME = "AgentFlow"
+DAEMON_EXE_NAME = "agentflow-desktop.exe"
 
 
 def b64url_decode(s: str) -> bytes:
@@ -164,35 +163,6 @@ def parse_invite(blob: str) -> dict:
     }
 
 
-def find_python() -> str:
-    """Return path to a working python interpreter on the host.
-
-    Prefer the interpreter under which the setup .exe runs only if it
-    looks like a real on-disk python (PyInstaller's frozen runtime
-    won't have `pip`). Otherwise look for `python` or `python3` on
-    PATH via `where`.
-    """
-    if not getattr(sys, "frozen", False):
-        return sys.executable
-    for name in ("python", "python3"):
-        try:
-            result = subprocess.run(
-                ["where", name],
-                capture_output=True,
-                text=True,
-                check=False,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except FileNotFoundError:
-            continue
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip().splitlines()[0].strip()
-    raise RuntimeError(
-        "Python 3.11+ не найден в PATH. Установи Python с python.org "
-        "и поставь галку «Add to PATH»."
-    )
-
-
 def write_auth_file(creds: dict) -> Path:
     af_dir = Path(os.environ.get("USERPROFILE", str(Path.home()))) / ".agentflow"
     af_dir.mkdir(parents=True, exist_ok=True)
@@ -208,46 +178,52 @@ def write_auth_file(creds: dict) -> Path:
     return auth_path
 
 
-def locate_launcher(python_exe: str) -> tuple[str, list[str]]:
-    """Find the agentflow-desktop launcher .exe; fall back to python -m."""
-
-    def probe(scheme: str | None) -> str | None:
-        try:
-            if scheme:
-                out = subprocess.run(
-                    [
-                        python_exe,
-                        "-c",
-                        f"import sysconfig; print(sysconfig.get_path('scripts', '{scheme}') or '')",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
-                return out.stdout.strip() or None
-            return sysconfig.get_path("scripts") or None
-        except Exception:
-            return None
-
-    candidates: list[str] = []
-    for scheme in ("nt_user", None):
-        path = probe(scheme)
-        if path:
-            candidates.append(path)
-    for scripts_dir in candidates:
-        for name in ("agentflow-desktop.exe", "agentflow-computer-mcp.exe"):
-            exe = Path(scripts_dir) / name
-            if exe.exists():
-                if "computer-mcp" in name:
-                    return str(exe), ["--mode", "ws"]
-                return str(exe), ["run"]
-    return python_exe, ["-m", "agentflow_computer_mcp.desktop_cli", "run"]
+def _self_exe_path() -> Path:
+    """Path to the currently running setup .exe (PyInstaller frozen) or
+    fallback to sys.executable + this script when running from source."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve()
+    # Dev mode — point at the .py file so smoke tests can still verify
+    # the copy step. The real install always runs frozen.
+    return Path(__file__).resolve()
 
 
-def register_scheduled_task(executable: str, args: list[str]) -> None:
-    """Register the daemon to autostart at user logon via schtasks."""
-    tr_value = f'"{executable}" ' + " ".join(args)
+def install_daemon_binary() -> Path:
+    """Copy this .exe to %LOCALAPPDATA%\\AgentFlow\\agentflow-desktop.exe
+    so the scheduled task survives the user moving / deleting the
+    download from the Downloads folder."""
+    base = Path(
+        os.environ.get("LOCALAPPDATA")
+        or (Path(os.environ.get("USERPROFILE", str(Path.home()))) / "AppData" / "Local")
+    )
+    target_dir = base / DAEMON_DIR_NAME
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / DAEMON_EXE_NAME
+    src = _self_exe_path()
+    if src.resolve() == target.resolve():
+        # Already running from the installed location — nothing to copy.
+        return target
+    # On Windows you can't overwrite a running .exe. We're running from
+    # the downloaded copy, not the target, so a plain copy is fine. If
+    # the target is locked (previous daemon still running) try to delete
+    # it first; if that fails fall back to a `.new` sidecar that the
+    # task will pick up on next logon.
+    try:
+        if target.exists():
+            target.unlink()
+        shutil.copy2(src, target)
+    except PermissionError:
+        sidecar = target.with_suffix(".new.exe")
+        shutil.copy2(src, sidecar)
+        return sidecar
+    return target
+
+
+def register_scheduled_task(executable: Path) -> None:
+    """Register the daemon to autostart at user logon via schtasks. The
+    .exe is fully self-contained so the task command is just
+    `<executable> --daemon` — no python, no pip, no PATH lookup."""
+    tr_value = f'"{executable}" --daemon'
     subprocess.run(
         [
             "schtasks",
@@ -269,7 +245,7 @@ def register_scheduled_task(executable: str, args: list[str]) -> None:
     )
 
 
-def launch_daemon(executable: str, args: list[str]) -> None:
+def launch_daemon(executable: Path) -> None:
     """Start the daemon once so the cabinet sees the device immediately."""
     creationflags = 0
     if os.name == "nt":
@@ -277,7 +253,7 @@ def launch_daemon(executable: str, args: list[str]) -> None:
             subprocess, "DETACHED_PROCESS", 0
         )
     subprocess.Popen(
-        [executable, *args],
+        [str(executable), "--daemon"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         stdin=subprocess.DEVNULL,
@@ -397,10 +373,10 @@ class SetupWindow:
             _bind_paste_anywhere(entry)
             self.fields[key] = entry
 
-        # Live log — scrolling text + animated progressbar. The pip
-        # install warmup pulls the whole git history (~30-60s of silent
-        # work in the original GUI), which looked frozen. Now the bar
-        # spins, the latest 6 lines of pip output stream in real-time.
+        # The bundle ships Python + agentflow_computer_mcp inside the
+        # .exe, so install is now just file IO + schtasks — should
+        # complete in ~5 seconds. The progressbar still spins so the
+        # user sees motion.
         self.progressbar = ttk.Progressbar(
             wrap, mode="indeterminate", length=100, style="AF.Horizontal.TProgressbar"
         )
@@ -504,92 +480,23 @@ class SetupWindow:
 
     def _install_worker(self) -> None:
         try:
-            self.log_queue.put("Шаг 1/4: ищу Python")
-            python_exe = find_python()
-            self.log_queue.put(f"  → {python_exe}")
+            self.log_queue.put("Шаг 1/4: проверяю invite-код")
+            assert self.creds is not None
+            self.log_queue.put(f"  → device_id={self.creds['device_id'][:18]}…")
 
-            self.log_queue.put("Шаг 2/4: качаю agentflow-computer-mcp с GitHub")
-            self.log_queue.put("  · клонирую репозиторий через git (≈30-60 сек первый запуск)")
-            # PyInstaller's frozen runtime + subprocess on Windows
-            # buffers pip output by default — the log stayed empty even
-            # though pip was working. Force unbuffered IO via `python -u`
-            # + PYTHONUNBUFFERED + raw byte reads so every newline shows
-            # up in real time.
-            env = os.environ.copy()
-            env["PYTHONUNBUFFERED"] = "1"
-            env["PYTHONIOENCODING"] = "utf-8"
-            env["PIP_NO_INPUT"] = "1"
-            env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
-            proc = subprocess.Popen(
-                [
-                    python_exe,
-                    "-u",
-                    "-m",
-                    "pip",
-                    "install",
-                    "--user",
-                    "--upgrade",
-                    "--progress-bar",
-                    "off",
-                    "-v",
-                    PACKAGE_GIT_URL,
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                bufsize=0,
-                env=env,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            assert proc.stdout is not None
-            last_line = ""
-            buf = bytearray()
-            last_heartbeat = [time.monotonic()]
-
-            def heartbeat() -> None:
-                if proc.poll() is None:
-                    if time.monotonic() - last_heartbeat[0] > 10:
-                        self.log_queue.put("  · всё ещё работаю, не закрывай окно")
-                        last_heartbeat[0] = time.monotonic()
-                    threading.Timer(5.0, heartbeat).start()
-
-            heartbeat()
-
-            while True:
-                chunk = proc.stdout.read(1)
-                if not chunk:
-                    break
-                if chunk in (b"\n", b"\r"):
-                    if buf:
-                        line = buf.decode("utf-8", "replace").strip()
-                        buf.clear()
-                        if line:
-                            last_line = line
-                            last_heartbeat[0] = time.monotonic()
-                            self.log_queue.put(f"  · {line[:140]}")
-                else:
-                    buf.extend(chunk)
-            if buf:
-                line = buf.decode("utf-8", "replace").strip()
-                if line:
-                    last_line = line
-                    self.log_queue.put(f"  · {line[:140]}")
-            rc = proc.wait()
-            if rc != 0:
-                raise RuntimeError(f"pip install failed (rc={rc}): {last_line}")
+            self.log_queue.put("Шаг 2/4: копирую бинарь в %LOCALAPPDATA%")
+            target = install_daemon_binary()
+            self.log_queue.put(f"  → {target}")
 
             self.log_queue.put("Шаг 3/4: сохраняю учётные данные")
-            assert self.creds is not None
             auth_path = write_auth_file(self.creds)
             self.device_id = self.creds["device_id"]
             self.log_queue.put(f"  → {auth_path}")
 
-            executable, args = locate_launcher(python_exe)
-            self.log_queue.put(f"  → launcher: {executable}")
-
             self.log_queue.put(f"Шаг 4/4: регистрирую автозапуск ({TASK_NAME})")
-            register_scheduled_task(executable, args)
+            register_scheduled_task(target)
             self.log_queue.put("  → задача создана, запускаю демон")
-            launch_daemon(executable, args)
+            launch_daemon(target)
 
             self.log_queue.put("Готово. Устройство онлайн.")
             self.root.after(0, self._on_success)
@@ -627,9 +534,30 @@ class SetupWindow:
         self.root.mainloop()
 
 
-def main() -> None:
+def _run_daemon_mode() -> int:
+    """Boot the agent daemon directly. CI calls this with `--selftest`
+    so the bundled PyInstaller binary is validated before release."""
+    # Drop --daemon from argv so the daemon's own argparse doesn't choke.
+    argv = [arg for arg in sys.argv[1:] if arg != "--daemon"]
+    if "--selftest" in argv:
+        # Replace --selftest with the daemon's `selftest` subcommand,
+        # which prints an OS-agnostic backend grid and exits 0.
+        argv = [arg for arg in argv if arg != "--selftest"]
+        argv.insert(0, "selftest")
+    elif not argv:
+        # Plain `--daemon` → `run` (full daemon, port 8765).
+        argv = ["run"]
+    sys.argv = [sys.argv[0], *argv]
+    from agentflow_computer_mcp.desktop_cli import main as daemon_main
+    return int(daemon_main() or 0)
+
+
+def main() -> int:
+    if "--daemon" in sys.argv:
+        return _run_daemon_mode()
     SetupWindow().run()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
