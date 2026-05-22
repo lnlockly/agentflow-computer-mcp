@@ -64,9 +64,16 @@ Download the GUI installer:
 
 [**agentflow-desktop-setup.exe**](https://github.com/lnlockly/agentflow-computer-mcp/releases/latest/download/agentflow-desktop-setup.exe)
 
-Double-click the file, paste the invite code from the cabinet into the single text field, click **Install**. The wizard pip-installs the package into your user site, writes `%USERPROFILE%\.agentflow\auth.json`, registers a `AgentFlowDesktop` scheduled task at logon, and starts the daemon. The «Open cabinet» button at the end jumps straight to your device's live view.
+Скачай и открой setup.exe — Python ставить не нужно. The .exe bundles CPython 3.11 + the entire `agentflow_computer_mcp` package + every dep (~70 MB). Paste the invite code from the cabinet into the single text field, click **Install**, and the wizard:
 
-The .exe is unsigned, so Windows SmartScreen shows «Windows protected your PC» the first time. Click **More info → Run anyway**. Power users can keep using the PowerShell one-liner below.
+1. Decodes the invite and writes `%USERPROFILE%\.agentflow\auth.json`.
+2. Copies the .exe to `%LOCALAPPDATA%\AgentFlow\agentflow-desktop.exe`.
+3. Registers a logon scheduled task `AgentFlowDesktop` that invokes the copied .exe with `--daemon`.
+4. Spawns the daemon immediately so the cabinet sees the device right away.
+
+The same binary runs as the daemon — no separate Python interpreter, no `pip install`, no PATH lookup. The «Open cabinet» button at the end jumps straight to your device's live view.
+
+The .exe is unsigned, so Windows SmartScreen shows «Windows protected your PC» the first time. Click **More info → Run anyway**. Power users who want a smaller footprint can keep using the PowerShell one-liner below — it still pip-installs against your existing Python.
 
 The invite code is base64url of `{"k":"<api_key>","d":"<device_id>","t":"<device_token>"}`. If you prefer pasting raw values, expand «Расширенные настройки» inside the wizard.
 

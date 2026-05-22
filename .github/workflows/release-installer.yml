@@ -25,14 +25,11 @@ jobs:
           python -m pip install pyinstaller pillow
           python -m pip install .
 
-      - name: Smoke — installer must work end-to-end before we publish
-        # Real `pip install --user` of the package + locate_launcher +
-        # launcher --help. If anything regresses (e.g. unbuffered output
-        # broken, locate_launcher returns nothing, .exe entry point
-        # broken) release is blocked and the .exe is NOT uploaded.
+      - name: Smoke — installer source must import + roundtrip before we build
+        # Verifies parse_invite + write_auth_file + the daemon entry
+        # point imports cleanly. If any of these regress the .exe will
+        # crash on the user's PC, so block the release here.
         run: python installer/smoke.py
-        env:
-          SMOKE_FULL: "1"
 
       - name: Build icon
         run: python installer/make_icon.py
@@ -42,6 +39,28 @@ jobs:
 
       - name: List artifacts
         run: dir dist
+
+      - name: Self-test — bundled daemon must boot
+        # Runs the artifact itself in --daemon --selftest mode. This
+        # catches PyInstaller `collect_all` misses (missing hidden
+        # imports, missing data files, etc.) BEFORE the binary ships
+        # to users. 30s timeout — selftest is platform-backend probe
+        # only, doesn't talk to the network.
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist/agentflow-desktop-setup.exe" `
+              -ArgumentList "--daemon","--selftest" `
+              -NoNewWindow -PassThru
+          if (-not $p.WaitForExit(30000)) {
+            $p.Kill()
+            Write-Error "selftest timed out after 30s"
+            exit 1
+          }
+          if ($p.ExitCode -ne 0) {
+            Write-Error "selftest exited with code $($p.ExitCode)"
+            exit 1
+          }
+          Write-Host "selftest passed"
 
       - name: Publish to tagged release
         if: startsWith(github.ref, 'refs/tags/v')
