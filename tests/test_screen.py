@@ -24,7 +24,13 @@ def test_encode_png_resizes_above_1280(fake_screenshot: Image.Image) -> None:
 
 
 def test_capture_base64_via_pyautogui_path(fake_screenshot: Image.Image) -> None:
+    # `backend` is non-None on Linux/Windows (platform-specific module) and
+    # owns its own capture path, so the dispatcher in `capture()` short-
+    # circuits before reaching pyautogui. Force the legacy pyautogui path
+    # explicitly so this test stays meaningful across all OSes.
     with patch.object(screen, "_HAS_QUARTZ", False), \
+         patch.object(screen, "PLATFORM", "mac"), \
+         patch.object(screen, "backend", None), \
          patch("pyautogui.screenshot", return_value=fake_screenshot):
         result = screen.capture_base64()
 
@@ -36,6 +42,8 @@ def test_capture_base64_via_pyautogui_path(fake_screenshot: Image.Image) -> None
 
 def test_capture_region_passes_through(fake_screenshot: Image.Image) -> None:
     with patch.object(screen, "_HAS_QUARTZ", False), \
+         patch.object(screen, "PLATFORM", "mac"), \
+         patch.object(screen, "backend", None), \
          patch("pyautogui.screenshot", return_value=fake_screenshot) as mock_shot:
         screen.capture(region={"x": 10, "y": 20, "width": 100, "height": 200})
 
