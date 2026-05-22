@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +31,7 @@ def _tokenize(text: str) -> set[str]:
 
 
 def _utcnow() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%fZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%fZ")
 
 
 def _ensure(db_path: Path | str) -> sqlite3.Connection:

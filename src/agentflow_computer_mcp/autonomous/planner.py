@@ -18,10 +18,11 @@ import re
 import sqlite3
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .budget import record_llm_cost
 from .schema import DEFAULT_DB_PATH, connect, init_db
@@ -42,7 +43,7 @@ class LlmCallResult:
 
 
 def _utcnow() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%fZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%fZ")
 
 
 def _default_llm_fn(api_key: str, llm_url: str = DEFAULT_LLM_URL) -> LlmFn:
@@ -270,7 +271,7 @@ def plan_today(
     if not row:
         raise ValueError(f"milestone {milestone_id} not found")
 
-    today = today or datetime.now(timezone.utc).date().isoformat()
+    today = today or datetime.now(UTC).date().isoformat()
     user = (
         f"Today's date: {today}\n"
         f"Goal: {row['goal_title']} (target {row['target_metric']}={row['target_value']})\n"

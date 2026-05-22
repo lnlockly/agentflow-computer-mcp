@@ -117,15 +117,13 @@ def check_autonomous_skeleton() -> None:
     """
     log("autonomous: schema + planner + memory + budget against mock LLM")
     try:
-        from agentflow_computer_mcp.autonomous import (
-            budget as af_budget,
-            cli as af_cli,
-            memory as af_memory,
-            planner as af_planner,
-            schema as af_schema,
-            sub_agents as af_sub_agents,
-            wake_cycle as af_wake_cycle,
-        )
+        from agentflow_computer_mcp.autonomous import budget as af_budget
+        from agentflow_computer_mcp.autonomous import cli as af_cli
+        from agentflow_computer_mcp.autonomous import memory as af_memory
+        from agentflow_computer_mcp.autonomous import planner as af_planner
+        from agentflow_computer_mcp.autonomous import schema as af_schema
+        from agentflow_computer_mcp.autonomous import sub_agents as af_sub_agents
+        from agentflow_computer_mcp.autonomous import wake_cycle as af_wake_cycle
     except Exception as exc:
         fail(f"cannot import autonomous package: {exc}")
     _ = (af_cli, af_sub_agents, af_wake_cycle)  # imported for side-effect coverage

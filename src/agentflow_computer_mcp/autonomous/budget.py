@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -38,14 +38,14 @@ _DEFAULT_PRICE = (3.0, 15.0)  # Sonnet-ish fallback
 
 
 def _utcnow() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%fZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%fZ")
 
 
 def _today() -> str:
     """UTC-day string. The ledger stores `created_at` in UTC, so the
     daily-sum filter must match in UTC too — using local `date.today()`
     would split the day in half for non-UTC users."""
-    return datetime.now(timezone.utc).date().isoformat()
+    return datetime.now(UTC).date().isoformat()
 
 
 def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:

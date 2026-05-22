@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +21,7 @@ from .schema import DEFAULT_DB_PATH, connect, init_db
 
 
 def _utcnow() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%fZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%fZ")
 
 
 def _ensure(db_path: Path | str) -> sqlite3.Connection:

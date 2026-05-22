@@ -16,9 +16,10 @@ import sqlite3
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .planner import LlmFn, plan_today, reflect_on_day
 from .schema import DEFAULT_DB_PATH, connect, init_db
@@ -39,7 +40,7 @@ def _default_http_post(url: str, data: bytes, headers: dict[str, str]) -> tuple[
 
 
 def _utcnow() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%fZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%fZ")
 
 
 def _ensure(db_path: Path | str) -> sqlite3.Connection:
@@ -186,7 +187,7 @@ def sleep_reflect(
     For each plan reflected with score >= 7, mark its milestone completed
     if its scheduled_for is in the past (best-effort heuristic).
     """
-    today = today or datetime.now(timezone.utc).date().isoformat()
+    today = today or datetime.now(UTC).date().isoformat()
     results: list[dict[str, Any]] = []
     for plan_id, outcomes in observed_outcomes_by_plan.items():
         try:
