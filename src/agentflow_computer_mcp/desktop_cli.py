@@ -119,6 +119,47 @@ def cmd_version(_: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_selftest(_: argparse.Namespace) -> int:
+    """Probe each backend capability and print an OK/FAIL grid.
+
+    No network, no API keys, no LLM. Use this to verify a fresh install on any OS.
+    """
+    from collections.abc import Callable
+    from typing import Any
+
+    from .platform import PLATFORM, backend
+
+    print(f"platform: {PLATFORM}")
+    if backend is None:
+        print("FAIL: no backend for this platform")
+        return 1
+    print(f"backend:  {backend.name}\n")
+
+    checks: list[tuple[str, str]] = []
+
+    def _run(label: str, fn: Callable[[], Any]) -> None:
+        try:
+            fn()
+            checks.append((label, "OK"))
+        except Exception as exc:  # noqa: BLE001
+            checks.append((label, f"FAIL: {exc}"))
+
+    _run("capture_screen_fast", lambda: backend.capture_screen_fast())
+    _run("capture_screen (png)", lambda: backend.capture_screen())
+    _run("window_list", lambda: backend.window_list())
+    _run("clipboard_read", lambda: backend.clipboard_read())
+    _run("read_terminal (optional)", lambda: backend.read_terminal())
+
+    width = max(len(name) for name, _ in checks)
+    failed = 0
+    for name, status in checks:
+        print(f"  {name.ljust(width)}  {status}")
+        if status.startswith("FAIL"):
+            failed += 1
+    print(f"\n{len(checks) - failed}/{len(checks)} checks passed")
+    return 0 if failed == 0 else 1
+
+
 def cmd_tools(args: argparse.Namespace) -> int:
     """List the tools the daemon exposes to the LLM."""
     from .driver.desktop_tools import all_tool_descriptors
@@ -186,6 +227,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("version", help="print version").set_defaults(func=cmd_version)
     sub.add_parser("tools", help="list LLM-facing tools").set_defaults(func=cmd_tools)
+    sub.add_parser(
+        "selftest",
+        help="probe screen capture + window list + clipboard on this OS",
+    ).set_defaults(func=cmd_selftest)
 
     health = sub.add_parser("health", help="probe capture + AF API")
     health.add_argument("--api-key", default=None)
