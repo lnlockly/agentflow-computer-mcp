@@ -207,6 +207,72 @@ class AFClient:
             "POST", "/me/telegram/send", body={"chat_id": chat_id, "text": text}
         )
 
+    def telegram_dialogs(self, limit: int = 25) -> AFResponse:
+        """List the last N Telegram dialogs (chats / channels / DMs).
+
+        Returns ``{ok, dialogs: [...]}``. Use instead of UI-screenshotting
+        Telegram when the user asks «что у меня в TG / последние диалоги».
+        """
+        return self._req(
+            "GET", "/me/telegram/dialogs", params={"limit": str(int(limit))}
+        )
+
+    def telegram_messages(self, chat_id: str | int, limit: int = 20) -> AFResponse:
+        """Fetch the last N messages from one peer (id / @username / 'me').
+
+        Response: ``{ok, messages: [{id, text, date, buttons, ...}]}``. Each
+        row carries inline / reply keyboard buttons so the daemon can choose
+        to click one back.
+        """
+        return self._req(
+            "GET",
+            "/me/telegram/messages",
+            params={"chat_id": str(chat_id), "limit": str(int(limit))},
+        )
+
+    def telegram_search(
+        self,
+        q: str,
+        chat_id: str | int | None = None,
+        limit: int | None = None,
+    ) -> AFResponse:
+        """Search Telegram messages.
+
+        Pass ``chat_id`` to scope inside one chat (search_messages); omit it
+        for global channel/group directory search (search_telegram). Response
+        shape: ``{ok, scope: 'chat'|'global', results}``.
+        """
+        params: dict[str, str] = {"q": q}
+        if chat_id is not None and str(chat_id).strip():
+            params["chat_id"] = str(chat_id)
+        if limit is not None:
+            params["limit"] = str(int(limit))
+        return self._req("GET", "/me/telegram/search", params=params)
+
+    def telegram_react(
+        self,
+        chat_id: str | int,
+        message_id: int,
+        emoji: str | None,
+        big: bool = False,
+    ) -> AFResponse:
+        """Set a reaction on a Telegram message. ``emoji=None`` clears the
+        existing reaction. ``big=True`` plays the full-screen animation."""
+        body: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": int(message_id),
+            "emoji": emoji,
+        }
+        if big:
+            body["big"] = True
+        return self._req("POST", "/me/telegram/react", body=body)
+
+    def telegram_whoami(self) -> AFResponse:
+        """Return the Telegram profile bound to the user's account (id,
+        username, phone, premium). Cheap liveness probe before doing real
+        work in a TG-heavy task."""
+        return self._req("GET", "/me/telegram/whoami")
+
     def post_matrix_room(self, room_id: str, text: str) -> AFResponse:
         return self._req(
             "POST", "/me/matrix/send", body={"room_id": room_id, "text": text}
@@ -360,6 +426,81 @@ AF_TOOL_DESCRIPTORS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "af_telegram_dialogs",
+        "description": (
+            "List the user's recent Telegram dialogs (chats / channels / DMs) "
+            "via MCP. Each item: id, name, username, unread count, last "
+            "message preview. Use this instead of opening the Telegram app "
+            "when the user asks what's in their TG."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "default": 25},
+            },
+        },
+    },
+    {
+        "name": "af_telegram_messages",
+        "description": (
+            "Fetch the last N messages from one Telegram peer (numeric id, "
+            "@username, or 'me' for Saved Messages). Each row includes inline "
+            "keyboard buttons so the daemon can decide to click one back."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "chat_id": {"type": "string"},
+                "limit": {"type": "integer", "default": 20},
+            },
+            "required": ["chat_id"],
+        },
+    },
+    {
+        "name": "af_telegram_search",
+        "description": (
+            "Search Telegram. Pass `chat_id` to scope the search to one "
+            "chat's messages. Omit `chat_id` for global directory search "
+            "across public channels and groups (Telegram's contacts.Search)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "q": {"type": "string"},
+                "chat_id": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+            "required": ["q"],
+        },
+    },
+    {
+        "name": "af_telegram_react",
+        "description": (
+            "Set a reaction emoji on a Telegram message. `emoji=null` clears "
+            "the current reaction. `big=true` plays the full-screen "
+            "animation."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "chat_id": {"type": "string"},
+                "message_id": {"type": "integer"},
+                "emoji": {"type": ["string", "null"]},
+                "big": {"type": "boolean", "default": False},
+            },
+            "required": ["chat_id", "message_id"],
+        },
+    },
+    {
+        "name": "af_telegram_whoami",
+        "description": (
+            "Return the Telegram profile bound to the user's account (id, "
+            "username, phone, premium). Cheap liveness probe before a "
+            "TG-heavy task."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "af_spawn_subagent",
         "description": (
             "Spawn a new AgentFlow project to delegate a sub-task. Creates + approves + "
@@ -510,6 +651,27 @@ def dispatch_af_tool(client: AFClient, name: str, args: dict[str, Any]) -> str:
         )
     elif name == "af_send_telegram_message":
         r = client.send_telegram_message(args["chat_id"], args["text"])
+    elif name == "af_telegram_dialogs":
+        r = client.telegram_dialogs(limit=int(args.get("limit", 25)))
+    elif name == "af_telegram_messages":
+        r = client.telegram_messages(
+            chat_id=args["chat_id"], limit=int(args.get("limit", 20))
+        )
+    elif name == "af_telegram_search":
+        r = client.telegram_search(
+            q=args["q"],
+            chat_id=args.get("chat_id"),
+            limit=int(args["limit"]) if args.get("limit") is not None else None,
+        )
+    elif name == "af_telegram_react":
+        r = client.telegram_react(
+            chat_id=args["chat_id"],
+            message_id=int(args["message_id"]),
+            emoji=args.get("emoji"),
+            big=bool(args.get("big", False)),
+        )
+    elif name == "af_telegram_whoami":
+        r = client.telegram_whoami()
     elif name == "af_post_matrix_room":
         r = client.post_matrix_room(args["room_id"], args["text"])
     elif name == "af_remember":
