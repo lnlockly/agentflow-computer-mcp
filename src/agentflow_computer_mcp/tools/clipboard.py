@@ -1,22 +1,25 @@
+"""Clipboard — async wrapper over the platform backend.
+
+The async signatures are preserved so MCP handlers and ``await`` callers don't break.
+The backend method is sync (subprocess calls). For long-running shells this is fine;
+we keep the awaitable surface for API stability.
+"""
 from __future__ import annotations
 
 import asyncio
 
+from ..platform import backend
+
 
 async def read() -> dict[str, str]:
-    proc = await asyncio.create_subprocess_exec(
-        "pbpaste",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, _ = await proc.communicate()
-    return {"text": stdout.decode("utf-8", errors="replace")}
+    if backend is None:
+        return {"text": ""}
+    text = await asyncio.to_thread(backend.clipboard_read)
+    return {"text": text}
 
 
 async def write(text: str) -> dict[str, int]:
-    proc = await asyncio.create_subprocess_exec(
-        "pbcopy",
-        stdin=asyncio.subprocess.PIPE,
-    )
-    await proc.communicate(text.encode("utf-8"))
+    if backend is None:
+        return {"length": 0}
+    await asyncio.to_thread(backend.clipboard_write, text)
     return {"length": len(text)}

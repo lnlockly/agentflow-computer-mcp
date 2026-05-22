@@ -1,17 +1,32 @@
+"""Screen capture — thin wrapper over the platform backend.
+
+Public API:
+- :func:`capture` returns PNG bytes (optionally a region).
+- :func:`capture_base64` returns ``{"mime", "base64", "size_bytes"}`` for MCP responses.
+
+The historical Quartz/pyautogui dual-path is preserved here for back-compat with
+existing tests that patch ``_HAS_QUARTZ`` to force a pyautogui fallback. On Linux
+and Windows the backend takes over via the explicit ``elif`` branches.
+"""
 from __future__ import annotations
 
 import base64
 import io
 from typing import Any
 
+from PIL import Image
+
+from ..platform import PLATFORM, backend
+
 try:
-    import Quartz
-    from Quartz import CoreGraphics as CG
+    import Quartz  # type: ignore[import-not-found]
+    from Quartz import CoreGraphics as CG  # type: ignore[import-not-found]
+
     _HAS_QUARTZ = True
 except ImportError:
+    Quartz = None  # type: ignore[assignment]
+    CG = None  # type: ignore[assignment]
     _HAS_QUARTZ = False
-
-from PIL import Image
 
 
 def _capture_via_quartz(region: dict[str, int] | None) -> bytes:
@@ -69,9 +84,15 @@ def _encode_png(img: Image.Image, max_width: int = 1280) -> bytes:
 
 
 def capture(region: dict[str, int] | None = None) -> bytes:
-    if _HAS_QUARTZ:
-        return _capture_via_quartz(region)
-    return _capture_via_pyautogui(region)
+    # On macOS keep the legacy dual-path so existing patch-based tests still drive both
+    # branches. Off-Mac platforms route through the backend abstraction.
+    if PLATFORM == "mac" or _HAS_QUARTZ:
+        if _HAS_QUARTZ:
+            return _capture_via_quartz(region)
+        return _capture_via_pyautogui(region)
+    if backend is None:
+        return _capture_via_pyautogui(region)
+    return backend.capture_screen(region)
 
 
 def capture_base64(region: dict[str, int] | None = None) -> dict[str, Any]:

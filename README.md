@@ -1,6 +1,19 @@
 # agentflow-computer-mcp
 
-Local daemon that lets AgentFlow's Eliza agents — and a direct LLM driver — control your macOS desktop. The package ships two surfaces in one wheel.
+Local daemon that lets AgentFlow's Eliza agents — and a direct LLM driver — control your desktop on **macOS, Linux, or Windows**. The package ships two surfaces in one wheel.
+
+## Platform support
+
+| OS | Screen | Input | Windows | Clipboard | Notes |
+|---|---|---|---|---|---|
+| macOS | Quartz CGDisplayCreateImage (~5 ms) | pyautogui | Quartz CGWindowList | pbcopy/pbpaste | grant Accessibility + Screen Recording |
+| Linux X11 | mss (~30 ms) | pyautogui | wmctrl + xdotool | xclip / xsel | requires `wmctrl`, `xdotool`, `xclip` |
+| Linux Wayland | grim | pyautogui (XWayland) | XWayland clients only | wl-copy / wl-paste | requires `grim`, `wl-clipboard` |
+| Windows | mss (~20 ms) | pyautogui | pywin32 EnumWindows | pyperclip | requires Python 3.11+ |
+
+Every OS-specific call routes through `agentflow_computer_mcp.platform.backend` (one Protocol, three implementations).
+
+Run `agentflow-desktop selftest` to see an OK/FAIL grid for each backend method on the current host.
 
 | Surface | Console script | Use |
 |---|---|---|
@@ -52,6 +65,21 @@ curl -sSL https://agentflow.website/install/computer-mcp.sh | \
 
 The installer pip-installs the package, writes `~/.agentflow/auth.json` (mode 0600), drops a default `~/.agentflow/computer-scope.toml`, loads a launchd plist. After install you grant Accessibility + Screen Recording to your terminal in System Settings → Privacy & Security.
 
+### Linux / Windows installers
+
+```bash
+# Linux (Debian/Ubuntu) — same env vars, picks up wmctrl/xdotool/xclip, drops a systemd user unit
+curl -sSL https://agentflow.website/install/computer-mcp.sh | AF_KEY=... AF_DEVICE_TOKEN=... AF_DEVICE_ID=... bash
+```
+
+```powershell
+# Windows — same env vars, registers a Task Scheduler entry
+$env:AF_KEY="..."; $env:AF_DEVICE_TOKEN="..."; $env:AF_DEVICE_ID="..."
+iwr https://agentflow.website/install/computer-mcp.ps1 -UseBasicParsing | iex
+```
+
+Both wrappers live in `scripts/install.sh` and `scripts/install.ps1` of this repo. Matching `uninstall.sh` / `uninstall.ps1` remove the autostart unit and `~/.agentflow/auth.json`.
+
 ## Run
 
 ### `agentflow-desktop` — full daemon (local LLM loop)
@@ -62,7 +90,8 @@ agentflow-desktop run --port 9000 --fps 12            # custom viewer port + cap
 agentflow-desktop run --no-af-tools                   # hide af_* tools from the LLM
 agentflow-desktop drive "screen_capture, then window_list, summarize"
 agentflow-desktop tools                               # list LLM-facing tools
-agentflow-desktop health                              # probe Quartz capture + AF API
+agentflow-desktop health                              # probe screen capture + AF API
+agentflow-desktop selftest                            # OS-agnostic backend probe (no key needed)
 agentflow-desktop version
 ```
 

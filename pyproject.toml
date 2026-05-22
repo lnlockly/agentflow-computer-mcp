@@ -1,7 +1,7 @@
 [project]
 name = "agentflow-computer-mcp"
-version = "0.1.0"
-description = "Local MCP server for AgentFlow desktop agents (macOS)"
+version = "0.2.0"
+description = "Local MCP server + desktop daemon for AgentFlow agents (macOS, Linux, Windows)"
 readme = "README.md"
 authors = [
     { name = "AgentFlow", email = "lnlockly@gmail.com" }
@@ -11,10 +11,18 @@ dependencies = [
     "mcp[cli]>=1.2.0",
     "pyautogui>=0.9.54",
     "websockets>=13.0",
-    "pyobjc-framework-Quartz>=10.0; platform_system == 'Darwin'",
-    "tomli>=2.0; python_version < '3.11'",
+    "mss>=9.0",
     "Pillow>=10.0",
+    "tomli>=2.0; python_version < '3.11'",
+    "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
+    "pywin32>=306; sys_platform == 'win32'",
+    "pyperclip>=1.8; sys_platform == 'win32'",
+    "psutil>=5.9; sys_platform == 'win32'",
 ]
+
+[project.optional-dependencies]
+linux = []
+windows = []
 
 [project.scripts]
 agentflow-computer-mcp = "agentflow_computer_mcp.__main__:main"
@@ -31,7 +39,7 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 # inline HTML/JS template in viewer.py and AppleScript one-liners exceed 120 but are unavoidable
-per-file-ignores = { "src/agentflow_computer_mcp/driver/viewer.py" = ["E501"], "src/agentflow_computer_mcp/driver/desktop_tools.py" = ["E501"] }
+per-file-ignores = { "src/agentflow_computer_mcp/driver/viewer.py" = ["E501"], "src/agentflow_computer_mcp/driver/desktop_tools.py" = ["E501"], "src/agentflow_computer_mcp/platform/mac.py" = ["E501"], "src/agentflow_computer_mcp/platform/linux.py" = ["E501"], "src/agentflow_computer_mcp/platform/windows.py" = ["E501"] }
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

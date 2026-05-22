@@ -17,6 +17,7 @@ from typing import Any
 
 from PIL import Image
 
+from ..platform import PLATFORM, backend
 from ..tools import clipboard, keyboard, mouse, screen, window
 from .af_client import AF_TOOL_DESCRIPTORS, AFClient, dispatch_af_tool
 
@@ -63,6 +64,8 @@ def jpeg_b64_region(x: int, y: int, w: int, h: int, quality: int = 85) -> str:
 
 
 def osa(script: str, timeout: int = 8) -> tuple[int, str]:
+    if PLATFORM != "mac":
+        return -1, f"osascript unavailable on {PLATFORM}"
     try:
         r = subprocess.run(
             ["osascript", "-e", script],
@@ -76,9 +79,11 @@ def osa(script: str, timeout: int = 8) -> tuple[int, str]:
 
 
 def app_activate(owner: str) -> str:
-    rc, out = osa(f'tell application "{owner}" to activate')
-    time.sleep(0.5)
-    return f"activated {owner!r}" if rc == 0 else f"failed: {out}"
+    if backend is None:
+        return "failed: no platform backend"
+    out = backend.app_activate(owner)
+    time.sleep(0.3)
+    return out
 
 
 def chrome_run_js(js: str, tab_index: int | None = None) -> str:
@@ -114,17 +119,12 @@ def chrome_list_tabs() -> str:
 
 
 def read_iterm_session() -> str:
-    rc, out = osa(
-        'tell application "iTerm" to tell current window to tell current session to get contents'
-    )
-    if rc == 0 and out:
-        return out[-2500:]
-    rc2, out2 = osa(
-        'tell application "Terminal" to tell front window to get contents of selected tab'
-    )
-    if rc2 == 0 and out2:
-        return out2[-2500:]
-    return f"error: iTerm={out!r} Terminal={out2!r}"
+    if backend is None:
+        return ""
+    text = backend.read_terminal()
+    if text:
+        return text
+    return f"error: no terminal contents available on {PLATFORM}"
 
 
 def get_window_list() -> list[dict[str, Any]]:

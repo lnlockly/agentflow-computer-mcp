@@ -1,4 +1,7 @@
-"""Fast Quartz screen capture + JPEG compression for the MJPEG live stream."""
+"""Fast screen capture + JPEG compression for the MJPEG live stream.
+
+Routes through the platform backend so the same loop runs on macOS, Linux, and Windows.
+"""
 from __future__ import annotations
 
 import io
@@ -8,42 +11,17 @@ from typing import Any
 
 from PIL import Image
 
-try:
-    import Quartz as _Q
-    from Quartz import CoreGraphics as _CG
-
-    _HAS_QUARTZ = True
-    _MAIN_DISPLAY = _CG.CGMainDisplayID()
-except ImportError:
-    _HAS_QUARTZ = False
-    _Q = None  # type: ignore[assignment]
-    _CG = None  # type: ignore[assignment]
-    _MAIN_DISPLAY = 0
+from ..platform import backend
 
 
 def fast_capture_jpeg(width_cap: int = 1400, quality: int = 68) -> bytes:
-    """Capture full screen as JPEG. Quartz CGDisplayCreateImage is ~5ms; falls back to pyautogui."""
-    if _HAS_QUARTZ:
-        img_ref = _CG.CGDisplayCreateImage(_MAIN_DISPLAY)
-        if img_ref is None:
-            raise RuntimeError("CGDisplayCreateImage returned None")
-        w = _Q.CGImageGetWidth(img_ref)
-        h = _Q.CGImageGetHeight(img_ref)
-        bpr = _Q.CGImageGetBytesPerRow(img_ref)
-        raw = bytes(_Q.CGDataProviderCopyData(_Q.CGImageGetDataProvider(img_ref)))
-        img = Image.frombuffer("RGBA", (w, h), raw, "raw", "BGRA", bpr, 1)
-    else:
-        import pyautogui
+    """Native-resolution JPEG of the primary display.
 
-        img = pyautogui.screenshot()
-        w = img.width
-
-    if img.width > width_cap:
-        ratio = width_cap / img.width
-        img = img.resize((width_cap, int(img.height * ratio)), Image.BILINEAR)
-    out = io.BytesIO()
-    img.convert("RGB").save(out, format="JPEG", quality=quality, optimize=False)
-    return out.getvalue()
+    On macOS this is ~5ms (CGDisplayCreateImage); on Linux/Windows ~20-40ms (mss).
+    """
+    if backend is None:
+        raise RuntimeError("no platform backend available")
+    return backend.capture_screen_fast(width_cap=width_cap, quality=quality)
 
 
 def compress_png_for_viewer(png: bytes, width_cap: int = 1600, quality: int = 78) -> bytes:
