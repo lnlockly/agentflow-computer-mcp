@@ -155,6 +155,27 @@ def update_live(state: DriverState, action: str, detail: str = "", thinking: str
         )
 
 
+def _fetch_skills_prompt_block(af_client: Any) -> str:
+    """Fetch the user's pre-rendered intent-skills block from the server.
+
+    Returns the block text on success, `""` on any failure (network,
+    auth, malformed body). The daemon must never crash a task because
+    the skills endpoint is down.
+    """
+    try:
+        resp = af_client.get_skills_prompt_block()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[loop] skills fetch error: {exc}", flush=True)
+        return ""
+    if not getattr(resp, "ok", False):
+        return ""
+    body = getattr(resp, "body", None)
+    if not isinstance(body, dict):
+        return ""
+    block = body.get("block")
+    return block.strip() if isinstance(block, str) else ""
+
+
 def run_task(
     task: str,
     state: DriverState,
@@ -179,6 +200,20 @@ def run_task(
 
     af_present = executor._af is not None  # noqa: SLF001
     system_msg = build_system_prompt(win_summary, af_tools_present=af_present)
+
+    # Prepend the user's editable Skills block from /me/devices/skills.
+    # The cabinet UI at /cabinet/devices/skills lets the owner add custom
+    # phrase → action mappings; they should win over the hardcoded
+    # intent_map in build_system_prompt. Soft-fail: a missing/erroring
+    # endpoint must not block task execution.
+    if af_present:
+        skills_block = _fetch_skills_prompt_block(executor._af)  # noqa: SLF001
+        if skills_block:
+            system_msg = (
+                "Пользовательские skills (приоритетнее дефолтных правил):\n"
+                f"{skills_block}\n\n"
+                f"{system_msg}"
+            )
     tools = all_tool_descriptors() if af_present else [
         t for t in all_tool_descriptors() if not t["name"].startswith("af_")
     ]
