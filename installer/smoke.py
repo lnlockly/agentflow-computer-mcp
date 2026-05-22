@@ -27,6 +27,7 @@ Run manually:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -391,10 +392,174 @@ def check_os_aware_system_prompt() -> None:
         fail(f"system prompt does not mention HOST_OS={HOST_OS!r}")
     if "Codex" not in prompt:
         fail("system prompt missing Codex / package-manager knowledge block")
+    if "Известные подводные камни" not in prompt:
+        fail("system prompt missing pitfalls knowledge block")
     log(f"  ok -- prompt declares host OS = {HOST_OS}")
 
 
+def check_loop_caps_constants() -> None:
+    """The driver loop must expose the new step/cost/checkpoint caps as
+    module-level constants so ops can introspect them at runtime and tests
+    can monkey-patch them per-case."""
+    log("driver loop caps: LOOP_MAX_STEPS / LOOP_MAX_USD / LOOP_CHECKPOINT_EVERY")
+    from agentflow_computer_mcp.driver import loop as driver_loop
+
+    for name in ("LOOP_MAX_STEPS", "LOOP_MAX_USD", "LOOP_CHECKPOINT_EVERY"):
+        if not hasattr(driver_loop, name):
+            fail(f"driver.loop missing constant: {name}")
+    if not isinstance(driver_loop.LOOP_MAX_STEPS, int):
+        fail("LOOP_MAX_STEPS must be int")
+    if not isinstance(driver_loop.LOOP_MAX_USD, float):
+        fail("LOOP_MAX_USD must be float")
+    if not isinstance(driver_loop.LOOP_CHECKPOINT_EVERY, int):
+        fail("LOOP_CHECKPOINT_EVERY must be int")
+    log(
+        f"  ok -- caps: steps={driver_loop.LOOP_MAX_STEPS}, "
+        f"usd=${driver_loop.LOOP_MAX_USD}, checkpoint_every={driver_loop.LOOP_CHECKPOINT_EVERY}"
+    )
+
+
+def check_loop_checkpoint_abort() -> None:
+    """Drive a fake run_task that hits a checkpoint returning on_track=false
+    and assert the loop aborts cleanly (task_error emitted, no exception).
+
+    We don't spin up a full DriverState/ToolExecutor — we stub the LLM
+    transport at the post_llm_cancellable seam, which is what every
+    code path in run_task funnels through.
+    """
+    log("driver loop checkpoint abort: mock LLM returns on_track=false")
+    import threading
+    from unittest.mock import patch
+
+    from agentflow_computer_mcp.driver import loop as driver_loop
+    from agentflow_computer_mcp.driver.state import DriverState
+
+    # Force a low checkpoint cadence so we hit the reflection turn fast.
+    # The minimum-step gate is 3 — pick CHECKPOINT_EVERY=3 to fire at step 3.
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["HOME"] = tmp
+        os.environ["USERPROFILE"] = tmp
+
+        state = DriverState()
+        state.current_task_id = "smoke-task-1"
+        outbound: list[dict] = []
+        state.outbound_publisher = lambda frame: outbound.append(frame)
+
+        call_count = {"n": 0}
+
+        def fake_post_llm(url, api_key, payload, abort_flag, timeout=180, poll_interval=0.2):  # noqa: ANN001, ARG001
+            call_count["n"] += 1
+            messages = payload.get("messages", [])
+            last_user_text = ""
+            if messages and messages[-1].get("role") == "user":
+                content = messages[-1].get("content", [])
+                for block in content:
+                    if block.get("type") == "text":
+                        last_user_text = block.get("text", "")
+                        break
+            # Checkpoint probe? Return on_track=false.
+            if "Сейчас сделано" in last_user_text or "потерялся" in last_user_text:
+                return {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": '{"on_track": false, "next_step": "", "abandon_reason": "lost in loop"}',
+                        }
+                    ],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 10, "output_tokens": 20},
+                }
+            # Normal turn: issue a benign tool call to bump the step counter.
+            return {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": f"tool_{call_count['n']}",
+                        "name": "noop_tool",
+                        "input": {},
+                    }
+                ],
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 50, "output_tokens": 80},
+            }
+
+        class FakeExecutor:
+            _af = None  # so af_present is False, skip af tools
+
+            def execute(self, name, args):  # noqa: ANN001, ARG002
+                return ("ok", None)
+
+        # Force checkpoint to fire fast (every 3 steps, min steps is 3).
+        # Patch the screen-grab helpers too — headless CI (Linux runners,
+        # Windows CI without an attached display) raises XError / equivalent
+        # on the first screenshot call, which would crash run_task before
+        # the checkpoint code ever runs.
+        with (
+            patch.object(driver_loop, "LOOP_CHECKPOINT_EVERY", 3),
+            patch.object(driver_loop, "LOOP_MAX_STEPS", 50),
+            patch.object(driver_loop, "LOOP_MAX_USD", 999.0),
+            patch.object(driver_loop, "post_llm_cancellable", fake_post_llm),
+            patch.object(driver_loop, "jpeg_b64_full", lambda *a, **kw: ""),
+            patch.object(driver_loop, "get_window_list", lambda *a, **kw: []),
+            patch.object(driver_loop, "update_live", lambda *a, **kw: None),
+            # Force memory + budget into the temp DB. They auto-mkdir.
+            patch(
+                "agentflow_computer_mcp.autonomous.schema.DEFAULT_DB_PATH",
+                Path(tmp) / "autonomous.db",
+            ),
+            patch(
+                "agentflow_computer_mcp.autonomous.memory.DEFAULT_DB_PATH",
+                Path(tmp) / "autonomous.db",
+            ),
+            patch(
+                "agentflow_computer_mcp.autonomous.budget.DEFAULT_DB_PATH",
+                Path(tmp) / "autonomous.db",
+            ),
+        ):
+            # Run with a hard wall-clock guard so a bug doesn't hang the smoke.
+            result_box: dict = {}
+
+            def _runner():
+                try:
+                    result_box["value"] = driver_loop.run_task(
+                        "smoke checkpoint task: do 5 things and then stop",
+                        state,
+                        FakeExecutor(),
+                        api_key="af_live_smoketest",
+                        max_iters=20,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    result_box["error"] = repr(exc)
+
+            t = threading.Thread(target=_runner, daemon=True)
+            t.start()
+            t.join(timeout=30)
+            if t.is_alive():
+                fail("run_task did not return within 30s after checkpoint abort")
+
+        if "error" in result_box:
+            fail(f"run_task raised on checkpoint abort: {result_box['error']}")
+
+        # Verify a task_error frame was emitted with our abandon reason.
+        abort_frames = [f for f in outbound if f.get("type") == "task_error"]
+        if not abort_frames:
+            fail(f"no task_error frame emitted on abandon; outbound={outbound}")
+        if not any("task.abandon" in (f.get("error") or "") for f in abort_frames):
+            fail(
+                f"task_error did not carry abandon reason; got: "
+                f"{[f.get('error') for f in abort_frames]}"
+            )
+
+    log("  ok — loop aborted cleanly via task_error frame")
+
+
 def main() -> None:
+    # Windows runners default stdout to cp1252, which blows up on the
+    # unicode arrows the driver prints inside run_task ("→", "⟳").
+    # Reconfigure to utf-8 so the new checkpoint check survives.
+    with contextlib.suppress(Exception):
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
     log("starting smoke for installer/setup_gui.py")
     check_invite_roundtrip()
     check_auth_file_shape()
@@ -403,6 +568,8 @@ def main() -> None:
     check_auto_updater()
     check_os_aware_tool_filter()
     check_os_aware_system_prompt()
+    check_loop_caps_constants()
+    check_loop_checkpoint_abort()
     log("ALL GREEN")
 
 

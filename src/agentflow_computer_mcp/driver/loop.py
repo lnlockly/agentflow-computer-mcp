@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import platform
 import sys
 import time
@@ -22,6 +23,46 @@ from .streamer import compress_png_for_viewer
 DEFAULT_LLM_URL = "https://agentflow.website/_agents/llm/v1/messages"
 DEFAULT_MODEL = "claude-opus-4-7"
 MAX_ITERS = 40
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read an int env var, falling back to default on missing/garbage.
+
+    Used by the loop caps so an operator can dial `LOOP_MAX_STEPS=120` without
+    a redeploy. Non-numeric values fall back silently — the loop should never
+    refuse to run because someone typed `abc` in the env.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+# Per-task hard caps. Configurable via env so ops can tune without a redeploy.
+# Defaults: 50 tool calls and $0.50 USD spend — generous for normal tasks,
+# cheap-fail for runaway agent loops.
+LOOP_MAX_STEPS = _env_int("LOOP_MAX_STEPS", 50)
+LOOP_MAX_USD = _env_float("LOOP_MAX_USD", 0.50)
+# Reflection cadence. Every Nth tool call we inject a "are you on track?"
+# turn; 0 disables. Short tasks (< 3 steps) skip the check regardless.
+LOOP_CHECKPOINT_EVERY = _env_int("LOOP_CHECKPOINT_EVERY", 8)
+# Below this step count we never bother with checkpoint reflection — short
+# read tasks shouldn't pay a 1-LLM-call overhead just to confirm "yes, still
+# on track".
+CHECKPOINT_MIN_STEPS = 3
 
 # Host platform string, captured once at module load. Used by build_system_prompt
 # to inject an OS-context block so the LLM doesn't try osascript on Windows
@@ -243,6 +284,20 @@ def build_system_prompt(window_summary: str, af_tools_present: bool) -> str:
         "  • Перед `winget install <id>` сначала `winget_search <query>` чтобы получить точный Id.\n"
     )
 
+    # Known foot-guns that come up in incident reports. Keep this block
+    # short — the LLM ignores walls of text. One line per gap, written as
+    # a rule the model can apply at decision time.
+    pitfalls = (
+        "\nИзвестные подводные камни:\n"
+        "  • Windows-хост: `osascript` / AppleScript / `open -a` НЕДОСТУПНЫ. Используй "
+        "chrome_open_url, powershell_exec, start_app.\n"
+        "  • Codex ≠ AgentFlow. «Кодекс» = OpenAI Codex (chatgpt.com/codex или CLI). "
+        "agentflow.website/llm-cabinet — это биллинг LLM-ключей, не редактор кода.\n"
+        "  • Перед загрузкой больших файлов проверь свободное место: `shutil.disk_usage` "
+        "через code_run_command, не качай вслепую.\n"
+        "  • Если задача меньше 3 шагов — не делай чекпоинт-рефлексию, это лишний LLM-вызов.\n"
+    )
+
     return (
         f"Ты управляешь {os_label} пользователя. Перед действием — короткая мысль в text-блоке. "
         "Не извиняйся, не повторяй очевидное. Стратегия:\n"
@@ -255,6 +310,7 @@ def build_system_prompt(window_summary: str, af_tools_present: bool) -> str:
         "Google Chrome с его сессией.\n"
         f"{os_context}"
         f"{knowledge}"
+        f"{pitfalls}"
         f"{af_block}"
         f"{intent_map}"
         f"{browser_efficiency}"
@@ -513,6 +569,245 @@ def update_live(state: DriverState, action: str, detail: str = "", thinking: str
         )
 
 
+def _build_memory_block(task: str, lesson_limit: int = 6, skill_limit: int = 4) -> str:
+    """Pre-task recall: top lessons + skills relevant to this task text.
+
+    Always returns a string (possibly empty). Any error in the memory layer
+    is swallowed — a missing/locked SQLite file must never block task
+    execution. Each lesson summary is capped at 200 chars and each skill
+    recipe at 400 to keep the system prompt tight; the cap matches the brief
+    so prompt size stays bounded regardless of memory size.
+    """
+    if not task or not task.strip():
+        return ""
+    try:
+        from ..autonomous import memory as _memory
+    except Exception as exc:  # noqa: BLE001
+        print(f"[loop] memory import failed: {exc}", flush=True)
+        return ""
+
+    try:
+        lessons = _memory.recall(topic=task, limit=lesson_limit)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[loop] memory.recall failed: {exc}", flush=True)
+        lessons = []
+    try:
+        skills = _memory.top_skills(when_to_use_query=task, limit=skill_limit)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[loop] memory.top_skills failed: {exc}", flush=True)
+        skills = []
+
+    if not lessons and not skills:
+        return ""
+
+    chunks: list[str] = []
+    if lessons:
+        chunks.append("\nПрошлый опыт (newest-first, релевантные уроки):")
+        for row in lessons:
+            summary = (row.get("summary") or "").strip().replace("\n", " ")
+            if len(summary) > 200:
+                summary = summary[:197] + "…"
+            topic = (row.get("topic") or "").strip()[:60]
+            chunks.append(f"  • [{topic}] {summary}")
+    if skills:
+        chunks.append("\nИзвестные навыки (применяй когда совпадает):")
+        for row in skills:
+            name = (row.get("name") or "").strip()
+            when = (row.get("when_to_use") or "").strip()[:80]
+            recipe_raw = row.get("recipe_json") or "{}"
+            try:
+                recipe = json.loads(recipe_raw) if isinstance(recipe_raw, str) else recipe_raw
+            except (json.JSONDecodeError, TypeError):
+                recipe = {}
+            recipe_str = json.dumps(recipe, ensure_ascii=False)
+            if len(recipe_str) > 400:
+                recipe_str = recipe_str[:397] + "…"
+            chunks.append(f"  • {name} ({when}) → {recipe_str}")
+    return "\n".join(chunks) + "\n"
+
+
+def _budget_record_llm(model: str, usage: dict[str, Any]) -> float:
+    """Record an LLM call against the budget ledger.
+
+    Returns the estimated USD spend for this call, or 0.0 on any error.
+    Soft-fails: a locked DB or missing schema must not crash the loop.
+    """
+    try:
+        from ..autonomous import budget as _budget
+    except Exception as exc:  # noqa: BLE001
+        print(f"[loop] budget import failed: {exc}", flush=True)
+        return 0.0
+    try:
+        in_tok = int(usage.get("input_tokens") or 0)
+        out_tok = int(usage.get("output_tokens") or 0)
+        return float(_budget.record_llm_cost(model, in_tok, out_tok))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[loop] budget.record_llm_cost failed: {exc}", flush=True)
+        return 0.0
+
+
+def _memory_save_outcome(
+    task: str,
+    *,
+    success: bool,
+    steps: int,
+    tools_used: list[str],
+    answer: str,
+    abandon_reason: str | None = None,
+) -> None:
+    """Persist a task_outcome lesson + auto-skill if a streak emerged.
+
+    Soft-fails: storage problems must not surface to the user. Score is a
+    crude 1-10 heuristic — successful short task = high, abandoned task =
+    low, long-but-successful task = medium-high.
+    """
+    if not task or not task.strip():
+        return
+    try:
+        from ..autonomous import memory as _memory
+    except Exception as exc:  # noqa: BLE001
+        print(f"[loop] memory import failed in save: {exc}", flush=True)
+        return
+
+    if success:
+        if steps <= 5:
+            score = 9
+        elif steps <= 15:
+            score = 7
+        else:
+            score = 5
+    else:
+        score = 2
+
+    summary_parts: list[str] = []
+    if success:
+        summary_parts.append(f"completed in {steps} steps")
+        if answer:
+            ans = answer.strip().replace("\n", " ")
+            if len(ans) > 140:
+                ans = ans[:137] + "…"
+            summary_parts.append(f"answer: {ans}")
+    else:
+        summary_parts.append(f"abandoned after {steps} steps")
+        if abandon_reason:
+            reason = abandon_reason.strip().replace("\n", " ")
+            if len(reason) > 140:
+                reason = reason[:137] + "…"
+            summary_parts.append(f"reason: {reason}")
+    summary = "; ".join(summary_parts)
+
+    try:
+        _memory.learn(
+            kind="task_outcome",
+            topic=task[:200],
+            summary=summary,
+            payload={
+                "steps": int(steps),
+                "success": bool(success),
+                "tools_used": list(tools_used)[:50],
+                "abandon_reason": abandon_reason,
+            },
+            score=int(score),
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[loop] memory.learn failed: {exc}", flush=True)
+
+    # Auto-skill: only when the task succeeded AND we saw a clean streak of
+    # ≥4 consecutive tool calls. Streak is detected from `tools_used` order —
+    # any 4 identical-or-not tools in a row without `__error__` markers count.
+    if not success or len(tools_used) < 4:
+        return
+    streak: list[str] = []
+    best_streak: list[str] = []
+    for tool in tools_used:
+        if tool.startswith("__"):  # synthetic markers we may add later
+            streak = []
+            continue
+        streak.append(tool)
+        if len(streak) > len(best_streak):
+            best_streak = list(streak)
+    if len(best_streak) < 4:
+        return
+    # Name: first 40 chars of task + step count, deduped via UPSERT on name.
+    base = "".join(c if c.isalnum() or c in "-_" else "_" for c in task.lower()[:40])
+    auto_name = f"auto:{base}:{len(best_streak)}"
+    recipe = [{"tool": t} for t in best_streak]
+    try:
+        _memory.record_skill(
+            name=auto_name,
+            when_to_use=task[:80],
+            recipe={"steps": recipe},
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[loop] memory.record_skill failed: {exc}", flush=True)
+
+
+def _request_checkpoint(
+    llm_url: str,
+    api_key: str,
+    model: str,
+    system_msg: str,
+    messages: list[dict[str, Any]],
+    abort_flag: Any,
+) -> dict[str, Any]:
+    """Inject a synthetic reflection turn and ask the LLM if it's on track.
+
+    Returns a dict ``{on_track: bool, next_step: str, abandon_reason: str|None,
+    usage: {...}}``. On any error returns ``{on_track: True, ...}`` — a broken
+    checkpoint must not abort an otherwise-healthy task.
+    """
+    fallback = {"on_track": True, "next_step": "", "abandon_reason": None, "usage": {}}
+    reflection_prompt = (
+        "Сейчас сделано несколько шагов из задачи. Кратко: ты ещё на пути к цели "
+        "или потерялся? Ответь СТРОГО валидным JSON-объектом без markdown: "
+        '{"on_track": true/false, "next_step": "одна строка", '
+        '"abandon_reason": null или "почему бросаешь"}'
+    )
+    probe_messages = list(messages) + [
+        {"role": "user", "content": [{"type": "text", "text": reflection_prompt}]}
+    ]
+    try:
+        resp = post_llm_cancellable(
+            llm_url,
+            api_key,
+            {
+                "model": model,
+                "max_tokens": 256,
+                "system": system_msg,
+                "messages": probe_messages,
+            },
+            abort_flag,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[loop] checkpoint LLM error: {exc}", flush=True)
+        return fallback
+    if resp.get("type") == "error":
+        return fallback
+
+    text_blocks = [b.get("text", "") for b in resp.get("content", []) if b.get("type") == "text"]
+    raw = " ".join(t for t in text_blocks if t).strip()
+    # Strip code fences if the model wrapped JSON in ```json … ```
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.lower().startswith("json"):
+            raw = raw[4:].lstrip()
+    # Find first { ... } to tolerate leading text.
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        raw = raw[start : end + 1]
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {**fallback, "usage": resp.get("usage", {})}
+    return {
+        "on_track": bool(parsed.get("on_track", True)),
+        "next_step": str(parsed.get("next_step") or "")[:240],
+        "abandon_reason": parsed.get("abandon_reason") or None,
+        "usage": resp.get("usage", {}),
+    }
+
+
 def _fetch_skills_prompt_block(af_client: Any) -> str:
     """Fetch the user's pre-rendered intent-skills block from the server.
 
@@ -558,6 +853,12 @@ def run_task(
 
     af_present = executor._af is not None  # noqa: SLF001
     system_msg = build_system_prompt(win_summary, af_tools_present=af_present)
+
+    # Pre-task recall: append the «Прошлый опыт» / «Известные навыки» block
+    # for THIS task only. Soft-fails to empty string when memory is missing.
+    memory_block = _build_memory_block(task)
+    if memory_block:
+        system_msg = f"{system_msg}\n{memory_block}"
 
     # Prepend the user's editable Skills block from /me/devices/skills.
     # The cabinet UI at /cabinet/devices/skills lets the owner add custom
@@ -624,12 +925,53 @@ def run_task(
 
     final_answer = ""
     iterations = 0
+    tool_calls_count = 0
+    tools_used: list[str] = []
+    total_cost_usd = 0.0
+    last_checkpoint_at = 0
+    abandon_reason: str | None = None
+
+    def _emit_abort(reason: str, kind: str) -> str:
+        """Emit task_error + persist outcome lesson, then return.
+
+        Used by the new caps (step / cost / abandon). Keeps WS frame parity
+        with _emit_cancel: same `task_error` type so the cabinet shows the
+        run as ended, just with a different `error` string for diagnosis.
+        """
+        update_live(state, kind, reason)
+        print(f"\n=== {kind.upper()} === {reason}", flush=True)
+        _memory_save_outcome(
+            task,
+            success=False,
+            steps=tool_calls_count,
+            tools_used=tools_used,
+            answer="",
+            abandon_reason=reason,
+        )
+        if state.current_task_id:
+            state.publish_outbound(
+                {
+                    "type": "task_error",
+                    "task_id": state.current_task_id,
+                    "error": reason,
+                }
+            )
+        return ""
+
     for i in range(max_iters):
         # Iteration-boundary check: fast path for tasks cancelled while idle
         # between iterations. The mid-stream and pre-tool-dispatch checks
         # below cover the long-pole cases.
         if state.abort_flag.is_set():
             return _emit_cancel()
+
+        # Cost cap: check before issuing the next LLM call so a runaway
+        # task doesn't burn one final $0.X call past the limit.
+        if total_cost_usd >= LOOP_MAX_USD:
+            return _emit_abort(
+                f"cost_cap_exceeded: spent ${total_cost_usd:.4f} >= ${LOOP_MAX_USD:.2f}",
+                "cost_cap",
+            )
 
         iterations = i + 1
         print(f"\n--- iter {iterations} ---", flush=True)
@@ -657,6 +999,8 @@ def run_task(
             update_live(state, "error", f"api error: {resp}")
             return ""
 
+        total_cost_usd += _budget_record_llm(model, resp.get("usage") or {})
+
         content = resp.get("content", [])
         texts = [b["text"] for b in content if b.get("type") == "text"]
         tool_uses = [b for b in content if b.get("type") == "tool_use"]
@@ -668,23 +1012,37 @@ def run_task(
 
         if not tool_uses:
             print(f"\n=== END (no tools, stop_reason={resp.get('stop_reason')}) ===", flush=True)
+            # Persist a success outcome — the model finished without further tools.
+            _memory_save_outcome(
+                task,
+                success=True,
+                steps=tool_calls_count,
+                tools_used=tools_used,
+                answer=final_answer or thinking,
+            )
             return final_answer
 
         messages.append({"role": "assistant", "content": content})
         results: list[dict[str, Any]] = []
         done = False
+        hit_step_cap = False
         for tu in tool_uses:
             # Pre-dispatch abort gate: covers the case where cancel arrives
             # while the LLM was responding and we already started iterating
             # over its tool_use blocks.
             if state.abort_flag.is_set():
                 return _emit_cancel()
+            if tool_calls_count >= LOOP_MAX_STEPS:
+                hit_step_cap = True
+                break
             args_preview = json.dumps(tu["input"], ensure_ascii=False)[:160]
             print(f"  → {tu['name']}({args_preview})", flush=True)
             try:
                 out, image = executor.execute(tu["name"], tu.get("input", {}))
             except Exception as exc:  # noqa: BLE001
                 out, image = f"error: {exc}", None
+            tool_calls_count += 1
+            tools_used.append(tu["name"])
             preview = (out[:240] if isinstance(out, str) else str(out)[:240]).replace("\n", " | ")
             print(f"    = {preview}", flush=True)
             update_live(
@@ -720,9 +1078,23 @@ def run_task(
                     {"type": "tool_result", "tool_use_id": tu["id"], "content": str(out)}
                 )
         messages.append({"role": "user", "content": results})
+
+        if hit_step_cap:
+            return _emit_abort(
+                f"step_cap_exceeded: ran {tool_calls_count} tool calls, cap={LOOP_MAX_STEPS}",
+                "step_cap",
+            )
+
         if done:
             update_live(state, "DONE", final_answer)
             print(f"\n=== DONE ===\n{final_answer}", flush=True)
+            _memory_save_outcome(
+                task,
+                success=True,
+                steps=tool_calls_count,
+                tools_used=tools_used,
+                answer=final_answer,
+            )
             if state.current_task_id:
                 state.publish_outbound(
                     {
@@ -731,13 +1103,64 @@ def run_task(
                         "answer": final_answer,
                         "iterations": iterations,
                         "tokens_used": 0,
-                        "cost_usd": 0.0,
+                        "cost_usd": round(total_cost_usd, 6),
                     }
                 )
             return final_answer
 
+        # Checkpoint reflection: fires every LOOP_CHECKPOINT_EVERY tool calls,
+        # but skips when the task is too short to warrant the overhead. The
+        # check runs AFTER the tools dispatch + their results are folded into
+        # messages so the synthetic reflection turn sees the actual progress.
+        if (
+            LOOP_CHECKPOINT_EVERY > 0
+            and tool_calls_count >= CHECKPOINT_MIN_STEPS
+            and tool_calls_count - last_checkpoint_at >= LOOP_CHECKPOINT_EVERY
+        ):
+            last_checkpoint_at = tool_calls_count
+            print(f"  ⟳ checkpoint @ step {tool_calls_count}", flush=True)
+            check = _request_checkpoint(
+                llm_url, api_key, model, system_msg, messages, state.abort_flag
+            )
+            total_cost_usd += _budget_record_llm(model, check.get("usage") or {})
+            on_track = bool(check.get("on_track", True))
+            next_step = (check.get("next_step") or "").strip()
+            reason = check.get("abandon_reason")
+            if not on_track and reason:
+                abandon_reason = str(reason)[:200]
+                update_live(state, "task.abandon", abandon_reason)
+                # Mirror the standard cancel/error path: emit task_error so
+                # the cabinet flips to "stopped" with a diagnostic reason.
+                return _emit_abort(
+                    f"task.abandon: {abandon_reason}",
+                    "task.abandon",
+                )
+            if on_track and next_step:
+                update_live(state, "checkpoint", f"on track → {next_step}")
+                # Inject the hint as a user-side note so the next iteration
+                # sees it without polluting the assistant turn.
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"(checkpoint: продолжай — следующий шаг: {next_step})",
+                            }
+                        ],
+                    }
+                )
+
     update_live(state, "max_iters", f"reached {max_iters}")
     print("\n=== max iters ===", flush=True)
+    _memory_save_outcome(
+        task,
+        success=False,
+        steps=tool_calls_count,
+        tools_used=tools_used,
+        answer=final_answer,
+        abandon_reason=f"max_iters reached ({max_iters})",
+    )
     if state.current_task_id:
         state.publish_outbound(
             {
@@ -746,7 +1169,7 @@ def run_task(
                 "answer": final_answer,
                 "iterations": iterations,
                 "tokens_used": 0,
-                "cost_usd": 0.0,
+                "cost_usd": round(total_cost_usd, 6),
             }
         )
     return final_answer
