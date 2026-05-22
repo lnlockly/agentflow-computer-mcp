@@ -1,0 +1,53 @@
+name: installer-smoke
+
+# Run the install smoke on every push + PR. If it fails, the PR is
+# blocked. This way we catch «pip stops streaming» / «locate_launcher
+# returns null» BEFORE shipping a release — owner stopped wanting to
+# iterate releases with end-users as testers.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "installer/**"
+      - "src/agentflow_computer_mcp/**"
+      - "pyproject.toml"
+      - ".github/workflows/installer-smoke.yml"
+  pull_request:
+    paths:
+      - "installer/**"
+      - "src/agentflow_computer_mcp/**"
+      - "pyproject.toml"
+      - ".github/workflows/installer-smoke.yml"
+  workflow_dispatch:
+
+jobs:
+  smoke-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install package + deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+      - name: Smoke (full — exercises real pip install)
+        run: python installer/smoke.py
+        env:
+          SMOKE_FULL: "1"
+
+  smoke-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install package + deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+      - name: Smoke (light — pip --dry-run only)
+        run: python installer/smoke.py

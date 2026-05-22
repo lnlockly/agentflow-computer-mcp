@@ -25,6 +25,15 @@ jobs:
           python -m pip install pyinstaller pillow
           python -m pip install .
 
+      - name: Smoke — installer must work end-to-end before we publish
+        # Real `pip install --user` of the package + locate_launcher +
+        # launcher --help. If anything regresses (e.g. unbuffered output
+        # broken, locate_launcher returns nothing, .exe entry point
+        # broken) release is blocked and the .exe is NOT uploaded.
+        run: python installer/smoke.py
+        env:
+          SMOKE_FULL: "1"
+
       - name: Build icon
         run: python installer/make_icon.py
 
