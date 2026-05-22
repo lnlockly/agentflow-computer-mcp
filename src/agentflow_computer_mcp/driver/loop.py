@@ -114,6 +114,11 @@ def build_system_prompt(window_summary: str, af_tools_present: bool) -> str:
         "task если scope большой.\n"
         "  • «запусти под-агента / делегируй X» → af_spawn_subagent(brief=...). После старта верни "
         "project_id и slug, не жди до конца если время > 60с.\n"
+        "  • «запиши видео экрана / сохрани видео что я делаю / clip последних N секунд» → "
+        "screen_record_start(path=~/Movies/agentflow-<ts>.mp4, max_duration_s=120) → выполняй задачу → "
+        "screen_record_stop. Если пользователь скажет «достаточно» / «хватит» — screen_record_stop сразу.\n"
+        "  • Не запускай запись без явной просьбы. После stop напиши путь к файлу и его размер "
+        "в task_complete.\n"
     )
 
     browser_efficiency = (
