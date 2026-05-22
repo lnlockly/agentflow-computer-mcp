@@ -52,6 +52,91 @@ def b64url_decode(s: str) -> bytes:
     return base64.b64decode(s + ("=" * pad))
 
 
+def _paste_from_clipboard(widget: tk.Widget) -> str:
+    """Paste clipboard text into a Tk Entry or Text widget. Returns
+    'break' so caller's keysym binding can stop the default handler.
+
+    Works regardless of keyboard layout — we read the clipboard directly
+    instead of relying on Tk's default Ctrl+V binding (which doesn't
+    fire when the active layout maps V to a non-Latin keysym, e.g.
+    Cyrillic м on Russian RU keyboard).
+    """
+    try:
+        text = widget.clipboard_get()
+    except tk.TclError:
+        return "break"
+    try:
+        if isinstance(widget, tk.Text):
+            # Replace selection if any, else insert at cursor.
+            try:
+                widget.delete("sel.first", "sel.last")
+            except tk.TclError:
+                pass
+            widget.insert("insert", text)
+        else:
+            # tk.Entry path.
+            try:
+                widget.delete("sel.first", "sel.last")
+            except tk.TclError:
+                pass
+            widget.insert("insert", text)
+    except Exception:
+        pass
+    return "break"
+
+
+def _bind_paste_anywhere(widget: tk.Widget) -> None:
+    """Bind Ctrl+V / Ctrl+М (Cyrillic) + right-click → Вставить on a
+    Tk Entry or Text. Idempotent — call once per widget on construction."""
+
+    def on_ctrl(event):  # noqa: ANN001
+        ks = (event.keysym or "").lower()
+        # 'v' = Latin V, 'cyrillic_em' / 'м' = Russian М (same physical key)
+        if ks in ("v", "м", "cyrillic_em"):
+            return _paste_from_clipboard(widget)
+        return None
+
+    widget.bind("<Control-KeyPress>", on_ctrl)
+
+    menu = tk.Menu(widget, tearoff=0, bg=FIELD_BG, fg=FG, activebackground=ACCENT, activeforeground=BG)
+    menu.add_command(label="Вставить", command=lambda: _paste_from_clipboard(widget))
+    menu.add_command(label="Копировать", command=lambda: _copy_to_clipboard(widget))
+    menu.add_command(label="Выбрать всё", command=lambda: _select_all(widget))
+
+    def on_right_click(event):  # noqa: ANN001
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    widget.bind("<Button-3>", on_right_click)
+
+
+def _copy_to_clipboard(widget: tk.Widget) -> None:
+    try:
+        if isinstance(widget, tk.Text):
+            text = widget.get("sel.first", "sel.last")
+        else:
+            text = widget.selection_get()
+    except tk.TclError:
+        return
+    widget.clipboard_clear()
+    widget.clipboard_append(text)
+
+
+def _select_all(widget: tk.Widget) -> str:
+    try:
+        if isinstance(widget, tk.Text):
+            widget.tag_add("sel", "1.0", "end-1c")
+            widget.mark_set("insert", "1.0")
+        else:
+            widget.select_range(0, "end")
+            widget.icursor("end")
+    except Exception:
+        pass
+    return "break"
+
+
 def parse_invite(blob: str) -> dict:
     """Decode a base64url invite blob and validate the three fields."""
     blob = blob.strip()
@@ -250,8 +335,11 @@ class SetupWindow:
             anchor="w",
         ).pack(fill="x")
 
+        invite_row = tk.Frame(wrap, bg=BG)
+        invite_row.pack(fill="x", pady=(4, 6))
+
         self.invite = tk.Text(
-            wrap,
+            invite_row,
             height=3,
             bg=FIELD_BG,
             fg=FG,
@@ -260,7 +348,25 @@ class SetupWindow:
             font=("Consolas", 9),
             wrap="char",
         )
-        self.invite.pack(fill="x", pady=(4, 6))
+        self.invite.pack(side="left", fill="x", expand=True)
+
+        # Tkinter's default Ctrl+V binding doesn't fire when the user has
+        # a non-Latin keyboard layout active (Cyrillic Ctrl+М ≠ Ctrl+V).
+        # Bind both common Russian-layout keysyms + provide a dedicated
+        # «Вставить» button + right-click menu so paste always works.
+        _bind_paste_anywhere(self.invite)
+        tk.Button(
+            invite_row,
+            text="Вставить",
+            bg=ACCENT,
+            fg=BG,
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            command=lambda: _paste_from_clipboard(self.invite),
+            padx=10,
+            pady=2,
+            cursor="hand2",
+        ).pack(side="left", padx=(6, 0), ipady=18)
 
         self.advanced_toggle = tk.Label(
             wrap,
@@ -287,6 +393,7 @@ class SetupWindow:
             tk.Label(row, text=label, bg=BG, fg=MUTED, width=22, anchor="w").pack(side="left")
             entry = tk.Entry(row, bg=FIELD_BG, fg=FG, insertbackground=FG, relief="flat")
             entry.pack(side="left", fill="x", expand=True)
+            _bind_paste_anywhere(entry)
             self.fields[key] = entry
 
         bottom = tk.Frame(wrap, bg=BG)
