@@ -5,6 +5,8 @@ from unittest.mock import MagicMock, patch
 from agentflow_computer_mcp.driver.af_client import AFClient
 from agentflow_computer_mcp.driver.desktop_tools import (
     DESKTOP_TOOLS,
+    MAC_ONLY_TOOLS,
+    WINDOWS_ONLY_TOOLS,
     ToolExecutor,
     all_tool_descriptors,
     get_window_list,
@@ -23,9 +25,40 @@ def test_all_tool_descriptors_includes_desktop_and_af() -> None:
     from agentflow_computer_mcp.driver.af_client import AF_TOOL_DESCRIPTORS
     from agentflow_computer_mcp.driver.firefox import FIREFOX_TOOL_DESCRIPTORS
 
-    assert len(tools) == (
-        len(DESKTOP_TOOLS) + len(FIREFOX_TOOL_DESCRIPTORS) + len(AF_TOOL_DESCRIPTORS)
-    )
+    # The OS filter strips mac-only tools on Windows/Linux and windows-only tools
+    # on macOS, so the total catalog drops by that count vs the raw sum.
+    raw_total = len(DESKTOP_TOOLS) + len(FIREFOX_TOOL_DESCRIPTORS) + len(AF_TOOL_DESCRIPTORS)
+    import platform as _platform
+
+    if _platform.system() == "Darwin":
+        expected = raw_total - len(WINDOWS_ONLY_TOOLS)
+    else:
+        expected = raw_total - len(MAC_ONLY_TOOLS)
+    assert len(tools) == expected
+
+
+def test_all_tool_descriptors_filters_mac_only_on_windows() -> None:
+    """On a Windows host, AppleScript-only tools must not appear in the LLM catalog."""
+    with patch("agentflow_computer_mcp.driver.desktop_tools.platform.system", return_value="Windows"):
+        names = {t["name"] for t in all_tool_descriptors()}
+    assert "chrome_eval" not in names
+    assert "chrome_tabs" not in names
+    assert "powershell_exec" in names
+    assert "winget_search" in names
+    # Cross-platform tools stay visible.
+    assert "chrome_open_url" in names
+    assert "start_app" in names
+
+
+def test_all_tool_descriptors_filters_windows_only_on_mac() -> None:
+    """On a macOS host, Windows-only tools must not appear in the LLM catalog."""
+    with patch("agentflow_computer_mcp.driver.desktop_tools.platform.system", return_value="Darwin"):
+        names = {t["name"] for t in all_tool_descriptors()}
+    assert "powershell_exec" not in names
+    assert "winget_search" not in names
+    assert "winget_install" not in names
+    assert "chrome_eval" in names
+    assert "chrome_tabs" in names
 
 
 def test_executor_routes_af_tool_when_client_present() -> None:

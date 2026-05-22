@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import platform
 import sys
 import time
 import urllib.error
@@ -21,6 +22,13 @@ from .streamer import compress_png_for_viewer
 DEFAULT_LLM_URL = "https://agentflow.website/_agents/llm/v1/messages"
 DEFAULT_MODEL = "claude-opus-4-7"
 MAX_ITERS = 40
+
+# Host platform string, captured once at module load. Used by build_system_prompt
+# to inject an OS-context block so the LLM doesn't try osascript on Windows
+# or PowerShell on macOS. `platform.system()` returns 'Darwin' | 'Linux' |
+# 'Windows' which lines up with the documentation tone we want in the prompt.
+HOST_OS = platform.system()
+HOST_OS_RELEASE = platform.release()
 
 
 def _current_os() -> str:
@@ -185,6 +193,56 @@ def build_system_prompt(window_summary: str, af_tools_present: bool) -> str:
     )
 
     os_label = {"macos": "Mac", "linux": "Linux", "windows": "Windows"}[_current_os()]
+
+    # OS-aware tool guidance. The agent boots on whatever host the user runs
+    # — macOS, Windows, or Linux — and historically had a Mac-centric prompt
+    # that pushed it to call osascript / pbcopy / AppleScript on Windows.
+    # This block hard-pins which tools are real on the current host so the
+    # LLM stops reaching for nonexistent commands.
+    os_context = (
+        f"\nОС хоста: {HOST_OS} ({HOST_OS_RELEASE})\n"
+        "Доступные инструменты — только те, что работают на этой ОС:\n"
+        "  • macOS:   AppleScript (osascript), Quartz screen capture, pbcopy/pbpaste, "
+        "chrome_open_url / chrome_eval / chrome_tabs (через AppleScript), read_terminal "
+        "(iTerm/Terminal через AppleScript), `open -a <App>`.\n"
+        "  • Windows: PowerShell (`powershell -Command \"...\"`) через powershell_exec, "
+        "winget_search / winget_install для пакетов, pywin32 windows через activate_app, "
+        "pyperclip для буфера. Chrome — только через chrome_open_url + chrome_eval "
+        "(headed Chromium / Firefox), НЕ AppleScript.\n"
+        "  • Linux:   bash, xdotool / wmctrl (X11) либо wl-tools (Wayland), xclip / wl-copy "
+        "для буфера, `xdg-open <url>` для дефолтного браузера.\n"
+    )
+    if HOST_OS == "Darwin":
+        os_context += (
+            "\nТы на macOS: AppleScript-инструменты разрешены. НЕ зови powershell_exec / winget_*.\n"
+        )
+    elif HOST_OS == "Windows":
+        os_context += (
+            "\nТы на Windows: osascript / AppleScript / pbcopy / `open -a` НЕДОСТУПНЫ. "
+            "Для shell — powershell_exec. Для запуска приложений — start_app(name). "
+            "Для установки софта — winget_search / winget_install. Chrome через chrome_open_url "
+            "+ chrome_eval (headed). read_terminal вернёт PowerShell history, а не iTerm.\n"
+        )
+    else:
+        os_context += (
+            "\nТы на Linux: AppleScript / PowerShell / winget недоступны. Используй bash через "
+            "code_run_command, xdg-open для браузера, activate_app для X11/Wayland окон.\n"
+        )
+
+    # Knowledge block for terms that the LLM consistently confuses across
+    # OS contexts. «Кодекс» = OpenAI Codex CLI / web app, NOT agentflow's
+    # llm-cabinet. Package managers are OS-specific.
+    knowledge = (
+        "\nСправочник терминов и инструментов:\n"
+        "  • Codex / Кодекс = OpenAI Codex (https://chatgpt.com/codex или CLI `npm i -g @openai/codex`). "
+        "Это НЕ agentflow.website/llm-cabinet — кабинет это наш биллинг LLM-ключей.\n"
+        "  • npm / node / git — кросс-платформенные. Установка: macOS `brew install node git`; "
+        "Windows `winget install OpenJS.NodeJS Git.Git`; Linux `apt install nodejs git`.\n"
+        "  • Vercel CLI: `npm i -g vercel`. Логин — `vercel login`.\n"
+        "  • Package managers по ОС: macOS `brew`, Windows `winget` / `scoop`, Linux `apt` / `dnf` / `pacman`.\n"
+        "  • Перед `winget install <id>` сначала `winget_search <query>` чтобы получить точный Id.\n"
+    )
+
     return (
         f"Ты управляешь {os_label} пользователя. Перед действием — короткая мысль в text-блоке. "
         "Не извиняйся, не повторяй очевидное. Стратегия:\n"
@@ -195,6 +253,8 @@ def build_system_prompt(window_summary: str, af_tools_present: bool) -> str:
         "ОТДЕЛЬНЫЙ от пользовательского браузера. Видим в live viewer.\n"
         "  • для авторизованного веба (где у юзера уже залогинено): chrome_eval / chrome_open_url — реальный "
         "Google Chrome с его сессией.\n"
+        f"{os_context}"
+        f"{knowledge}"
         f"{af_block}"
         f"{intent_map}"
         f"{browser_efficiency}"

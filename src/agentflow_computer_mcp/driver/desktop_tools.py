@@ -10,6 +10,8 @@ import asyncio
 import base64
 import io
 import json
+import platform
+import shutil
 import subprocess
 import threading
 import time
@@ -97,6 +99,14 @@ def app_activate(owner: str) -> str:
 
 
 def chrome_run_js(js: str, tab_index: int | None = None) -> str:
+    # AppleScript-only — no cross-platform analog. Headless DevTools Protocol
+    # would work on Windows/Linux but needs Chrome started with --remote-debug.
+    # On non-Mac the LLM should fall back to browser_eval (headed Chromium).
+    if PLATFORM != "mac":
+        return (
+            "error: chrome_eval requires AppleScript and only works on macOS. "
+            "Use browser_open + browser_navigate + browser_eval (headed Chromium) instead."
+        )
     js_esc = js.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
     if tab_index is None:
         script = f'tell application "Google Chrome" to tell active tab of front window to execute javascript "{js_esc}"'
@@ -107,25 +117,205 @@ def chrome_run_js(js: str, tab_index: int | None = None) -> str:
 
 
 def chrome_open_url(url: str, new_tab: bool = True) -> str:
-    if new_tab:
-        rc, out = osa(
-            f'tell application "Google Chrome" to tell front window to make new tab with properties {{URL:"{url}"}}',
-            timeout=10,
-        )
-    else:
-        rc, out = osa(
-            f'tell application "Google Chrome" to set URL of active tab of front window to "{url}"',
-            timeout=10,
-        )
-    return f"opened {url}" if rc == 0 else f"error: {out}"
+    """Open a URL in the user's real Chrome / default browser.
+
+    Cross-platform: AppleScript on macOS, `start chrome` on Windows,
+    `xdg-open` on Linux. ``new_tab`` is honoured only on macOS — the
+    other platforms always open in whichever window the OS shell picks.
+    """
+    if PLATFORM == "mac":
+        if new_tab:
+            rc, out = osa(
+                f'tell application "Google Chrome" to tell front window to make new tab with properties {{URL:"{url}"}}',
+                timeout=10,
+            )
+        else:
+            rc, out = osa(
+                f'tell application "Google Chrome" to set URL of active tab of front window to "{url}"',
+                timeout=10,
+            )
+        return f"opened {url}" if rc == 0 else f"error: {out}"
+    if PLATFORM == "windows":
+        try:
+            # `start` is a cmd builtin — invoke via shell. Quote-escape the URL.
+            subprocess.run(
+                ["cmd", "/c", "start", "", url],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            return f"opened {url}"
+        except Exception as exc:  # noqa: BLE001
+            return f"error: {exc}"
+    # Linux
+    opener = shutil.which("xdg-open") or shutil.which("gio")
+    if not opener:
+        return "error: no xdg-open / gio available; install xdg-utils"
+    try:
+        cmd = [opener, "open", url] if opener.endswith("gio") else [opener, url]
+        subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
+        return f"opened {url}"
+    except Exception as exc:  # noqa: BLE001
+        return f"error: {exc}"
 
 
 def chrome_list_tabs() -> str:
+    if PLATFORM != "mac":
+        return (
+            "error: chrome_tabs requires AppleScript and only works on macOS. "
+            "Use browser_snapshot (headed Chromium) or query DevTools Protocol directly."
+        )
     rc, out = osa(
         'tell application "Google Chrome" to get {URL, title} of tabs of front window',
         timeout=10,
     )
     return out
+
+
+# ---- Windows / cross-platform helpers ---------------------------------------
+
+def powershell_exec(command: str, timeout: int = 30) -> dict[str, Any]:
+    """Run a PowerShell command and return stdout/stderr/exit_code.
+
+    Only works on Windows. The LLM-facing tool dispatcher also routes this
+    through ``scope.shell_whitelist`` — the program ``powershell`` must be
+    allow-listed for the call to land.
+    """
+    if PLATFORM != "windows":
+        return {
+            "ok": False,
+            "error": "mac_only_or_linux_only",
+            "detail": "powershell_exec is Windows-only; use code_run_command on macOS/Linux",
+        }
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", command],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        return {
+            "ok": r.returncode == 0,
+            "exit_code": r.returncode,
+            "stdout": (r.stdout or "")[:8000],
+            "stderr": (r.stderr or "")[:4000],
+        }
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "timeout", "timeout_s": timeout}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+def winget_search(query: str) -> dict[str, Any]:
+    """Discover an app via `winget search`. Windows-only."""
+    if PLATFORM != "windows":
+        return {"ok": False, "error": "windows_only", "detail": "winget exists only on Windows"}
+    try:
+        r = subprocess.run(
+            ["winget", "search", "--source", "winget", "--accept-source-agreements", query],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        return {
+            "ok": r.returncode == 0,
+            "exit_code": r.returncode,
+            "stdout": (r.stdout or "")[:8000],
+            "stderr": (r.stderr or "")[:2000],
+        }
+    except FileNotFoundError:
+        return {"ok": False, "error": "winget_not_found", "detail": "winget is not on PATH"}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "timeout"}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+def winget_install(package_id: str) -> dict[str, Any]:
+    """Install an app via `winget install <id>`. Windows-only."""
+    if PLATFORM != "windows":
+        return {"ok": False, "error": "windows_only", "detail": "winget exists only on Windows"}
+    try:
+        r = subprocess.run(
+            [
+                "winget",
+                "install",
+                "--id",
+                package_id,
+                "--exact",
+                "--silent",
+                "--accept-package-agreements",
+                "--accept-source-agreements",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+        return {
+            "ok": r.returncode == 0,
+            "exit_code": r.returncode,
+            "stdout": (r.stdout or "")[:8000],
+            "stderr": (r.stderr or "")[:2000],
+        }
+    except FileNotFoundError:
+        return {"ok": False, "error": "winget_not_found"}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "timeout"}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+def start_app(name: str) -> str:
+    """Launch an app by name, cross-platform.
+
+    macOS:  `open -a <name>`
+    Windows: `Start-Process <name>` via PowerShell
+    Linux:  best-effort — try the binary, then xdg-open as a fallback
+    """
+    if PLATFORM == "mac":
+        try:
+            r = subprocess.run(
+                ["open", "-a", name],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            return f"launched {name}" if r.returncode == 0 else f"error: {r.stderr.strip() or 'open -a failed'}"
+        except Exception as exc:  # noqa: BLE001
+            return f"error: {exc}"
+    if PLATFORM == "windows":
+        try:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", f"Start-Process -FilePath '{name}'"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            return f"launched {name}" if r.returncode == 0 else f"error: {(r.stderr or 'Start-Process failed').strip()}"
+        except Exception as exc:  # noqa: BLE001
+            return f"error: {exc}"
+    # Linux
+    binary = shutil.which(name)
+    if binary:
+        try:
+            subprocess.Popen([binary], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return f"launched {name}"
+        except Exception as exc:  # noqa: BLE001
+            return f"error: {exc}"
+    opener = shutil.which("xdg-open")
+    if opener:
+        try:
+            subprocess.Popen([opener, name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return f"launched {name} (via xdg-open)"
+        except Exception as exc:  # noqa: BLE001
+            return f"error: {exc}"
+    return f"error: cannot launch {name!r} on Linux — not in PATH and xdg-open missing"
 
 
 def read_iterm_session() -> str:
@@ -598,6 +788,57 @@ DESKTOP_TOOLS: list[dict[str, Any]] = [
         "input_schema": {"type": "object", "properties": {}},
     },
     {
+        "name": "powershell_exec",
+        "description": (
+            "Windows only. Run a PowerShell command. Returns stdout/stderr/exit_code. "
+            "The program `powershell` must be in scope.shell_whitelist. Use this instead "
+            "of code_run_command when you need PowerShell-specific cmdlets (Get-Process, "
+            "Start-Process, Get-WmiObject, etc.)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+                "timeout": {"type": "integer", "default": 30},
+            },
+            "required": ["command"],
+        },
+    },
+    {
+        "name": "winget_search",
+        "description": "Windows only. Search winget for a package (returns matching Ids).",
+        "input_schema": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "winget_install",
+        "description": (
+            "Windows only. Install a winget package by exact Id. Run winget_search first "
+            "to find the right Id. Requires user confirmation (shell.exec gate)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"id": {"type": "string"}},
+            "required": ["id"],
+        },
+    },
+    {
+        "name": "start_app",
+        "description": (
+            "Launch an app by name, cross-platform. macOS uses `open -a`, Windows uses "
+            "`Start-Process`, Linux tries the binary then xdg-open. For full window control "
+            "use activate_app instead (focuses an already-running window)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        },
+    },
+    {
         "name": "task_complete",
         "description": "Finish with answer.",
         "input_schema": {
@@ -609,9 +850,51 @@ DESKTOP_TOOLS: list[dict[str, Any]] = [
 ]
 
 
+# Tools that only make sense on macOS — wrap AppleScript or *nix-only paths.
+# Filtered out of the LLM tool list on Windows/Linux so the model never tries
+# to call them on the wrong host.
+MAC_ONLY_TOOLS: frozenset[str] = frozenset(
+    {
+        "chrome_eval",
+        "chrome_tabs",
+    }
+)
+
+# Tools that only work on Windows. Filtered out on macOS/Linux.
+WINDOWS_ONLY_TOOLS: frozenset[str] = frozenset(
+    {
+        "powershell_exec",
+        "winget_search",
+        "winget_install",
+    }
+)
+
+
+def _filter_tools_by_os(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Strip OS-incompatible tools out of the LLM-visible catalog.
+
+    The driver loop never exposes ``osascript_*`` on Windows nor
+    ``powershell_exec`` on macOS — anything the model can call back must
+    be backed by a real executable on the current host. Tools that are
+    cross-platform (chrome_open_url, start_app, screen_*, browser_*) stay
+    visible everywhere.
+    """
+    host = platform.system()
+    out: list[dict[str, Any]] = []
+    for t in tools:
+        name = t.get("name", "")
+        if host == "Darwin" and name in WINDOWS_ONLY_TOOLS:
+            continue
+        if host != "Darwin" and name in MAC_ONLY_TOOLS:
+            continue
+        out.append(t)
+    return out
+
+
 def all_tool_descriptors() -> list[dict[str, Any]]:
-    """Desktop tools + Firefox tools + AgentFlow API tools, in one flat list for the Anthropic API."""
-    return DESKTOP_TOOLS + FIREFOX_TOOL_DESCRIPTORS + AF_TOOL_DESCRIPTORS
+    """Desktop tools + Firefox tools + AgentFlow API tools, filtered by host OS."""
+    raw = DESKTOP_TOOLS + FIREFOX_TOOL_DESCRIPTORS + AF_TOOL_DESCRIPTORS
+    return _filter_tools_by_os(raw)
 
 
 class ToolExecutor:
@@ -866,6 +1149,49 @@ class ToolExecutor:
                 return json.dumps(result, ensure_ascii=False), None
             except Exception as exc:  # noqa: BLE001
                 return json.dumps({"ok": False, "error": str(exc)}), None
+        if name == "powershell_exec":
+            cmd = args.get("command", "")
+            self._announce("powershell_exec", f"cmd={cmd[:120]}")
+            if PLATFORM != "windows":
+                return json.dumps(
+                    {"ok": False, "error": "windows_only", "detail": "powershell_exec is Windows-only"},
+                    ensure_ascii=False,
+                ), None
+            # Route through the same shell_whitelist gate as code_run_command.
+            try:
+                from ..scope import check_shell
+
+                check_shell("powershell", self._scope)
+            except Exception as exc:  # noqa: BLE001
+                return json.dumps({"ok": False, "error": f"scope: {exc}"}), None
+            if requires_confirm("computer.shell.exec", self._scope):
+                summary = confirm_summary(
+                    "powershell.exec", {"command": cmd[:300]}
+                )
+                if not self._confirm_blocking("computer.powershell.exec", summary):
+                    return json.dumps({"ok": False, "error": "user denied powershell_exec"}), None
+            result = powershell_exec(cmd, timeout=int(args.get("timeout", 30)))
+            return json.dumps(result, ensure_ascii=False)[:4000], None
+        if name == "winget_search":
+            self._announce("winget_search", f"query={args.get('query', '')[:80]}")
+            result = winget_search(args.get("query", ""))
+            return json.dumps(result, ensure_ascii=False)[:4000], None
+        if name == "winget_install":
+            pkg = args.get("id", "")
+            self._announce("winget_install", f"id={pkg}")
+            if PLATFORM != "windows":
+                return json.dumps(
+                    {"ok": False, "error": "windows_only"}, ensure_ascii=False
+                ), None
+            if requires_confirm("computer.shell.exec", self._scope):
+                summary = confirm_summary("winget.install", {"id": pkg})
+                if not self._confirm_blocking("computer.winget.install", summary):
+                    return json.dumps({"ok": False, "error": "user denied winget_install"}), None
+            result = winget_install(pkg)
+            return json.dumps(result, ensure_ascii=False)[:4000], None
+        if name == "start_app":
+            self._announce("start_app", f"name={args.get('name', '')}")
+            return start_app(args.get("name", "")), None
         if name == "task_complete":
             return "__DONE__", None
         return f"unknown tool: {name}", None
