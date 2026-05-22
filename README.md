@@ -58,6 +58,18 @@ These run inline in the driver loop and let the LLM act on AgentFlow itself (cre
 
 From the AgentFlow cabinet at `https://agentflow.website/cabinet/devices`, click "Add device" — the modal prints the one-liner for the matching OS.
 
+### Windows (recommended: setup.exe)
+
+Download the GUI installer:
+
+[**agentflow-desktop-setup.exe**](https://github.com/lnlockly/agentflow-computer-mcp/releases/latest/download/agentflow-desktop-setup.exe)
+
+Double-click the file, paste the invite code from the cabinet into the single text field, click **Install**. The wizard pip-installs the package into your user site, writes `%USERPROFILE%\.agentflow\auth.json`, registers a `AgentFlowDesktop` scheduled task at logon, and starts the daemon. The «Open cabinet» button at the end jumps straight to your device's live view.
+
+The .exe is unsigned, so Windows SmartScreen shows «Windows protected your PC» the first time. Click **More info → Run anyway**. Power users can keep using the PowerShell one-liner below.
+
+The invite code is base64url of `{"k":"<api_key>","d":"<device_id>","t":"<device_token>"}`. If you prefer pasting raw values, expand «Расширенные настройки» inside the wizard.
+
 ### macOS
 
 ```bash
