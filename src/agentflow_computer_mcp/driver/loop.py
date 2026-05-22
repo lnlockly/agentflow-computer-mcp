@@ -538,8 +538,9 @@ def run_task(
 
     def _emit_cancel() -> str:
         state.abort_flag.clear()
-        update_live(state, "cancelled", "task cancelled by user")
-        print("\n=== CANCELLED ===", flush=True)
+        # Publish task_error FIRST so the cabinet flips to "stopped" within
+        # milliseconds. update_live (which does a fresh screenshot for the
+        # viewer JPEG) can take 2-5 s on macOS and must not block the WS frame.
         if state.current_task_id:
             state.publish_outbound(
                 {
@@ -548,6 +549,17 @@ def run_task(
                     "error": "cancelled_by_user",
                 }
             )
+        print("\n=== CANCELLED ===", flush=True)
+        # Best-effort viewer update — never let a slow screencapture stall the
+        # cancel path. Run in a daemon thread so this function returns now.
+        import threading as _th_local
+
+        _th_local.Thread(
+            target=update_live,
+            args=(state, "cancelled", "task cancelled by user"),
+            daemon=True,
+            name="cancel-update-live",
+        ).start()
         return ""
 
     final_answer = ""
