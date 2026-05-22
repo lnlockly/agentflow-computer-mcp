@@ -11,15 +11,40 @@ foreach ($var in @("AF_KEY", "AF_DEVICE_TOKEN", "AF_DEVICE_ID")) {
 }
 
 $AfWsUrl = $env:AF_WS_URL
-if (-not $AfWsUrl) { $AfWsUrl = "wss://agentflow.website/_devices/connect" }
+if (-not $AfWsUrl) { $AfWsUrl = "wss://agentflow.website/_agents/_devices/connect" }
 
 $AfDir = Join-Path $env:USERPROFILE ".agentflow"
 New-Item -ItemType Directory -Force -Path $AfDir | Out-Null
 
+# ---------------------------------------------------------------------------
+# Detect Python — Microsoft Store installs may only expose `py -3`.
+# ---------------------------------------------------------------------------
+$PythonCmd = $null
+foreach ($candidate in @("python", "py -3")) {
+    try {
+        $ver = & cmd /c "$candidate --version" 2>&1
+        if ($LASTEXITCODE -eq 0 -and $ver -match "Python 3") {
+            $PythonCmd = $candidate
+            break
+        }
+    } catch { }
+}
+
+if (-not $PythonCmd) {
+    Write-Host ""
+    Write-Host "ERROR: Python 3 not found on PATH." -ForegroundColor Red
+    Write-Host "Install Python from: https://www.python.org/downloads/windows/" -ForegroundColor Yellow
+    Write-Host "  - Tick 'Add Python to PATH' during setup."
+    Write-Host "  - Microsoft Store users: also try 'py -3 --version' from a fresh terminal."
+    exit 1
+}
+
+Write-Host "Using Python: $PythonCmd"
+
 if ($env:AF_PACKAGE_PATH) {
-    & python -m pip install --user --upgrade $env:AF_PACKAGE_PATH
+    & cmd /c "$PythonCmd -m pip install --user --upgrade $env:AF_PACKAGE_PATH"
 } else {
-    & python -m pip install --user --upgrade "git+https://github.com/lnlockly/agentflow-computer-mcp.git"
+    & cmd /c "$PythonCmd -m pip install --user --upgrade git+https://github.com/lnlockly/agentflow-computer-mcp.git"
 }
 
 $Auth = @{
@@ -48,33 +73,53 @@ budget_usd = 2.0
 "@ | Set-Content -Path $ScopePath -Encoding UTF8
 }
 
-# Find the entry-point script pip --user dropped on disk.
-$UserScripts = & python -c "import site; print(site.USER_BASE)"
-$Entrypoint = Join-Path $UserScripts "Scripts\agentflow-computer-mcp.exe"
+# ---------------------------------------------------------------------------
+# Find the entry-point binary pip --user dropped on disk.
+# ---------------------------------------------------------------------------
+$UserBase = & cmd /c "$PythonCmd -c `"import site; print(site.USER_BASE)`""
+$Entrypoint = Join-Path $UserBase "Scripts\agentflow-desktop.exe"
 if (-not (Test-Path $Entrypoint)) {
-    $Entrypoint = Join-Path $UserScripts "Scripts\agentflow-computer-mcp"
+    $Entrypoint = Join-Path $UserBase "Scripts\agentflow-desktop"
+}
+# Fallback: old package name
+if (-not (Test-Path $Entrypoint)) {
+    $Entrypoint = Join-Path $UserBase "Scripts\agentflow-computer-mcp.exe"
 }
 if (-not (Test-Path $Entrypoint)) {
-    Write-Error "could not find agentflow-computer-mcp entry point under $UserScripts\Scripts"
+    $Entrypoint = Join-Path $UserBase "Scripts\agentflow-computer-mcp"
+}
+if (-not (Test-Path $Entrypoint)) {
+    Write-Error "could not find agentflow-desktop entry point under $UserBase\Scripts"
     exit 1
 }
 
-# Task Scheduler entry that runs on user logon.
-$TaskName = "AgentFlowComputerMcp"
-$Action = New-ScheduledTaskAction -Execute $Entrypoint -Argument "--mode ws"
-$Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+# ---------------------------------------------------------------------------
+# Task Scheduler — runs at logon AND at system startup.
+# RunLevel = Limited (daemon does not need admin rights).
+# RestartCount = 5 with 1-minute interval.
+# ---------------------------------------------------------------------------
+$TaskName = "AgentFlowDesktop"
+$Action = New-ScheduledTaskAction -Execute $Entrypoint -Argument "run"
+
+$TriggerLogon  = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$TriggerBoot   = New-ScheduledTaskTrigger -AtStartup
+
 $Settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -StartWhenAvailable `
-    -RestartInterval (New-TimeSpan -Minutes 1) `
-    -RestartCount 3
-$Principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive
+    -RestartCount 5 `
+    -RestartInterval (New-TimeSpan -Minutes 1)
+
+$Principal = New-ScheduledTaskPrincipal `
+    -UserId $env:USERNAME `
+    -LogonType Interactive `
+    -RunLevel Limited
 
 Register-ScheduledTask `
     -TaskName $TaskName `
     -Action $Action `
-    -Trigger $Trigger `
+    -Trigger @($TriggerLogon, $TriggerBoot) `
     -Settings $Settings `
     -Principal $Principal `
     -Force | Out-Null
@@ -83,6 +128,24 @@ Start-ScheduledTask -TaskName $TaskName
 
 Write-Host ""
 Write-Host "Windows install complete."
-Write-Host "  Task: $TaskName (runs at logon)"
-Write-Host "  Verify: agentflow-desktop selftest"
-Write-Host "  Stop:   Stop-ScheduledTask -TaskName $TaskName"
+Write-Host "  Task:      $TaskName (runs at logon + startup, restarts up to 5x on failure)"
+Write-Host "  Logs:      %TEMP%\agentflow-desktop.log  (or Event Viewer → Task Scheduler)"
+Write-Host "  Stop:      Stop-ScheduledTask -TaskName $TaskName"
+Write-Host ""
+
+# ---------------------------------------------------------------------------
+# Selftest
+# ---------------------------------------------------------------------------
+$DesktopBin = Join-Path $UserBase "Scripts\agentflow-desktop.exe"
+if (-not (Test-Path $DesktopBin)) {
+    $DesktopBin = Join-Path $UserBase "Scripts\agentflow-desktop"
+}
+if (Test-Path $DesktopBin) {
+    Write-Host "--- selftest ---"
+    & $DesktopBin selftest
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "selftest: PASS"
+    } else {
+        Write-Host "selftest: FAIL (see above)"
+    }
+}
