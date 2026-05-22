@@ -32,13 +32,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
       - name: Lint
-        run: ruff check src tests
+        run: python -m ruff check src tests
       - name: Test (under Xvfb)
         run: |
-          xvfb-run -a pytest -v
+          xvfb-run -a python -m pytest -v
       - name: Selftest
         run: |
-          xvfb-run -a agentflow-desktop selftest || echo "selftest may report partial results without a real desktop session"
+          xvfb-run -a python -m agentflow_computer_mcp.desktop_cli selftest || echo "selftest may report partial results without a real desktop session"
 
   # test-macos:
   #   runs-on: [self-hosted, macOS]   # enable once a macOS runner is registered for this repo

@@ -1,8 +1,30 @@
 #!/bin/bash
 set -euo pipefail
 
-if [[ -z "${AF_KEY:-}" || -z "${AF_DEVICE_TOKEN:-}" || -z "${AF_DEVICE_ID:-}" ]]; then
-  echo "error: AF_KEY, AF_DEVICE_TOKEN, AF_DEVICE_ID env vars required" >&2
+if [[ -z "${AF_DEVICE_TOKEN:-}" || -z "${AF_DEVICE_ID:-}" ]]; then
+  echo "error: AF_DEVICE_TOKEN and AF_DEVICE_ID env vars required" >&2
+  exit 1
+fi
+
+# Ask for AF_KEY interactively if not provided (avoids shell-history leakage).
+# Falls back to /dev/tty so the prompt works under `curl | bash` piping.
+if [[ -z "${AF_KEY:-}" ]]; then
+  if [[ -t 0 ]]; then
+    printf "AgentFlow API key (af_live_...): "
+    read -rs AF_KEY
+    echo
+  elif [[ -e /dev/tty ]]; then
+    printf "AgentFlow API key (af_live_...): " >/dev/tty
+    read -rs AF_KEY </dev/tty
+    echo >/dev/tty
+  else
+    echo "error: AF_KEY env var required (no TTY for interactive prompt)" >&2
+    exit 1
+  fi
+fi
+
+if [[ -z "${AF_KEY:-}" ]]; then
+  echo "error: AF_KEY is empty" >&2
   exit 1
 fi
 
