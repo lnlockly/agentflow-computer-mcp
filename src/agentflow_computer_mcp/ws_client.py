@@ -22,23 +22,44 @@ HEARTBEAT_INTERVAL_S = 15
 HEARTBEAT_TIMEOUT_S = 45
 
 ToolHandler = Callable[[str, dict[str, Any]], Awaitable[Any]]
+TaskDispatchHandler = Callable[[str, str, dict[str, Any] | None], None]
+StreamSubscribeHandler = Callable[[bool], None]
 
 
 class WSClient:
+    """Reverse-tunnel client for the AgentFlow devices WS.
+
+    Routes server-initiated frames:
+      • `tool_call_request` → tool handler (existing behavior)
+      • `task_dispatch`     → `on_task_dispatch(task_id, task, scope)`
+      • `subscribe_stream`  → `on_stream_subscribe(True)`
+      • `unsubscribe_stream` → `on_stream_subscribe(False)`
+
+    Other modules (AI loop, capture loop) can push outbound frames via
+    `publish(payload)` — a thread-safe schedule onto the WS event loop.
+    """
+
     def __init__(
         self,
         config: AppConfig,
         tool_handler: ToolHandler,
         tool_names: list[str],
+        *,
+        on_task_dispatch: TaskDispatchHandler | None = None,
+        on_stream_subscribe: StreamSubscribeHandler | None = None,
     ) -> None:
         self._config = config
         self._handler = tool_handler
         self._tool_names = tool_names
+        self._on_task_dispatch = on_task_dispatch
+        self._on_stream_subscribe = on_stream_subscribe
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._last_recv_ts: float = 0.0
         self._stop = asyncio.Event()
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     async def run(self) -> None:
+        self._loop = asyncio.get_running_loop()
         backoff = 1.0
         while not self._stop.is_set():
             try:
@@ -54,6 +75,32 @@ class WSClient:
 
     def stop(self) -> None:
         self._stop.set()
+
+    # ─────────── thread-safe outbound bridge ───────────
+    def publish(self, payload: dict[str, Any]) -> None:
+        """Schedule `payload` to be sent over the WS from any thread.
+
+        Safe to call from non-asyncio threads. Drops the frame if the WS is
+        not currently open. Never raises.
+        """
+        loop = self._loop
+        ws = self._ws
+        if loop is None or ws is None:
+            return
+        try:
+            loop.call_soon_threadsafe(asyncio.create_task, self._send_safely(payload))
+        except RuntimeError:
+            # event loop closed mid-shutdown
+            return
+
+    async def _send_safely(self, payload: dict[str, Any]) -> None:
+        ws = self._ws
+        if ws is None:
+            return
+        try:
+            await ws.send(json.dumps(payload))
+        except Exception as exc:  # noqa: BLE001
+            log.debug("ws publish dropped: %s", exc)
 
     async def _connect_once(self) -> None:
         auth = self._config.auth
@@ -84,6 +131,12 @@ class WSClient:
                 heartbeat_task.cancel()
                 with suppress_cancelled():
                     await heartbeat_task
+                # On disconnect, drop the stream subscription so the capture
+                # loop stops emitting WS frames into the void.
+                if self._on_stream_subscribe is not None:
+                    with contextlib.suppress(Exception):
+                        self._on_stream_subscribe(False)
+                self._ws = None
 
     async def _recv_loop(self) -> None:
         assert self._ws is not None
@@ -104,7 +157,40 @@ class WSClient:
             if mtype == "tool_call_request":
                 asyncio.create_task(self._handle_tool_call(msg))
                 continue
+            if mtype == "task_dispatch":
+                self._handle_task_dispatch(msg)
+                continue
+            if mtype == "subscribe_stream":
+                self._handle_stream_subscription(True)
+                continue
+            if mtype == "unsubscribe_stream":
+                self._handle_stream_subscription(False)
+                continue
             log.debug("unknown message type: %s", mtype)
+
+    def _handle_task_dispatch(self, msg: dict[str, Any]) -> None:
+        task_id = str(msg.get("id") or "").strip()
+        task = str(msg.get("task") or "").strip()
+        scope = msg.get("scope") if isinstance(msg.get("scope"), dict) else None
+        if not task_id or not task:
+            log.warning("task_dispatch missing id/task: %s", msg)
+            return
+        if self._on_task_dispatch is None:
+            log.warning("task_dispatch received but no handler registered")
+            return
+        try:
+            self._on_task_dispatch(task_id, task, scope)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("task_dispatch handler failed: %s", exc)
+
+    def _handle_stream_subscription(self, subscribe: bool) -> None:
+        if self._on_stream_subscribe is None:
+            log.debug("stream subscription message ignored (no handler)")
+            return
+        try:
+            self._on_stream_subscribe(subscribe)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("stream subscribe handler failed: %s", exc)
 
     async def _handle_hello_ack(self, msg: dict[str, Any]) -> None:
         new_secret = msg.get("device_secret")

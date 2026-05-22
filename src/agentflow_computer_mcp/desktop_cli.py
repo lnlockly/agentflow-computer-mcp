@@ -1,17 +1,24 @@
 """Entry point for the AgentFlow Desktop daemon.
 
-One process serves: HTTP viewer (port 8765) + MJPEG capture loop + LLM task worker.
+One process serves: HTTP viewer (port 8765) + MJPEG capture loop + LLM task
+worker + optional WS reverse-tunnel to AgentFlow prod (so cabinet-side
+`dispatch_task` reaches the same DriverState as local chat input).
 """
 from __future__ import annotations
 
 import argparse
+import asyncio
+import contextlib
 import logging
 import os
+import signal
 import sys
+import threading
 from pathlib import Path
+from typing import Any
 
 from . import __version__
-from .config import load_auth
+from .config import load_auth, load_config
 from .driver import (
     AFClient,
     CaptureLoop,
@@ -38,6 +45,68 @@ def _resolve_api_key(cli_value: str | None) -> str:
     return auth.api_key or ""
 
 
+def _start_ws_bridge(
+    state: DriverState,
+    capture: CaptureLoop,
+) -> tuple[threading.Thread, Any] | None:
+    """Spin up the WS reverse-tunnel in a sidecar thread sharing DriverState.
+
+    Returns (thread, ws_client) or None when the auth file isn't enrolled.
+    The thread owns its own asyncio loop; it stays alive for the process
+    lifetime and reconnects on its own.
+    """
+    from .server import TOOL_NAMES, _dispatch_tool
+    from .ws_client import WSClient
+
+    config = load_config()
+    if not config.auth.api_key or not config.auth.device_id:
+        log.info("ws bridge skipped: ~/.agentflow/auth.json not enrolled")
+        return None
+    if not config.auth.device_secret and not config.auth.enrollment_token:
+        log.info("ws bridge skipped: no device_secret / enrollment_token in auth.json")
+        return None
+
+    async def handler(name: str, args: dict[str, Any]) -> Any:
+        return await _dispatch_tool(name, args, config)
+
+    def on_task_dispatch(task_id: str, task: str, scope: dict[str, Any] | None) -> None:
+        log.info("ws task_dispatch id=%s task=%s", task_id, task[:80])
+        state.enqueue_task(task, task_id)
+
+    def on_stream_subscribe(subscribe: bool) -> None:
+        if subscribe:
+            state.stream_subscribed.set()
+        else:
+            state.stream_subscribed.clear()
+        log.info("ws stream subscribed=%s", subscribe)
+
+    client = WSClient(
+        config,
+        handler,
+        TOOL_NAMES,
+        on_task_dispatch=on_task_dispatch,
+        on_stream_subscribe=on_stream_subscribe,
+    )
+
+    # Bind the outbound publisher into DriverState (for task_action /
+    # task_complete frames from the AI loop) and into the capture loop
+    # (for stream_frame frames).
+    state.outbound_publisher = client.publish
+    capture.set_outbound_publisher(client.publish)
+
+    def _run() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(client.run())
+        finally:
+            loop.close()
+
+    thread = threading.Thread(target=_run, name="ws-bridge", daemon=True)
+    thread.start()
+    return thread, client
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
@@ -62,22 +131,47 @@ def cmd_run(args: argparse.Namespace) -> int:
     except Exception as exc:  # noqa: BLE001
         log.warning("screen warmup failed: %s (continuing)", exc)
 
-    capture = CaptureLoop(state.stream_frame, state.stream_cond, fps=args.fps)
+    capture = CaptureLoop(
+        state.stream_frame,
+        state.stream_cond,
+        fps=args.fps,
+        stream_subscribed=state.stream_subscribed,
+    )
     capture.start()
     server = start_viewer(state, presets, port=args.port, host=args.host)
     log.info("live viewer: http://%s:%d", args.host, args.port)
+
+    bridge: tuple[threading.Thread, Any] | None = None
+    if not args.no_ws:
+        bridge = _start_ws_bridge(state, capture)
+
     print(
         f"\n{'=' * 70}\n"
         f"AgentFlow Desktop {__version__}\n"
         f"  viewer:  http://{args.host}:{args.port}\n"
         f"  model:   {args.model}\n"
         f"  presets: {len(presets)}\n"
+        f"  ws:      {'on' if bridge else 'off (enroll via /me/devices to enable)'}\n"
         f"{'=' * 70}\n",
         flush=True,
     )
 
     af = AFClient(api_key) if not args.no_af_tools else None
     executor = ToolExecutor(state.last_cursor, af_client=af, pw=PlaywrightHost())
+
+    shutdown = threading.Event()
+
+    def _on_signal(signum: int, _frame: Any) -> None:
+        log.info("received signal %d, shutting down", signum)
+        shutdown.set()
+        if bridge is not None:
+            _, client = bridge
+            with contextlib.suppress(Exception):
+                client.stop()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(ValueError):
+            signal.signal(sig, _on_signal)
 
     try:
         task_worker(
@@ -92,6 +186,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     finally:
         capture.stop()
         server.shutdown()
+        if bridge is not None:
+            _, client = bridge
+            with contextlib.suppress(Exception):
+                client.stop()
     return 0
 
 
@@ -125,7 +223,6 @@ def cmd_selftest(_: argparse.Namespace) -> int:
     No network, no API keys, no LLM. Use this to verify a fresh install on any OS.
     """
     from collections.abc import Callable
-    from typing import Any
 
     from .platform import PLATFORM, backend
 
@@ -204,7 +301,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="store_true", help="print version and exit")
     sub = p.add_subparsers(dest="cmd")
 
-    run = sub.add_parser("run", help="start the daemon (viewer + worker)")
+    run = sub.add_parser("run", help="start the daemon (viewer + worker + ws bridge)")
     run.add_argument("--host", default="127.0.0.1")
     run.add_argument("--port", type=int, default=8765)
     run.add_argument("--fps", type=int, default=20)
@@ -213,6 +310,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--model", default=DEFAULT_MODEL)
     run.add_argument("--presets", default=None, help="path to preset yaml")
     run.add_argument("--no-af-tools", action="store_true", help="hide af_* tools from LLM")
+    run.add_argument(
+        "--no-ws",
+        action="store_true",
+        help="disable the cabinet WS reverse-tunnel (viewer/worker only)",
+    )
     run.add_argument("--log-level", default="INFO")
     run.set_defaults(func=cmd_run)
 

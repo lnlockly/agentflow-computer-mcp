@@ -211,8 +211,15 @@ def make_handler(state: DriverState, presets: list[dict[str, str]]) -> type[Base
                     if not task:
                         self._json({"ok": False, "error": "empty task"}, 400)
                         return
-                    state.task_queue.put(task)
-                    self._json({"ok": True, "queued": True, "queue_size": state.task_queue.qsize()})
+                    task_id = state.enqueue_task(task)
+                    self._json(
+                        {
+                            "ok": True,
+                            "queued": True,
+                            "task_id": task_id,
+                            "queue_size": state.task_queue.qsize(),
+                        }
+                    )
                 except Exception as exc:  # noqa: BLE001
                     self._json({"ok": False, "error": str(exc)}, 400)
                 return

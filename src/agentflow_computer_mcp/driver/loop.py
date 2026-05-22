@@ -139,8 +139,10 @@ def run_task(
     ]
 
     final_answer = ""
+    iterations = 0
     for i in range(max_iters):
-        print(f"\n--- iter {i + 1} ---", flush=True)
+        iterations = i + 1
+        print(f"\n--- iter {iterations} ---", flush=True)
         try:
             resp = post_llm(
                 llm_url,
@@ -223,11 +225,40 @@ def run_task(
         if done:
             update_live(state, "DONE", final_answer)
             print(f"\n=== DONE ===\n{final_answer}", flush=True)
+            if state.current_task_id:
+                state.publish_outbound(
+                    {
+                        "type": "task_complete",
+                        "task_id": state.current_task_id,
+                        "answer": final_answer,
+                        "iterations": iterations,
+                        "tokens_used": 0,
+                        "cost_usd": 0.0,
+                    }
+                )
             return final_answer
 
     update_live(state, "max_iters", f"reached {max_iters}")
     print("\n=== max iters ===", flush=True)
+    if state.current_task_id:
+        state.publish_outbound(
+            {
+                "type": "task_complete",
+                "task_id": state.current_task_id,
+                "answer": final_answer,
+                "iterations": iterations,
+                "tokens_used": 0,
+                "cost_usd": 0.0,
+            }
+        )
     return final_answer
+
+
+def _normalize_task_entry(entry: Any) -> tuple[str, str]:
+    """Accept legacy str entries or new (id, task) tuples uniformly."""
+    if isinstance(entry, tuple) and len(entry) == 2:
+        return str(entry[0]), str(entry[1])
+    return f"local-{int(time.time() * 1000)}", str(entry)
 
 
 def task_worker(
@@ -242,19 +273,30 @@ def task_worker(
     update_live(state, "idle", "ожидаю задачу из чат-инпута")
     while True:
         try:
-            task = state.task_queue.get(timeout=1)
+            raw = state.task_queue.get(timeout=1)
         except Exception:  # noqa: BLE001 — queue.Empty
             if not state.busy and (int(time.time()) % 60 == 0):
                 update_live(state, "idle", "ожидаю задачу")
             continue
+        task_id, task = _normalize_task_entry(raw)
         state.busy = True
         state.current_task = task
+        state.current_task_id = task_id
         try:
             run_task(task, state, executor, api_key, llm_url=llm_url, model=model)
         except Exception as exc:  # noqa: BLE001
             update_live(state, "error", f"{type(exc).__name__}: {exc}")
             print(f"task error: {exc}", flush=True)
+            if state.current_task_id:
+                state.publish_outbound(
+                    {
+                        "type": "task_error",
+                        "task_id": state.current_task_id,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
         finally:
             state.busy = False
             state.current_task = ""
+            state.current_task_id = ""
             state.task_count += 1
