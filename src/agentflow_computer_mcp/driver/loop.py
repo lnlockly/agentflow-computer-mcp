@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -20,6 +21,52 @@ from .streamer import compress_png_for_viewer
 DEFAULT_LLM_URL = "https://agentflow.website/_agents/llm/v1/messages"
 DEFAULT_MODEL = "claude-opus-4-7"
 MAX_ITERS = 40
+
+
+def _current_os() -> str:
+    """One of 'macos' | 'linux' | 'windows' — used to swap the OS-specific
+    section of the intent map so the model doesn't try to drive Mail.app
+    on Ubuntu or hit Cmd+Space on a Windows box."""
+    if sys.platform.startswith("darwin"):
+        return "macos"
+    if sys.platform.startswith("linux"):
+        return "linux"
+    if sys.platform.startswith("win"):
+        return "windows"
+    # Best-effort fallback — treat anything exotic as Linux since the
+    # Linux block is the most generic (browser-first, no native keybinds).
+    return "linux"
+
+
+_OS_INTENT_BLOCK = {
+    "macos": (
+        "  • «открой Mail / проверь почту» → activate_app('Mail') → wait 0.5 → screen_region.\n"
+        "  • «напиши email на X тему Y» → activate_app('Mail') → keypress Cmd+N → "
+        "Tab-driven type To/Subject/body. НЕ нажимай Send без явного «отправляй».\n"
+        "  • «открой Terminal / iTerm» → activate_app('iTerm2') или activate_app('Terminal'); "
+        "wait 0.4 → read_terminal.\n"
+        "  • shell-shortcuts: Cmd+C / Cmd+V / Cmd+Space (Spotlight).\n"
+    ),
+    "linux": (
+        "  • «открой почту / проверь mail» → если Thunderbird установлен — activate_app('Thunderbird'), "
+        "иначе browser_open + browser_navigate https://mail.google.com (Gmail web).\n"
+        "  • «напиши email на X тему Y» — на Linux браузерный Gmail надёжнее десктопного клиента: "
+        "browser_open + navigate https://mail.google.com → browser_click 'Compose' → "
+        "fill To/Subject/body. НЕ нажимай Send без явного «отправляй».\n"
+        "  • «открой Terminal» → activate_app('gnome-terminal') / 'konsole' / 'xterm' "
+        "(пробуй в этом порядке).\n"
+        "  • shell-shortcuts: Ctrl+C / Ctrl+V; нет Spotlight — используй активацию окна.\n"
+    ),
+    "windows": (
+        "  • «открой почту / проверь mail» → если Outlook установлен — activate_app('Outlook'), "
+        "иначе browser_open + browser_navigate https://outlook.live.com или https://mail.google.com.\n"
+        "  • «напиши email на X тему Y» — браузерный путь обычно надёжнее десктопного: "
+        "browser_open + соответствующий navigate, потом fill полей. НЕ нажимай Send без явного «отправляй».\n"
+        "  • «открой Terminal» → activate_app('WindowsTerminal') (Windows Terminal), "
+        "fallback 'powershell' или 'cmd'.\n"
+        "  • shell-shortcuts: Ctrl+C / Ctrl+V; Win+R = Run dialog (аналог Spotlight).\n"
+    ),
+}
 
 
 def build_system_prompt(window_summary: str, af_tools_present: bool) -> str:
@@ -46,23 +93,12 @@ def build_system_prompt(window_summary: str, af_tools_present: bool) -> str:
         "af_send_telegram_message(chat_id='me', text=...). НЕ открывай приложение Telegram.\n"
         "  • «напиши в TG юзеру X / chat_id N» → af_send_telegram_message(chat_id=N, text=...).\n"
         "  • «напиши в Matrix / в комнату X» → af_post_matrix_room(room_id=..., text=...).\n"
-        "  • «открой Terminal / iTerm» → activate_app('iTerm2') ИЛИ activate_app('Terminal'); "
-        "после wait 0.4 → read_terminal чтобы убедиться что вкладка активна.\n"
+        f"{_OS_INTENT_BLOCK[_current_os()]}"
         "  • «открой kwork / kwork.ru / посмотри заказы на kwork» → browser_open → "
         "browser_navigate https://kwork.ru/projects → browser_snapshot → browser_eval для DOM-извлечения.\n"
         "  • «открой документ X / напиши в файл» → fs.write (с подтверждением), либо открой через "
         "activate_app соответствующего редактора, потом keypress/type.\n"
         "  • «прочитай экран / что сейчас открыто» → screen_capture + краткое описание.\n"
-        "  • «проверь почту / посмотри inbox / есть письма?» → activate_app('Mail') → wait 0.5 → "
-        "screen_region на список писем; перечисли последние 5–10 (отправитель, тема, время). "
-        "Если письма нет — скажи прямо.\n"
-        "  • «открой письмо от X / прочитай письмо про Y» → activate_app('Mail') → wait 0.4 → "
-        "browser_eval-стиль нет, используй keypress: Cmd+F → type query → Return → стрелка вниз → "
-        "screen_region на превью.\n"
-        "  • «напиши email / отправь письмо на X с темой Y» → activate_app('Mail') → wait 0.4 → "
-        "keypress Cmd+N → wait 0.3 → type адрес → keypress Tab → type тему → keypress Tab → "
-        "type тело письма. НЕ нажимай Send без явного подтверждения юзера: остановись на "
-        "task_complete с превью того что собрано в окне.\n"
         "  • «напиши код для X / сделай скрипт Y» → активируй редактор (Cursor / VSCode / iTerm), "
         "читай существующий код через code_read_file, правь через code_edit_file/code_write_file "
         "(с подтверждением). Перед изменением — короткий план в text-блоке.\n"
@@ -95,14 +131,15 @@ def build_system_prompt(window_summary: str, af_tools_present: bool) -> str:
         "того что ты написал.\n"
     )
 
+    os_label = {"macos": "Mac", "linux": "Linux", "windows": "Windows"}[_current_os()]
     return (
-        "Ты управляешь Mac пользователя. Перед действием — короткая мысль в text-блоке. "
+        f"Ты управляешь {os_label} пользователя. Перед действием — короткая мысль в text-блоке. "
         "Не извиняйся, не повторяй очевидное. Стратегия:\n"
-        "  • для содержимого окон Mac: activate_app → wait 0.5 → screen_region(bounds) — быстро и детально.\n"
-        "  • для iTerm/Terminal: read_terminal даёт точный текст через AppleScript.\n"
+        "  • для содержимого окон: activate_app → wait 0.5 → screen_region(bounds) — быстро и детально.\n"
+        "  • для содержимого терминала: read_terminal даёт точный текст активной вкладки.\n"
         "  • для веб-задач (открыть сайт, прочитать DOM, нажать кнопку): browser_open → browser_navigate → "
         "browser_snapshot → browser_click/browser_fill/browser_press/browser_eval. Это headed Chromium, "
-        "ОТДЕЛЬНЫЙ от пользовательского Chrome. Видим в live viewer.\n"
+        "ОТДЕЛЬНЫЙ от пользовательского браузера. Видим в live viewer.\n"
         "  • для авторизованного веба (где у юзера уже залогинено): chrome_eval / chrome_open_url — реальный "
         "Google Chrome с его сессией.\n"
         f"{af_block}"
@@ -111,7 +148,7 @@ def build_system_prompt(window_summary: str, af_tools_present: bool) -> str:
         f"{visibility_block}"
         "Scope hard rules: paths `~/.ssh`, `~/.config`, `~/Library/Keychains`, `~/.aws`, `~/.gnupg` всегда запрещены "
         "к чтению/записи. fs.write и shell.exec требуют подтверждения. Не пытайся это обходить.\n"
-        f"Окна Mac сейчас:\n{window_summary}\n"
+        f"Окна сейчас:\n{window_summary}\n"
         "Когда выполнил — task_complete с кратким ответом. Отвечай по-русски."
     )
 
