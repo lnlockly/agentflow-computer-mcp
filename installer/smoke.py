@@ -27,6 +27,7 @@ Run manually:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -553,6 +554,12 @@ def check_loop_checkpoint_abort() -> None:
 
 
 def main() -> None:
+    # Windows runners default stdout to cp1252, which blows up on the
+    # unicode arrows the driver prints inside run_task ("→", "⟳").
+    # Reconfigure to utf-8 so the new checkpoint check survives.
+    with contextlib.suppress(Exception):
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
     log("starting smoke for installer/setup_gui.py")
     check_invite_roundtrip()
     check_auth_file_shape()
