@@ -82,12 +82,17 @@ def _start_ws_bridge(
             state.stream_subscribed.clear()
         log.info("ws stream subscribed=%s", subscribe)
 
+    def on_task_cancel(task_id: str | None) -> None:
+        log.info("ws task_cancel received task_id=%s", task_id)
+        state.request_abort(task_id)
+
     client = WSClient(
         config,
         handler,
         TOOL_NAMES,
         on_task_dispatch=on_task_dispatch,
         on_stream_subscribe=on_stream_subscribe,
+        on_task_cancel=on_task_cancel,
     )
 
     # Bind the outbound publisher into DriverState (for task_action /
@@ -232,9 +237,16 @@ def cmd_version(_: argparse.Namespace) -> int:
 def cmd_selftest(_: argparse.Namespace) -> int:
     """Probe each backend capability and print an OK/FAIL grid.
 
-    No network, no API keys, no LLM. Use this to verify a fresh install on any OS.
+    Checks: screen capture, WS endpoint reachable, scope file parseable, auth
+    file present.  Exit non-zero if any required check fails.  Safe to run as a
+    liveness probe from launchd / systemd / Task Scheduler.
     """
+    import json
+    import socket
+    import ssl
+    import tomllib  # stdlib >=3.11
     from collections.abc import Callable
+    from pathlib import Path
 
     from .platform import PLATFORM, backend
 
@@ -244,29 +256,78 @@ def cmd_selftest(_: argparse.Namespace) -> int:
         return 1
     print(f"backend:  {backend.name}\n")
 
-    checks: list[tuple[str, str]] = []
+    checks: list[tuple[str, str, bool]] = []  # (label, status, required)
 
-    def _run(label: str, fn: Callable[[], Any]) -> None:
+    def _run(label: str, fn: Callable[[], Any], *, required: bool = True) -> None:
         try:
             fn()
-            checks.append((label, "OK"))
+            checks.append((label, "OK", required))
         except Exception as exc:  # noqa: BLE001
-            checks.append((label, f"FAIL: {exc}"))
+            checks.append((label, f"FAIL: {exc}", required))
 
+    # --- screen capture ---
     _run("capture_screen_fast", lambda: backend.capture_screen_fast())
     _run("capture_screen (png)", lambda: backend.capture_screen())
     _run("window_list", lambda: backend.window_list())
     _run("clipboard_read", lambda: backend.clipboard_read())
-    _run("read_terminal (optional)", lambda: backend.read_terminal())
+    _run("read_terminal", lambda: backend.read_terminal(), required=False)
 
-    width = max(len(name) for name, _ in checks)
-    failed = 0
-    for name, status in checks:
-        print(f"  {name.ljust(width)}  {status}")
-        if status.startswith("FAIL"):
-            failed += 1
-    print(f"\n{len(checks) - failed}/{len(checks)} checks passed")
-    return 0 if failed == 0 else 1
+    # --- auth file present and parseable ---
+    auth_path = Path.home() / ".agentflow" / "auth.json"
+
+    def _check_auth() -> None:
+        if not auth_path.exists():
+            raise FileNotFoundError(f"{auth_path} not found")
+        data = json.loads(auth_path.read_text())
+        if not data.get("api_key"):
+            raise ValueError("auth.json missing api_key")
+
+    _run("auth_file", _check_auth)
+
+    # --- scope file parses ---
+    scope_path = Path.home() / ".agentflow" / "computer-scope.toml"
+
+    def _check_scope() -> None:
+        if not scope_path.exists():
+            raise FileNotFoundError(f"{scope_path} not found")
+        with open(scope_path, "rb") as fh:
+            tomllib.load(fh)
+
+    _run("scope_file_parseable", _check_scope)
+
+    # --- WS endpoint reachable (TCP + TLS handshake; no HTTP upgrade) ---
+    def _check_ws_endpoint() -> None:
+        ws_url = "wss://agentflow.website/_agents/_devices/connect"
+        try:
+            if auth_path.exists():
+                data = json.loads(auth_path.read_text())
+                ws_url = data.get("ws_url") or ws_url
+        except Exception:  # noqa: BLE001
+            pass
+        host = ws_url.split("://", 1)[-1].split("/")[0]
+        port = 443 if ws_url.startswith("wss") else 80
+        ctx = ssl.create_default_context()
+        with socket.create_connection((host, port), timeout=5) as sock:
+            if ws_url.startswith("wss"):
+                with ctx.wrap_socket(sock, server_hostname=host):
+                    pass  # TLS handshake succeeded
+
+    _run("ws_endpoint_reachable", _check_ws_endpoint)
+
+    width = max(len(label) for label, _, _ in checks)
+    failed_required = 0
+    for label, status, required in checks:
+        tag = " (optional)" if not required else ""
+        print(f"  {label.ljust(width)}  {status}{tag}")
+        if status.startswith("FAIL") and required:
+            failed_required += 1
+
+    total = len(checks)
+    passed = sum(1 for _, s, _ in checks if not s.startswith("FAIL"))
+    print(f"\n{passed}/{total} checks passed")
+    if failed_required > 0:
+        print(f"FAIL: {failed_required} required check(s) failed")
+    return 0 if failed_required == 0 else 1
 
 
 def cmd_selfmod(args: argparse.Namespace) -> int:
