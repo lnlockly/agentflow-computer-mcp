@@ -109,6 +109,35 @@ def check_daemon_entrypoint_imports() -> None:
     log("  ok — daemon main() is importable")
 
 
+def check_tray_entrypoint_imports() -> None:
+    """`agentflow-tray.exe` runs `agentflow_computer_mcp.winapp.__main__:main`.
+    Every module it touches at startup must import cleanly so PyInstaller
+    bundles them and the frozen runtime doesn't crash on launch."""
+    log("tray entry point: import agentflow_computer_mcp.winapp.__main__")
+    try:
+        from agentflow_computer_mcp.winapp import autostart  # noqa: F401
+        from agentflow_computer_mcp.winapp import (  # noqa: F401
+            actions,
+            cloud,
+            daemon_probe,
+            icon,
+            menu,
+            state,
+        )
+        from agentflow_computer_mcp.winapp.__main__ import (  # noqa: F401
+            build_parser,
+            main,
+        )
+    except Exception as exc:
+        fail(f"cannot import tray entry point: {exc}")
+    # Verify the argparse skeleton is intact — `--version` must work
+    # without pulling pystray (which isn't installed on macOS CI hosts).
+    parser = build_parser()
+    args = parser.parse_args([])
+    assert hasattr(args, "cmd")
+    log("  ok — tray winapp.__main__ is importable")
+
+
 def check_autonomous_skeleton() -> None:
     """Import every autonomous module, init a temp DB, exercise
     decompose_goal + plan_today + recall + budget against a stubbed LLM.
@@ -587,6 +616,7 @@ def main() -> None:
     check_invite_roundtrip()
     check_auth_file_shape()
     check_daemon_entrypoint_imports()
+    check_tray_entrypoint_imports()
     check_multi_agent_runtime_imports()
     check_autonomous_skeleton()
     check_auto_updater()
