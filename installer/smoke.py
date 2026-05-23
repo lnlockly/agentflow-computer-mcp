@@ -335,6 +335,29 @@ def check_auto_updater() -> None:
     log(f"  ok -- auto_updater stays put on {local_version} vs fake v0.0.1")
 
 
+def check_multi_agent_runtime_imports() -> None:
+    """Multi-agent runtime modules must import cleanly so PyInstaller bundles them."""
+    log("multi-agent runtime: import slot/router/pool/budget/bootstrap/socket/_runtime")
+    try:
+        from agentflow_computer_mcp.agents import (  # noqa: F401
+            AgentRouter,
+            AgentSlot,
+            BrowserPool,
+            BudgetExhausted,
+            BudgetSlice,
+            PoolFull,
+        )
+        from agentflow_computer_mcp.agents import _runtime  # noqa: F401
+        from agentflow_computer_mcp.agents import bootstrap as _agent_bootstrap  # noqa: F401
+        from agentflow_computer_mcp.agents.socket import (  # noqa: F401
+            DEFAULT_SOCKET_PATH,
+            AgentSocket,
+        )
+    except Exception as exc:
+        fail(f"cannot import multi-agent runtime: {exc}")
+    log("  ok — multi-agent runtime modules import cleanly")
+
+
 def check_os_aware_tool_filter() -> None:
     """The driver builds the LLM tool catalog from the current host OS.
     Mac-only tools must not leak onto Windows, and Windows-only tools must
@@ -564,6 +587,7 @@ def main() -> None:
     check_invite_roundtrip()
     check_auth_file_shape()
     check_daemon_entrypoint_imports()
+    check_multi_agent_runtime_imports()
     check_autonomous_skeleton()
     check_auto_updater()
     check_os_aware_tool_filter()

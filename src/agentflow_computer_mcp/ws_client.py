@@ -204,6 +204,7 @@ class WSClient:
         task_id = str(msg.get("id") or "").strip()
         task = str(msg.get("task") or "").strip()
         scope = msg.get("scope") if isinstance(msg.get("scope"), dict) else None
+        agent_id = str(msg.get("agent_id") or "").strip()
         if not task_id or not task:
             log.warning("task_dispatch missing id/task: %s", msg)
             return
@@ -211,7 +212,11 @@ class WSClient:
             log.warning("task_dispatch received but no handler registered")
             return
         try:
-            self._on_task_dispatch(task_id, task, scope)
+            # Back-compat: handlers may be 3-arg (legacy) or 4-arg (multi-agent).
+            try:
+                self._on_task_dispatch(task_id, task, scope, agent_id)  # type: ignore[call-arg]
+            except TypeError:
+                self._on_task_dispatch(task_id, task, scope)  # type: ignore[call-arg]
         except Exception as exc:  # noqa: BLE001
             log.exception("task_dispatch handler failed: %s", exc)
 

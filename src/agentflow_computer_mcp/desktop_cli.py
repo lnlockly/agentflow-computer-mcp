@@ -163,6 +163,19 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not args.no_ws:
         bridge = _start_ws_bridge(state, capture)
 
+    # Multi-agent runtime is opt-in for v1. When AGENTFLOW_MULTI_AGENT=1, spin
+    # up the router + control socket alongside the legacy single-slot worker.
+    # The router is silent until the server starts tagging task_dispatch frames
+    # with agent_id; legacy frames keep going through DriverState as today.
+    multi_agent_runtime = None
+    if not args.no_multi_agent:
+        try:
+            from .agents import _runtime as agents_runtime  # local import to avoid cycle
+
+            multi_agent_runtime = agents_runtime.maybe_start_runtime()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("multi-agent runtime disabled: %s", exc)
+
     # Auto-update polling. Wrapped in a broad try/except so a flaky
     # GitHub API can never take the daemon down.
     if not getattr(args, "no_auto_update", False):
@@ -230,6 +243,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                 client.stop()
         if selfmod_worker is not None:
             selfmod_worker.stop()
+        if multi_agent_runtime is not None:
+            with contextlib.suppress(Exception):
+                multi_agent_runtime.stop()
     return 0
 
 
@@ -462,6 +478,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-auto-update",
         action="store_true",
         help="disable the GitHub-releases auto-updater poller",
+    )
+    run.add_argument(
+        "--no-multi-agent",
+        action="store_true",
+        help="disable the multi-agent runtime even if AGENTFLOW_MULTI_AGENT=1",
     )
     run.add_argument("--log-level", default="INFO")
     run.set_defaults(func=cmd_run)
