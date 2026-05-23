@@ -71,6 +71,27 @@ jobs:
         run: |
           xvfb-run -a agentflow-desktop selftest || echo "selftest may report partial results without a real desktop session"
 
+  multi-agent-selftest:
+    # End-to-end harness for the multi-agent runtime (#89).
+    # Spawns the daemon in a child process, drives it over the UNIX
+    # socket, asserts lifecycle guarantees (spawn/list/pause/resume/
+    # scope-isolation). POSIX-only; runs on the same self-hosted
+    # Linux box that owns the rest of the linux CI.
+    needs: test-linux
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Multi-agent self-test
+        run: |
+          pytest tests/integration/test_multi_agent_lifecycle.py -x -v --timeout=120
+
   test-windows:
     runs-on: windows-latest
     strategy:
