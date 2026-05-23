@@ -18,6 +18,8 @@ dependencies = [
     "pywin32>=306; sys_platform == 'win32'",
     "pyperclip>=1.8; sys_platform == 'win32'",
     "psutil>=5.9; sys_platform == 'win32'",
+    "typer>=0.12",
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
@@ -37,6 +39,7 @@ dev = [
 [project.scripts]
 agentflow-computer-mcp = "agentflow_computer_mcp.__main__:main"
 agentflow-desktop = "agentflow_computer_mcp.desktop_cli:main"
+agentflow = "agentflow_computer_mcp.cli.main:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
