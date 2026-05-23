@@ -22,7 +22,9 @@ jobs:
       - name: Install build deps
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pyinstaller pillow
+          # pystray is bundled into agentflow-tray.exe; install it on the
+          # builder so PyInstaller's collect_all("pystray") finds wheels.
+          python -m pip install pyinstaller pillow pystray
           python -m pip install .
 
       - name: Smoke — installer source must import + roundtrip before we build
@@ -34,11 +36,26 @@ jobs:
       - name: Build icon
         run: python installer/make_icon.py
 
-      - name: Build setup.exe
+      - name: Build setup.exe + tray.exe
+        # Single spec, two EXE() blocks → dist/agentflow-desktop-setup.exe
+        # and dist/agentflow-tray.exe ship side-by-side. Wizard copies
+        # both into %LOCALAPPDATA%\AgentFlow\ + writes the Run-key for
+        # the tray so it auto-launches on every user logon.
         run: pyinstaller installer/agentflow-setup.spec
 
       - name: List artifacts
-        run: dir dist
+        # Sanity check — both binaries must be present before selftest.
+        shell: pwsh
+        run: |
+          Get-ChildItem dist | Format-Table Name, Length
+          if (-not (Test-Path dist/agentflow-desktop-setup.exe)) {
+            Write-Error "agentflow-desktop-setup.exe missing from dist/"
+            exit 1
+          }
+          if (-not (Test-Path dist/agentflow-tray.exe)) {
+            Write-Error "agentflow-tray.exe missing from dist/"
+            exit 1
+          }
 
       - name: Seed dummy creds for selftest
         # selftest checks for auth.json + computer-scope.toml under
@@ -90,6 +107,29 @@ jobs:
           }
           Write-Host "selftest passed"
 
+      - name: Self-test — bundled tray --version must exit 0
+        # Boots the tray .exe in argparse-only mode (no pystray GUI loop)
+        # to prove the bundle contains every winapp module + pystray.
+        # `--version` short-circuits before tray.run(), so this is safe
+        # on the headless CI runner where there's no system tray.
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist/agentflow-tray.exe" `
+              -ArgumentList "--version" `
+              -NoNewWindow -PassThru -RedirectStandardOutput tray-version.log
+          if (-not $p.WaitForExit(15000)) {
+            $p.Kill()
+            Write-Error "agentflow-tray --version timed out after 15s"
+            exit 1
+          }
+          if ($p.ExitCode -ne 0) {
+            Get-Content tray-version.log
+            Write-Error "agentflow-tray --version exited $($p.ExitCode)"
+            exit 1
+          }
+          Get-Content tray-version.log
+          Write-Host "tray --version passed"
+
       - name: Compute sha256 + write SHA256SUMS
         # SHA256SUMS is the asset the auto-updater downloads to verify the
         # exe (un-authenticated, no GitHub API rate limit). Owner hit a
@@ -100,11 +140,18 @@ jobs:
         id: sha
         shell: pwsh
         run: |
-          $hash = (Get-FileHash -Path dist/agentflow-desktop-setup.exe -Algorithm SHA256).Hash.ToLower()
-          Write-Host "sha256: $hash"
-          "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          $hashSetup = (Get-FileHash -Path dist/agentflow-desktop-setup.exe -Algorithm SHA256).Hash.ToLower()
+          $hashTray  = (Get-FileHash -Path dist/agentflow-tray.exe          -Algorithm SHA256).Hash.ToLower()
+          Write-Host "sha256(setup): $hashSetup"
+          Write-Host "sha256(tray):  $hashTray"
+          "sha256=$hashSetup" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "sha256_tray=$hashTray" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           # GNU sha256sum format — `<hex>  <filename>\n` (two spaces).
-          "$hash  agentflow-desktop-setup.exe" | Out-File -FilePath dist/SHA256SUMS -Encoding ascii
+          $lines = @(
+            "$hashSetup  agentflow-desktop-setup.exe",
+            "$hashTray  agentflow-tray.exe"
+          )
+          $lines | Out-File -FilePath dist/SHA256SUMS -Encoding ascii
 
       - name: Publish to tagged release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -112,12 +159,14 @@ jobs:
         with:
           files: |
             dist/agentflow-desktop-setup.exe
+            dist/agentflow-tray.exe
             dist/SHA256SUMS
           fail_on_unmatched_files: true
           body: |
             AgentFlow Desktop ${{ github.ref_name }}
 
-            sha256: ${{ steps.sha.outputs.sha256 }}
+            sha256 (agentflow-desktop-setup.exe): ${{ steps.sha.outputs.sha256 }}
+            sha256 (agentflow-tray.exe):          ${{ steps.sha.outputs.sha256_tray }}
 
       - name: Publish to "latest" rolling release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -127,6 +176,7 @@ jobs:
           name: latest
           files: |
             dist/agentflow-desktop-setup.exe
+            dist/agentflow-tray.exe
             dist/SHA256SUMS
           fail_on_unmatched_files: true
           prerelease: false
@@ -134,4 +184,5 @@ jobs:
           body: |
             AgentFlow Desktop ${{ github.ref_name }}
 
-            sha256: ${{ steps.sha.outputs.sha256 }}
+            sha256 (agentflow-desktop-setup.exe): ${{ steps.sha.outputs.sha256 }}
+            sha256 (agentflow-tray.exe):          ${{ steps.sha.outputs.sha256_tray }}

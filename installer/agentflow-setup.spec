@@ -1,17 +1,25 @@
 # PyInstaller spec for the AgentFlow Desktop self-contained installer.
 #
-# This bundle is the wizard AND the daemon — the same .exe spawns the GUI
-# by default and the headless daemon when invoked with --daemon. We
-# collect_all the runtime package + every transitive dep so the user
-# never needs Python on their machine.
+# This bundle ships TWO onefile binaries from a single Analysis+PYZ:
+#
+#   dist/agentflow-desktop-setup.exe  — wizard (default) AND daemon
+#                                       (with `--daemon` flag). Built
+#                                       from `setup_gui.py`.
+#   dist/agentflow-tray.exe           — pystray system-tray app. Built
+#                                       from `tray_entry.py`, runs
+#                                       `agentflow_computer_mcp.winapp`.
+#
+# Both share the same CPython 3.11 + `agentflow_computer_mcp` + every
+# transitive dep, so the user never needs Python on their machine and
+# the two .exes can launch each other without extra runtime hops.
 #
 # Build:
 #   python installer/make_icon.py
 #   pyinstaller installer/agentflow-setup.spec
 #
 # Output:
-#   dist/agentflow-desktop-setup.exe  (~70 MB — intentional, contains
-#   full CPython 3.11 + agentflow_computer_mcp + all wheels)
+#   dist/agentflow-desktop-setup.exe  (~50 MB — wizard + daemon)
+#   dist/agentflow-tray.exe           (~50 MB — same bundle, tray entry)
 
 from pathlib import Path
 
@@ -66,6 +74,10 @@ BUNDLE_PACKAGES = [
     "starlette",
     "uvicorn",
     "click",
+    # winapp/ tray deps — bundled so agentflow-tray.exe can boot pystray
+    # on a fresh user machine without a separate `pip install`. See
+    # `docs/specs/2026-05-23-setup-exe-v050.md`.
+    "pystray",
 ]
 
 for pkg in BUNDLE_PACKAGES:
@@ -85,7 +97,8 @@ for pkg in BUNDLE_PACKAGES:
 # lazy `importlib.import_module` inside desktop_cli still resolves.
 hiddenimports += collect_submodules("agentflow_computer_mcp")
 
-a = Analysis(
+# ---- Bundle 1: agentflow-desktop-setup.exe (wizard + daemon) -----------
+a_setup = Analysis(
     [str(HERE / "setup_gui.py")],
     pathex=[str(HERE), str(HERE.parent / "src")],
     binaries=binaries,
@@ -99,14 +112,14 @@ a = Analysis(
     cipher=block_cipher,
     noarchive=False,
 )
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz_setup = PYZ(a_setup.pure, a_setup.zipped_data, cipher=block_cipher)
 
-exe = EXE(
-    pyz,
-    a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
+exe_setup = EXE(
+    pyz_setup,
+    a_setup.scripts,
+    a_setup.binaries,
+    a_setup.zipfiles,
+    a_setup.datas,
     [],
     name="agentflow-desktop-setup",
     debug=False,
@@ -114,6 +127,51 @@ exe = EXE(
     strip=False,
     upx=False,
     runtime_tmpdir=None,
+    console=False,
+    disable_windowed_traceback=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    icon=str(ICON) if ICON.exists() else None,
+)
+
+# ---- Bundle 2: agentflow-tray.exe (pystray system-tray) ----------------
+# Second onefile from the same package set. Separate Analysis so the EXE
+# can have its own entry point + windowed console flag. Reuses the same
+# binaries/datas/hiddenimports lists computed above — keeps both .exes
+# byte-equivalent on every Python dep, so an auto-update that rolls one
+# never leaves the other on a stale wheel.
+a_tray = Analysis(
+    [str(HERE / "tray_entry.py")],
+    pathex=[str(HERE), str(HERE.parent / "src")],
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=hiddenimports,
+    hookspath=[],
+    runtime_hooks=[],
+    excludes=[],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=block_cipher,
+    noarchive=False,
+)
+pyz_tray = PYZ(a_tray.pure, a_tray.zipped_data, cipher=block_cipher)
+
+exe_tray = EXE(
+    pyz_tray,
+    a_tray.scripts,
+    a_tray.binaries,
+    a_tray.zipfiles,
+    a_tray.datas,
+    [],
+    name="agentflow-tray",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    runtime_tmpdir=None,
+    # console=False → no flicker of a cmd window when pystray boots from
+    # the Run-key autostart on user logon.
     console=False,
     disable_windowed_traceback=False,
     target_arch=None,

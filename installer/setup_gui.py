@@ -44,6 +44,9 @@ DEFAULT_WS_URL = "wss://agentflow.website/_agents/_devices/connect"
 TASK_NAME = "AgentFlowDesktop"
 DAEMON_DIR_NAME = "AgentFlow"
 DAEMON_EXE_NAME = "agentflow-desktop.exe"
+TRAY_EXE_NAME = "agentflow-tray.exe"
+TRAY_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+TRAY_RUN_VALUE = "AgentFlowTray"
 
 
 def b64url_decode(s: str) -> bytes:
@@ -200,11 +203,7 @@ def install_daemon_binary() -> Path:
     """Copy this .exe to %LOCALAPPDATA%\\AgentFlow\\agentflow-desktop.exe
     so the scheduled task survives the user moving / deleting the
     download from the Downloads folder."""
-    base = Path(
-        os.environ.get("LOCALAPPDATA")
-        or (Path(os.environ.get("USERPROFILE", str(Path.home()))) / "AppData" / "Local")
-    )
-    target_dir = base / DAEMON_DIR_NAME
+    target_dir = _install_dir()
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / DAEMON_EXE_NAME
     src = _self_exe_path()
@@ -312,20 +311,119 @@ def launch_daemon(executable: Path) -> None:
     )
 
 
-def _run_install_steps(creds: dict, *, on_step=None) -> Path:
-    """Pure install logic — no Tk. Runs the same four steps the GUI's
-    Install button does:
+def _install_dir() -> Path:
+    """`%LOCALAPPDATA%\\AgentFlow\\` — owner of both daemon + tray .exes."""
+    base = Path(
+        os.environ.get("LOCALAPPDATA")
+        or (Path(os.environ.get("USERPROFILE", str(Path.home()))) / "AppData" / "Local")
+    )
+    return base / DAEMON_DIR_NAME
+
+
+def _bundled_tray_path() -> Path | None:
+    """Locate `agentflow-tray.exe` shipped alongside the setup .exe.
+
+    The release ZIP drops both binaries in the same dir; PyInstaller's
+    spec builds them side-by-side under `dist/`. When the user runs the
+    setup wizard the tray exe sits next to it. Returns `None` if absent
+    (dev source mode, or release packaging glitch) so callers can fall
+    back to `python -m agentflow_computer_mcp.winapp`."""
+    src_dir = _self_exe_path().parent
+    candidate = src_dir / TRAY_EXE_NAME
+    if candidate.exists():
+        return candidate
+    # Allow CI override (same pattern as AF_SETUP_EXE_OVERRIDE).
+    override = os.environ.get("AF_TRAY_EXE_OVERRIDE", "").strip()
+    if override:
+        p = Path(override)
+        if p.exists():
+            return p.resolve()
+    return None
+
+
+def install_tray_binary() -> Path | None:
+    """Copy `agentflow-tray.exe` next to the daemon binary. Returns the
+    target path on success, `None` if the source isn't bundled (dev
+    mode). Same overwrite policy as the daemon: PermissionError falls
+    back to a `.new.exe` sidecar."""
+    src = _bundled_tray_path()
+    if src is None:
+        return None
+    target_dir = _install_dir()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / TRAY_EXE_NAME
+    if src.resolve() == target.resolve():
+        return target
+    try:
+        if target.exists():
+            target.unlink()
+        shutil.copy2(src, target)
+    except PermissionError:
+        sidecar = target.with_suffix(".new.exe")
+        shutil.copy2(src, sidecar)
+        return sidecar
+    return target
+
+
+def register_tray_autostart(executable: Path) -> None:
+    """Write `HKCU\\…\\Run\\AgentFlowTray = "<path>"` so the tray launches
+    on every user logon. Mirrors `winapp.autostart.install()` but points
+    at the bundled tray .exe instead of `pythonw -m …` so end-users
+    without a system Python are still covered.
+
+    No-op on non-Windows (dev mode) — callers can pass an `opener=` for
+    tests via `winapp.autostart.install`. Production always goes through
+    this helper from the wizard.
+    """
+    if os.name != "nt":
+        return
+    import winreg  # type: ignore[import-not-found]
+
+    with winreg.OpenKey(
+        winreg.HKEY_CURRENT_USER, TRAY_RUN_KEY, 0, winreg.KEY_SET_VALUE
+    ) as key:
+        winreg.SetValueEx(key, TRAY_RUN_VALUE, 0, winreg.REG_SZ, f'"{executable}"')
+
+
+def launch_tray(executable: Path) -> None:
+    """Spawn the tray once so the icon shows up immediately after install
+    instead of waiting for the next logon."""
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(
+            subprocess, "DETACHED_PROCESS", 0
+        )
+    subprocess.Popen(
+        [str(executable)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        close_fds=True,
+        creationflags=creationflags,
+    )
+
+
+def _run_install_steps(
+    creds: dict, *, on_step=None, install_tray: bool = True
+) -> Path:
+    """Pure install logic — no Tk. Runs the steps the GUI's Install button
+    does:
 
       1. copy this .exe to %LOCALAPPDATA%\\AgentFlow\\agentflow-desktop.exe
       2. write %USERPROFILE%\\.agentflow\\auth.json
       3. schtasks /Create /TN AgentFlowDesktop /XML
       4. spawn the daemon
+      5. (if install_tray) copy agentflow-tray.exe + HKCU Run key + spawn
 
     Returns the path to the installed daemon .exe so callers (CI / future
     `--silent --invite=...` CLI) can verify the schtasks XML.
 
     `on_step` is an optional callable that receives short progress strings
     so the GUI can pipe them into its log view.
+
+    `install_tray=False` leaves the wizard backwards-compatible with the
+    v0.4.x flow (daemon only) — useful for users who unchecked the tray
+    checkbox.
     """
 
     def _emit(msg: str) -> None:
@@ -350,6 +448,26 @@ def _run_install_steps(creds: dict, *, on_step=None) -> Path:
     _emit("launch_daemon")
     launch_daemon(target)
     _emit("  → spawned")
+
+    if install_tray:
+        _emit("install_tray_binary")
+        tray_target = install_tray_binary()
+        if tray_target is None:
+            _emit("  → пропуск: agentflow-tray.exe не найден рядом с инсталлятором")
+        else:
+            _emit(f"  → {tray_target}")
+            _emit("register_tray_autostart (HKCU\\…\\Run\\AgentFlowTray)")
+            try:
+                register_tray_autostart(tray_target)
+                _emit("  → Run-key установлен")
+            except Exception as exc:  # noqa: BLE001
+                _emit(f"  → ошибка Run-key: {exc}")
+            _emit("launch_tray")
+            try:
+                launch_tray(tray_target)
+                _emit("  → иконка в трее запущена")
+            except Exception as exc:  # noqa: BLE001
+                _emit(f"  → ошибка запуска трея: {exc}")
 
     return target
 
@@ -464,6 +582,26 @@ class SetupWindow:
             entry.pack(side="left", fill="x", expand=True)
             _bind_paste_anywhere(entry)
             self.fields[key] = entry
+
+        # «Запускать иконку в трее при старте Windows» — default ON, mirrors
+        # the Mac DMG behaviour where AgentFlow.app shows up in the menu bar
+        # after install AND on every login. Off → wizard skips the Run-key
+        # write + immediate tray spawn (daemon-only mode, v0.4.x parity).
+        self.tray_autostart_var = tk.BooleanVar(value=True)
+        tray_row = tk.Frame(wrap, bg=BG)
+        tray_row.pack(fill="x", pady=(2, 0))
+        tk.Checkbutton(
+            tray_row,
+            text="Запускать иконку в трее при старте Windows",
+            variable=self.tray_autostart_var,
+            bg=BG,
+            fg=FG,
+            selectcolor=FIELD_BG,
+            activebackground=BG,
+            activeforeground=FG,
+            font=("Segoe UI", 9),
+            anchor="w",
+        ).pack(side="left")
 
         # The bundle ships Python + agentflow_computer_mcp inside the
         # .exe, so install is now just file IO + schtasks — should
@@ -593,18 +731,27 @@ class SetupWindow:
             self.device_id = self.creds["device_id"]
 
             step_labels = {
-                "install_daemon_binary": "Шаг 2/4: копирую бинарь в %LOCALAPPDATA%",
-                "write_auth_file": "Шаг 3/4: сохраняю учётные данные",
+                "install_daemon_binary": "Шаг 2/5: копирую бинарь в %LOCALAPPDATA%",
+                "write_auth_file": "Шаг 3/5: сохраняю учётные данные",
                 f"register_scheduled_task ({TASK_NAME})": (
-                    f"Шаг 4/4: регистрирую автозапуск ({TASK_NAME})"
+                    f"Шаг 4/5: регистрирую автозапуск ({TASK_NAME})"
                 ),
                 "launch_daemon": "  → задача создана, запускаю демон",
+                "install_tray_binary": "Шаг 5/5: устанавливаю иконку в трее",
+                "register_tray_autostart (HKCU\\…\\Run\\AgentFlowTray)": (
+                    "  → прописываю автозапуск трея"
+                ),
+                "launch_tray": "  → запускаю иконку в трее",
             }
 
             def _bridge(msg: str) -> None:
                 self.log_queue.put(step_labels.get(msg, msg))
 
-            _run_install_steps(self.creds, on_step=_bridge)
+            _run_install_steps(
+                self.creds,
+                on_step=_bridge,
+                install_tray=bool(self.tray_autostart_var.get()),
+            )
 
             self.log_queue.put("Готово. Устройство онлайн.")
             self.root.after(0, self._on_success)
