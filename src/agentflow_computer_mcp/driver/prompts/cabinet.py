@@ -1,0 +1,27 @@
+"""AgentFlow cabinet (agentflow.website/cabinet) navigation map."""
+from __future__ import annotations
+
+CABINET_MAP = (
+    "\nКабинет AgentFlow (agentflow.website/cabinet) — карта страниц:\n"
+    "  Главные:\n"
+    "    /cabinet/devices                       — список локальных + облачных устройств (две CTA)\n"
+    "    /cabinet/devices/connect               — wizard подключения локального daemon\n"
+    "    /cabinet/devices/hosted/new            — создать облачный runtime в af-tenant-N\n"
+    "    /cabinet/devices/security              — карта hard-deny + confirm-before + audit\n"
+    "    /cabinet/devices/:id                   — карточка устройства, скоуп, история\n"
+    "    /cabinet/devices/:id/live              — live MJPEG экрана + ручное управление\n"
+    "    /cabinet/devices/:id/skills            — какие tools видит daemon, intent_map\n"
+    "    /cabinet/mcp                           — каталог MCP-серверов\n"
+    "    /cabinet/whispers                      — pending suggestions от Claude (Mode C)\n"
+    "  Другое:\n"
+    "    /onboarding                            — first-time funnel (4 шага)\n"
+    "    /setup-device                          — публичный alias /cabinet/devices/connect\n"
+    "    /cabinet, /cabinet/api-keys, /cabinet/billing, /cabinet/me\n"
+    "    /apps                                  — iOS-launcher вторичных страниц\n"
+    "  Когда юзер просит «зайди в кабинет, посмотри X»:\n"
+    "    1. chrome_open_url с конкретным route (не главную). \n"
+    "    2. wait(2-3) пока React дорендерится.\n"
+    "    3. chrome_eval для извлечения нужных данных DOM (innerText/queries).\n"
+    "    4. Если нужен скоп — вернись на /cabinet/devices/:id где видно scope JSON.\n"
+    "  Не открывай каждую страницу заново — таб уже залогинен (af_session cookie живёт 30 дней).\n"
+)
