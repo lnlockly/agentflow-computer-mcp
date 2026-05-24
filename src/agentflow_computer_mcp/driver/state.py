@@ -39,6 +39,9 @@ class DriverState:
     # Set by `request_abort` when a task_cancel WS frame arrives. The run_task
     # loop checks this between iterations and exits early. Cleared after abort.
     abort_flag: threading.Event = field(default_factory=threading.Event)
+    # Process-level shutdown signal used by desktop_cli signal handlers so the
+    # task_worker loop can exit cleanly instead of surviving SIGTERM forever.
+    shutdown_flag: threading.Event = field(default_factory=threading.Event)
 
     def __post_init__(self) -> None:
         self.live_dir.mkdir(parents=True, exist_ok=True)

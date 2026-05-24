@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 HARD_DENY_PATHS: tuple[str, ...] = (
     "~/.ssh",
@@ -104,3 +106,27 @@ def load_auth(path: Path = AUTH_FILE) -> Auth:
 
 def load_config() -> AppConfig:
     return AppConfig(scope=load_scope(), auth=load_auth())
+
+
+def scope_from_mapping(raw: Mapping[str, Any] | None, base: Scope | None = None) -> Scope:
+    """Build a Scope from API/WS JSON, inheriting omitted fields from `base`.
+
+    Per-task dispatch scopes arrive as JSON objects over WS. We treat them as a
+    partial override on top of the daemon's base scope so tasks can narrow or
+    widen specific capabilities without losing hard-deny defaults or other
+    existing settings.
+    """
+    if raw is None:
+        return base or Scope()
+    parent = base or Scope()
+    return Scope(
+        allow_apps=tuple(raw.get("allow_apps", parent.allow_apps)),
+        allow_paths=tuple(raw.get("allow_paths", parent.allow_paths)),
+        deny_paths=tuple(raw.get("deny_paths", parent.deny_paths)),
+        shell_whitelist=tuple(raw.get("shell_whitelist", parent.shell_whitelist)),
+        confirm_before=tuple(raw.get("confirm_before", parent.confirm_before)),
+        max_actions_per_session=int(
+            raw.get("max_actions_per_session", parent.max_actions_per_session)
+        ),
+        budget_usd=float(raw.get("budget_usd", parent.budget_usd)),
+    )
