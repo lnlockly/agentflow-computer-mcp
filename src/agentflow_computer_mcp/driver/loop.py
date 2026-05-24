@@ -21,7 +21,11 @@ from .state import DriverState
 from .streamer import compress_png_for_viewer
 
 DEFAULT_LLM_URL = "https://agentflow.website/_agents/llm/v1/messages"
-DEFAULT_MODEL = "claude-opus-4-7"
+# Speed beats raw IQ for desktop loops — sonnet handles screenshot→tool
+# decisions in 2-3 seconds vs opus 10-15 sec, and an extra iteration is
+# cheaper than a slow one. Owner can override via AF_DESKTOP_MODEL env;
+# scope-level model override (per task) still wins.
+DEFAULT_MODEL = os.environ.get("AF_DESKTOP_MODEL", "claude-sonnet-4-6")
 MAX_ITERS = 40
 
 
