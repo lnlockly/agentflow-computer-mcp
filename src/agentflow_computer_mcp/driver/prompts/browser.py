@@ -12,6 +12,17 @@ BROWSER_EFFICIENCY = (
     "    Chromium). browser_* открывает чистую сессию без логина юзера.\n"
     "  • Перед browser_click — всегда browser_snapshot чтобы убедиться элемент существует.\n"
     "    Не кликай по координатам — клик по селектору идемпотентен.\n"
+    "  • ВАЖНО: для записи экрана (screen_record_start) и любых демо/туториалов используй\n"
+    "    ТОЛЬКО browser_* (Playwright headed, отдельное окно даемона). НЕ переключай фокус на\n"
+    "    chrome_open_url юзера — он сейчас работает и не должен видеть переключения вкладок.\n"
+    "  • Wait-for-load: после browser_navigate всегда дожидайся полной загрузки страницы\n"
+    "    перед screenshot или click:\n"
+    "      1) browser_eval(\"new Promise(r=>{const c=()=>{if(document.readyState==='complete')\"\n"
+    "         \"r('ok'); else setTimeout(c,200);};c();})\")\n"
+    "      2) wait(1.0–2.0) для React/SPA hydration\n"
+    "      3) browser_snapshot чтобы убедиться, что нужный якорный элемент уже в DOM.\n"
+    "    Не делай screenshot или click до того как страница загрузилась — рекординг\n"
+    "    показывает пустую заглушку и весь туториал идёт в мусор.\n"
 )
 
 
