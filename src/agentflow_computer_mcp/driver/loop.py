@@ -23,6 +23,7 @@ from .streamer import compress_png_for_viewer
 DEFAULT_LLM_URL = "https://agentflow.website/_agents/llm/v1/messages"
 DEFAULT_MODEL = "claude-opus-4-7"
 MAX_ITERS = 40
+HISTORY_IMAGE_KEEP_RECENT_MESSAGES = 1
 
 
 def _env_int(name: str, default: int) -> int:
@@ -52,10 +53,13 @@ def _env_float(name: str, default: float) -> float:
 
 
 # Per-task hard caps. Configurable via env so ops can tune without a redeploy.
-# Defaults: 50 tool calls and $0.50 USD spend — generous for normal tasks,
-# cheap-fail for runaway agent loops.
+# Defaults: 50 tool calls and $2 USD spend — generous for normal tasks,
+# cheap-fail for runaway agent loops. Per-task scope.budget_usd overrides
+# this when the dispatch frame supplies one, and `~/.agentflow/computer-scope.toml`
+# `budget_usd` lifts the floor at daemon-config load time (see the scope-aware
+# fallback in run_task's caller).
 LOOP_MAX_STEPS = _env_int("LOOP_MAX_STEPS", 50)
-LOOP_MAX_USD = _env_float("LOOP_MAX_USD", 0.50)
+LOOP_MAX_USD = _env_float("LOOP_MAX_USD", 2.0)
 # Reflection cadence. Every Nth tool call we inject a "are you on track?"
 # turn; 0 disables. Short tasks (< 3 steps) skip the check regardless.
 LOOP_CHECKPOINT_EVERY = _env_int("LOOP_CHECKPOINT_EVERY", 8)
@@ -213,6 +217,35 @@ def build_system_prompt(window_summary: str, af_tools_present: bool) -> str:
         "пиши руками на десктопе.\n"
     )
 
+    terminal_playbook = (
+        "\nTerminal playbook (code_run_command):\n"
+        "  • Inspect before mutating: `ls -la`, `cat`, `stat`, `wc -l`, `head`, `tail`, `file` "
+        "сначала. Не вычищай и не перезаписывай вслепую.\n"
+        "  • One purposeful command per call. Не клей десяток через `&&` — теряется stderr "
+        "по каждому шагу. Цепочки только когда логически атомарны (`mkdir -p X && cd X`).\n"
+        "  • Always pin cwd: каждый code_run_command принимает `cwd`. Передавай абсолютный путь, "
+        "не полагайся на $PWD от прошлого вызова — каждый shell.exec starts fresh.\n"
+        "  • Quote everything user-supplied: `\"$VAR\"`, `'$LITERAL'`. Пробелы и юникод ломают "
+        "split.\n"
+        "  • Capture, don't guess: после `git`, `npm`, `curl` читай и stdout, и stderr. exit_code "
+        "!= 0 — не ретрай команду один в один, а изучи последние 5 строк stderr.\n"
+        "  • Tail truncate: `cmd 2>&1 | tail -n 80` когда вывод длинный. Не таскай мегабайтные логи "
+        "в LLM-context.\n"
+        "  • Prefer dedicated tools: для файла — code_read_file/code_write_file (точнее и дешевле, "
+        "чем cat/heredoc). Для grep — `rg` если есть, иначе `grep -rn --include`.\n"
+        "  • Network is expensive: `curl` только когда нужно. -s -S -L флаги обязательны. "
+        "Для JSON — `curl -s ... | jq` сразу, не парси текст вручную.\n"
+        "  • Git хайгиена: перед коммитом — `git status -s` + `git diff --stat`. Никогда "
+        "`--no-verify`, `--force` без явной причины. `git stash push -u -m 'wip-…'` перед "
+        "checkout новой ветки если есть грязные изменения.\n"
+        "  • Long-running: команды > 30 сек — `timeout_sec=120` в args. Daemon отвалится на "
+        "дефолтном таймауте если что-то висит.\n"
+        "  • Idempotent destructive: `rm -i`, `rm -rf` только когда target проверен `ls -la` ранее "
+        "в этой же сессии. Никогда `rm -rf $VAR/` без `printf '%s\\n' \"$VAR\"` проверки.\n"
+        "  • Scope-deny: если получил `shell_whitelist is empty` или `path not in allow_paths` — "
+        "не пытайся обойти. Сообщи в task_complete честно: «scope блокирует X, нужно расширить».\n"
+    )
+
     memory_block = ""
     if af_tools_present:
         memory_block = (
@@ -316,6 +349,7 @@ def build_system_prompt(window_summary: str, af_tools_present: bool) -> str:
         f"{browser_efficiency}"
         f"{memory_block}"
         f"{coding_workflow}"
+        f"{terminal_playbook}"
         f"{task_efficiency}"
         f"{visibility_block}"
         "Scope hard rules: paths `~/.ssh`, `~/.config`, `~/Library/Keychains`, `~/.aws`, `~/.gnupg` всегда запрещены "
@@ -646,6 +680,14 @@ def _budget_record_llm(model: str, usage: dict[str, Any]) -> float:
         return 0.0
 
 
+def _usage_total_tokens(usage: dict[str, Any]) -> int:
+    """Best-effort total tokens across one LLM response payload."""
+    try:
+        return int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0)
+    except Exception:
+        return 0
+
+
 def _memory_save_outcome(
     task: str,
     *,
@@ -829,6 +871,138 @@ def _fetch_skills_prompt_block(af_client: Any) -> str:
     return block.strip() if isinstance(block, str) else ""
 
 
+def _tool_failure_reason(tool_name: str, out: Any) -> str | None:
+    """Return a concise failure reason when a tool output represents failure."""
+    if tool_name == "task_complete":
+        return None
+    if not isinstance(out, str):
+        return None
+    stripped = out.strip()
+    lower = stripped.lower()
+    if lower.startswith("error:") or lower.startswith("firefox error:") or lower.startswith("unknown tool:"):
+        return stripped[:200]
+    try:
+        parsed = json.loads(stripped)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    if parsed.get("ok") is False:
+        detail = str(parsed.get("error") or stripped)
+        return detail[:200]
+    exit_code = parsed.get("exit_code")
+    if isinstance(exit_code, int) and exit_code != 0:
+        detail = str(parsed.get("stderr") or "").strip() or f"exit_code={exit_code}"
+        return detail[:200]
+    return None
+
+
+def _tool_is_observation_only(tool_name: str) -> bool:
+    if tool_name.startswith("af_list_") or tool_name.startswith("af_get_"):
+        return True
+    return tool_name in {
+        "af_telegram_dialogs",
+        "af_telegram_messages",
+        "af_telegram_search",
+        "af_telegram_whoami",
+        "browser_eval",
+        "browser_snapshot",
+        "chrome_eval",
+        "chrome_tabs",
+        "code_list_dir",
+        "code_read_file",
+        "goal_list",
+        "goal_show",
+        "list_windows",
+        "read_terminal",
+        "screen_capture",
+        "screen_record_status",
+        "screen_region",
+        "winget_search",
+    }
+
+
+def _content_has_image(blocks: list[dict[str, Any]]) -> bool:
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "image":
+            return True
+        nested = block.get("content")
+        if isinstance(nested, list) and _content_has_image(nested):
+            return True
+    return False
+
+
+def _compact_content_images(blocks: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+    compacted: list[dict[str, Any]] = []
+    removed_any = False
+    for block in blocks:
+        if not isinstance(block, dict):
+            compacted.append(block)
+            continue
+        if block.get("type") == "image":
+            removed_any = True
+            continue
+        nested = block.get("content")
+        if isinstance(nested, list):
+            nested_compacted, nested_removed = _compact_content_images(nested)
+            if nested_removed:
+                removed_any = True
+                block = {**block, "content": nested_compacted}
+        compacted.append(block)
+    if removed_any:
+        compacted.append(
+            {
+                "type": "text",
+                "text": "[earlier screenshot omitted from history to bound memory]",
+            }
+        )
+    return compacted, removed_any
+
+
+def _compact_message_history(messages: list[dict[str, Any]]) -> None:
+    image_message_indexes: list[int] = []
+    for idx, message in enumerate(messages):
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        if _content_has_image(content):
+            image_message_indexes.append(idx)
+
+    keep = set(image_message_indexes[-HISTORY_IMAGE_KEEP_RECENT_MESSAGES:])
+    for idx in image_message_indexes:
+        if idx in keep:
+            continue
+        content = messages[idx].get("content")
+        if not isinstance(content, list):
+            continue
+        compacted, removed_any = _compact_content_images(content)
+        if not removed_any:
+            continue
+        messages[idx]["content"] = compacted
+
+
+def _task_complete_answer_indicates_failure(answer: str) -> bool:
+    text = answer.strip().lower()
+    if not text:
+        return False
+    failure_markers = (
+        "❌",
+        "задача не выполн",
+        "не выполнена",
+        "не удалось",
+        "невозможно",
+        "заблокирован",
+        "cannot ",
+        "can't ",
+        "failed",
+        "blocked",
+        "unable to",
+    )
+    return any(marker in text for marker in failure_markers)
+
+
 def run_task(
     task: str,
     state: DriverState,
@@ -838,6 +1012,7 @@ def run_task(
     llm_url: str = DEFAULT_LLM_URL,
     model: str = DEFAULT_MODEL,
     max_iters: int = MAX_ITERS,
+    max_usd: float = LOOP_MAX_USD,
 ) -> str:
     update_live(state, "start", task)
     wins = get_window_list()
@@ -928,8 +1103,11 @@ def run_task(
     tool_calls_count = 0
     tools_used: list[str] = []
     total_cost_usd = 0.0
+    total_tokens_used = 0
     last_checkpoint_at = 0
     abandon_reason: str | None = None
+    unresolved_tool_error: str | None = None
+    budget_finalization_turn_allowed = False
 
     def _emit_abort(reason: str, kind: str) -> str:
         """Emit task_error + persist outcome lesson, then return.
@@ -965,13 +1143,13 @@ def run_task(
         if state.abort_flag.is_set():
             return _emit_cancel()
 
-        # Cost cap: check before issuing the next LLM call so a runaway
-        # task doesn't burn one final $0.X call past the limit.
-        if total_cost_usd >= LOOP_MAX_USD:
+        in_budget_finalization_turn = total_cost_usd >= max_usd and budget_finalization_turn_allowed
+        if total_cost_usd >= max_usd and not in_budget_finalization_turn:
             return _emit_abort(
-                f"cost_cap_exceeded: spent ${total_cost_usd:.4f} >= ${LOOP_MAX_USD:.2f}",
+                f"cost_cap_exceeded: spent ${total_cost_usd:.4f} >= ${max_usd:.2f}",
                 "cost_cap",
             )
+        budget_finalization_turn_allowed = False
 
         iterations = i + 1
         print(f"\n--- iter {iterations} ---", flush=True)
@@ -999,7 +1177,9 @@ def run_task(
             update_live(state, "error", f"api error: {resp}")
             return ""
 
-        total_cost_usd += _budget_record_llm(model, resp.get("usage") or {})
+        usage = resp.get("usage") or {}
+        total_cost_usd += _budget_record_llm(model, usage)
+        total_tokens_used += _usage_total_tokens(usage)
 
         content = resp.get("content", [])
         texts = [b["text"] for b in content if b.get("type") == "text"]
@@ -1012,6 +1192,11 @@ def run_task(
 
         if not tool_uses:
             print(f"\n=== END (no tools, stop_reason={resp.get('stop_reason')}) ===", flush=True)
+            if unresolved_tool_error:
+                return _emit_abort(
+                    f"completion_blocked_after_tool_error: {unresolved_tool_error}",
+                    "completion_blocked",
+                )
             # Persist a success outcome — the model finished without further tools.
             _memory_save_outcome(
                 task,
@@ -1021,6 +1206,15 @@ def run_task(
                 answer=final_answer or thinking,
             )
             return final_answer
+
+        # Once we enter the single grace turn after hitting the budget cap,
+        # only a terminal task_complete is allowed. Any further non-terminal
+        # tool work gets blocked before the executor mutates more state.
+        if in_budget_finalization_turn and any(tu.get("name") != "task_complete" for tu in tool_uses):
+            return _emit_abort(
+                f"cost_cap_exceeded: spent ${total_cost_usd:.4f} >= ${max_usd:.2f}",
+                "cost_cap",
+            )
 
         messages.append({"role": "assistant", "content": content})
         results: list[dict[str, Any]] = []
@@ -1050,9 +1244,24 @@ def run_task(
                 tu["name"],
                 f"args: {args_preview}\nresult: {out[:600] if isinstance(out, str) else out}",
             )
+            failure = _tool_failure_reason(tu["name"], out)
+            if failure:
+                unresolved_tool_error = f"{tu['name']}: {failure}"[:240]
+            elif tu["name"] != "task_complete" and not _tool_is_observation_only(tu["name"]):
+                unresolved_tool_error = None
             if out == "__DONE__":
-                done = True
                 final_answer = tu["input"].get("answer", "")
+                if unresolved_tool_error:
+                    return _emit_abort(
+                        f"completion_blocked_after_tool_error: {unresolved_tool_error}",
+                        "completion_blocked",
+                    )
+                if _task_complete_answer_indicates_failure(final_answer):
+                    return _emit_abort(
+                        f"task_complete_reported_failure: {final_answer[:200]}",
+                        "completion_blocked",
+                    )
+                done = True
                 results.append({"type": "tool_result", "tool_use_id": tu["id"], "content": "ok"})
                 continue
             if image is not None:
@@ -1078,6 +1287,7 @@ def run_task(
                     {"type": "tool_result", "tool_use_id": tu["id"], "content": str(out)}
                 )
         messages.append({"role": "user", "content": results})
+        _compact_message_history(messages)
 
         if hit_step_cap:
             return _emit_abort(
@@ -1102,11 +1312,14 @@ def run_task(
                         "task_id": state.current_task_id,
                         "answer": final_answer,
                         "iterations": iterations,
-                        "tokens_used": 0,
+                        "tokens_used": total_tokens_used,
                         "cost_usd": round(total_cost_usd, 6),
                     }
                 )
             return final_answer
+
+        if total_cost_usd >= max_usd:
+            budget_finalization_turn_allowed = True
 
         # Checkpoint reflection: fires every LOOP_CHECKPOINT_EVERY tool calls,
         # but skips when the task is too short to warrant the overhead. The
@@ -1122,7 +1335,9 @@ def run_task(
             check = _request_checkpoint(
                 llm_url, api_key, model, system_msg, messages, state.abort_flag
             )
-            total_cost_usd += _budget_record_llm(model, check.get("usage") or {})
+            check_usage = check.get("usage") or {}
+            total_cost_usd += _budget_record_llm(model, check_usage)
+            total_tokens_used += _usage_total_tokens(check_usage)
             on_track = bool(check.get("on_track", True))
             next_step = (check.get("next_step") or "").strip()
             reason = check.get("abandon_reason")
@@ -1164,22 +1379,22 @@ def run_task(
     if state.current_task_id:
         state.publish_outbound(
             {
-                "type": "task_complete",
+                "type": "task_error",
                 "task_id": state.current_task_id,
-                "answer": final_answer,
-                "iterations": iterations,
-                "tokens_used": 0,
-                "cost_usd": round(total_cost_usd, 6),
+                "error": f"max_iters reached ({max_iters})",
             }
         )
     return final_answer
 
 
-def _normalize_task_entry(entry: Any) -> tuple[str, str]:
-    """Accept legacy str entries or new (id, task) tuples uniformly."""
-    if isinstance(entry, tuple) and len(entry) == 2:
-        return str(entry[0]), str(entry[1])
-    return f"local-{int(time.time() * 1000)}", str(entry)
+def _normalize_task_entry(entry: Any) -> tuple[str, str, dict[str, Any] | None]:
+    """Accept legacy str entries and newer queue tuples uniformly."""
+    if isinstance(entry, tuple):
+        if len(entry) == 3:
+            return str(entry[0]), str(entry[1]), entry[2] if isinstance(entry[2], dict) else None
+        if len(entry) == 2:
+            return str(entry[0]), str(entry[1]), None
+    return f"local-{int(time.time() * 1000)}", str(entry), None
 
 
 def task_worker(
@@ -1192,19 +1407,37 @@ def task_worker(
 ) -> None:
     """Blocking loop: pull tasks off the queue, run them sequentially."""
     update_live(state, "idle", "ожидаю задачу из чат-инпута")
-    while True:
+    while not state.shutdown_flag.is_set():
         try:
             raw = state.task_queue.get(timeout=1)
         except Exception:  # noqa: BLE001 — queue.Empty
             if not state.busy and (int(time.time()) % 60 == 0):
                 update_live(state, "idle", "ожидаю задачу")
             continue
-        task_id, task = _normalize_task_entry(raw)
+        task_id, task, task_scope = _normalize_task_entry(raw)
         state.busy = True
         state.current_task = task
         state.current_task_id = task_id
         try:
-            run_task(task, state, executor, api_key, llm_url=llm_url, model=model)
+            executor.apply_task_scope(task_scope)
+            # Precedence: per-task scope.budget_usd > base scope (computer-scope.toml)
+            # > LOOP_MAX_USD env default. The base scope value is the owner's
+            # global ceiling — if it's higher than the env default, trust it.
+            base_budget = float(getattr(executor.base_scope, "budget_usd", 0) or 0)
+            max_usd = max(LOOP_MAX_USD, base_budget) if base_budget > 0 else LOOP_MAX_USD
+            if isinstance(task_scope, dict):
+                raw_budget = task_scope.get("budget_usd")
+                if isinstance(raw_budget, (int, float)) and raw_budget > 0:
+                    max_usd = float(raw_budget)
+            run_task(
+                task,
+                state,
+                executor,
+                api_key,
+                llm_url=llm_url,
+                model=model,
+                max_usd=max_usd,
+            )
         except Exception as exc:  # noqa: BLE001
             update_live(state, "error", f"{type(exc).__name__}: {exc}")
             print(f"task error: {exc}", flush=True)
@@ -1217,7 +1450,9 @@ def task_worker(
                     }
                 )
         finally:
+            executor.reset_task_scope()
             state.busy = False
             state.current_task = ""
             state.current_task_id = ""
             state.task_count += 1
+    update_live(state, "shutdown", "daemon worker stopped")
