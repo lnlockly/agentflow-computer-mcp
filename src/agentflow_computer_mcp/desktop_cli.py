@@ -90,6 +90,10 @@ def _start_ws_bridge(
     def on_stream_subscribe(subscribe: bool) -> None:
         if subscribe:
             state.stream_subscribed.set()
+            # Wake the capture loop right away — otherwise the cabinet
+            # would see up to a second of black before the first frame
+            # while the loop's idle wait timed out.
+            state.capture_wake.set()
         else:
             state.stream_subscribed.clear()
         log.info("ws stream subscribed=%s", subscribe)
@@ -155,6 +159,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         state.stream_cond,
         fps=args.fps,
         stream_subscribed=state.stream_subscribed,
+        has_consumer=state.has_capture_consumer,
+        wake_event=state.capture_wake,
     )
     capture.start()
     server = start_viewer(state, presets, port=args.port, host=args.host)

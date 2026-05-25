@@ -36,6 +36,19 @@ class DriverState:
     # on WS disconnect. Capture loop polls this to decide whether to push
     # `stream_frame` frames over the wire.
     stream_subscribed: threading.Event = field(default_factory=threading.Event)
+    # Reference count of active local MJPEG viewers at http://localhost:8765
+    # (the daemon's built-in browser viewer). Incremented when `/stream.mjpg`
+    # opens, decremented on disconnect. The capture loop keeps mss capture
+    # active while either this counter is positive OR `stream_subscribed`
+    # is set. Default zero — without an active consumer the loop sleeps and
+    # no JPEG frames are produced, freeing CPU and WS bandwidth.
+    local_viewer_count: int = 0
+    local_viewer_lock: threading.Lock = field(default_factory=threading.Lock)
+    # Pulsed (set+clear) whenever a consumer wakes up the capture loop —
+    # either `subscribe_stream` fires or a local viewer connects. The loop
+    # blocks on this event when no consumer is around, so it does not burn
+    # CPU spinning while the screen is hidden.
+    capture_wake: threading.Event = field(default_factory=threading.Event)
     # Set by `request_abort` when a task_cancel WS frame arrives. The run_task
     # loop checks this between iterations and exits early. Cleared after abort.
     abort_flag: threading.Event = field(default_factory=threading.Event)
@@ -45,6 +58,35 @@ class DriverState:
 
     def __post_init__(self) -> None:
         self.live_dir.mkdir(parents=True, exist_ok=True)
+
+    # ─────────── local viewer ref-counting ───────────
+    def acquire_local_viewer(self) -> None:
+        """Mark that one more local MJPEG client is reading frames.
+
+        Wakes the capture loop on the 0→1 transition so the next frame
+        lands within ~50 ms instead of waiting on the idle event.
+        """
+        with self.local_viewer_lock:
+            self.local_viewer_count += 1
+        self.capture_wake.set()
+
+    def release_local_viewer(self) -> None:
+        """Drop one local MJPEG client. Idempotent on the 0→0 edge."""
+        with self.local_viewer_lock:
+            if self.local_viewer_count > 0:
+                self.local_viewer_count -= 1
+
+    def has_capture_consumer(self) -> bool:
+        """True iff some downstream consumer wants captured frames.
+
+        The capture loop polls this between frames. When it returns False
+        the loop blocks on `capture_wake` instead of capturing — no mss
+        call, no JPEG encode, no WS publish.
+        """
+        if self.stream_subscribed.is_set():
+            return True
+        with self.local_viewer_lock:
+            return self.local_viewer_count > 0
 
     # ─────────── outbound WS helpers ───────────
     def publish_outbound(self, payload: dict[str, Any]) -> None:
