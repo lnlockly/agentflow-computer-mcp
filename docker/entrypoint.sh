@@ -6,9 +6,22 @@
 # token from environment variables baked into the pod by the hosted-device
 # provisioner.
 #
-# Required env:
-#   AF_API_KEY        — owner API key (af_live_*)
-#   AF_DEVICE_TOKEN   — JWT issued by /me/devices/issue
+# Required env (one of two enrollment modes):
+#
+#   Mode A — hosted-device pod (default for kind=daemon hosted_devices):
+#     AF_DEVICE_ID                  — user_devices.id minted by /me/hosted-devices
+#     AF_HOSTED_DEVICE_ID           — hosted_devices.id (used for /reenroll)
+#     AF_HOSTED_ROTATION_SECRET     — long-lived per-pod secret; entrypoint
+#                                     exchanges it for a fresh enrollment_token
+#                                     via POST /me/hosted-devices/:id/reenroll
+#                                     on every pod start (pods are stateless)
+#     AF_ENROLLMENT_TOKEN           — fallback token in case /reenroll is down;
+#                                     valid 30 days from create time
+#
+#   Mode B — selftest / dev image (no hosted backing):
+#     AF_API_KEY                    — owner API key (af_live_*)
+#     AF_DEVICE_TOKEN               — JWT issued by /me/devices/issue
+#
 #   AF_DEVICE_NAME    — friendly name surfaced in /cabinet/devices
 #
 # Optional:
@@ -88,7 +101,86 @@ if [[ "$AF_ENABLE_SCREEN" == "1" ]]; then
   export AF_VNC_PASSWORD
 fi
 
-if [[ -z "${AF_API_KEY:-}" ]]; then
+# ─── Hosted-device enrollment ────────────────────────────────────────
+#
+# For pods born from /me/hosted-devices kind=daemon: the entrypoint trades
+# the long-lived AF_HOSTED_ROTATION_SECRET for a fresh enrollment_token via
+# POST /me/hosted-devices/:id/reenroll, then writes ~/.agentflow/auth.json
+# in the format the daemon's auth.py expects. We do this every pod start
+# because hosted pods are stateless (no PVC under ~/.agentflow).
+write_hosted_auth() {
+  local api_url="${AF_API_URL:-https://agentflow.website}"
+  local device_id="${AF_DEVICE_ID:-}"
+  local enrollment="${AF_ENROLLMENT_TOKEN:-}"
+  local ttl="2592000"
+
+  if [[ -z "$device_id" ]]; then
+    return 1
+  fi
+
+  # If we have both hosted_device_id + rotation_secret, swap them for a
+  # fresh enrollment_token first. Best-effort: on /reenroll failure we
+  # fall back to whatever AF_ENROLLMENT_TOKEN was baked in at pod-create.
+  if [[ -n "${AF_HOSTED_DEVICE_ID:-}" && -n "${AF_HOSTED_ROTATION_SECRET:-}" ]]; then
+    local payload
+    payload=$(printf '{"rotation_secret":"%s"}' "$AF_HOSTED_ROTATION_SECRET")
+    local resp
+    if resp=$(curl -fsS --max-time 15 \
+        -H 'content-type: application/json' \
+        -X POST \
+        --data "$payload" \
+        "${api_url}/_agents/me/hosted-devices/${AF_HOSTED_DEVICE_ID}/reenroll" 2>/dev/null); then
+      # Extract enrollment_token + device_id without pulling a JSON parser
+      # into the base image. Tolerant of either ordering.
+      local re_token re_device re_ttl
+      re_token=$(printf '%s' "$resp" | sed -n 's/.*"enrollment_token":"\([^"]*\)".*/\1/p')
+      re_device=$(printf '%s' "$resp" | sed -n 's/.*"device_id":"\([^"]*\)".*/\1/p')
+      re_ttl=$(printf '%s' "$resp" | sed -n 's/.*"ttl_sec":\([0-9]*\).*/\1/p')
+      if [[ -n "$re_token" ]]; then
+        enrollment="$re_token"
+        echo "[entrypoint] /reenroll ok — fresh enrollment_token (ttl=${re_ttl:-?}s)" >&2
+      fi
+      if [[ -n "$re_device" ]]; then
+        device_id="$re_device"
+      fi
+      if [[ -n "$re_ttl" ]]; then
+        ttl="$re_ttl"
+      fi
+    else
+      echo "[entrypoint] /reenroll failed, falling back to baked-in token" >&2
+    fi
+  fi
+
+  if [[ -z "$enrollment" ]]; then
+    echo "[entrypoint] no enrollment_token available — cannot write auth.json" >&2
+    return 1
+  fi
+
+  local ws_url="${api_url//https:/wss:}/_agents/_devices/connect"
+  ws_url="${ws_url//http:/ws:}"
+
+  mkdir -p "$HOME/.agentflow"
+  local auth_file="$HOME/.agentflow/auth.json"
+  cat > "$auth_file" <<JSON
+{
+  "device_id": "${device_id}",
+  "enrollment_token": "${enrollment}",
+  "api_key": "${AF_API_KEY:-}",
+  "ws_url": "${ws_url}"
+}
+JSON
+  chmod 600 "$auth_file"
+  echo "[entrypoint] wrote $auth_file (device_id=${device_id:0:8}…)" >&2
+  return 0
+}
+
+# Detect mode and act accordingly.
+if [[ -n "${AF_DEVICE_ID:-}" ]]; then
+  if ! write_hosted_auth; then
+    echo "[entrypoint] hosted enrollment failed — running selftest only" >&2
+    exec agentflow-desktop selftest
+  fi
+elif [[ -z "${AF_API_KEY:-}" ]]; then
   echo "[entrypoint] AF_API_KEY missing — running selftest only" >&2
   exec agentflow-desktop selftest
 fi
