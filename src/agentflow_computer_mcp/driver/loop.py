@@ -313,8 +313,44 @@ def post_llm_cancellable(
         },
     )
 
+    # Default urlopen на Windows иногда срывает TLS handshake с
+    # `EOF occurred in violation of protocol (_ssl.c:2427)` — особенно
+    # когда CA bundle Python'а отстаёт от Cloudflare-pin'а или антивирус
+    # MITM-итает трафик. Принудительный TLS 1.2 minimum + system trust
+    # store даёт более устойчивый handshake.
     try:
-        resp = urllib.request.urlopen(req, timeout=timeout)
+        import ssl as _ssl
+        ctx = _ssl.create_default_context()
+        ctx.minimum_version = _ssl.TLSVersion.TLSv1_2
+    except Exception:  # noqa: BLE001
+        ctx = None  # fallback на default behaviour
+
+    def _open_with_retry():
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            try:
+                if ctx is not None:
+                    return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+                return urllib.request.urlopen(req, timeout=timeout)
+            except urllib.error.HTTPError:
+                raise
+            except (urllib.error.URLError, TimeoutError, OSError) as exc_inner:
+                last_exc = exc_inner
+                msg = str(exc_inner)
+                # Retry один раз на «EOF occurred in violation of protocol»
+                # (transient TLS reset Cloudflare/MITM) или 10060 timeout.
+                if attempt == 0 and (
+                    "EOF occurred in violation" in msg
+                    or "WinError 10060" in msg
+                    or "_ssl.c" in msg
+                ):
+                    continue
+                raise
+        assert last_exc is not None
+        raise last_exc
+
+    try:
+        resp = _open_with_retry()
     except urllib.error.HTTPError:
         # 4xx/5xx — caller wants to read the body to surface a useful
         # message, so propagate the structured exception unchanged.
