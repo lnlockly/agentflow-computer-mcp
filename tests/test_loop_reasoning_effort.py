@@ -25,7 +25,6 @@ from agentflow_computer_mcp.driver.loop import (
 )
 from agentflow_computer_mcp.driver.state import DriverState
 
-
 # ─────────────────────── _is_gpt5_family ────────────────────────────────────
 
 def test_is_gpt5_family_positive() -> None:
