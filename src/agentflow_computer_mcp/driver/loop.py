@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -57,9 +58,7 @@ def _is_gpt5_family(model: str) -> bool:
         return True
     # OpenAI o-series reasoning models (o1, o3, o4, …). Match `o<digit>` to
     # avoid catching unrelated names that happen to start with `o`.
-    if len(m) >= 2 and m[0] == "o" and m[1].isdigit():
-        return True
-    return False
+    return bool(len(m) >= 2 and m[0] == "o" and m[1].isdigit())
 
 
 def _augment_body_with_reasoning(
@@ -79,10 +78,7 @@ def _augment_body_with_reasoning(
     if not reasoning_effort or not _is_gpt5_family(model):
         return body
     meta = body.get("metadata")
-    if not isinstance(meta, dict):
-        meta = {}
-    else:
-        meta = dict(meta)
+    meta = {} if not isinstance(meta, dict) else dict(meta)
     meta["reasoning_effort"] = reasoning_effort
     body["metadata"] = meta
     return body
@@ -271,6 +267,77 @@ class LlmNetworkError(Exception):
     """
 
 
+def _curl_post_messages(
+    url: str,
+    api_key: str,
+    body: bytes,
+    timeout: int,
+    *,
+    runner=None,
+) -> dict[str, Any]:
+    """Last-resort POST through the system `curl` binary.
+
+    Windows Defender's TLS MITM occasionally mangles the handshake for
+    `urlopen` (Python's bundled OpenSSL) but leaves Schannel-backed curl
+    alone. Windows 10+ (1803+) ships `curl.exe` in `System32`. Linux/mac
+    have it as a system package.
+
+    Returns the parsed JSON response — same shape `post_llm` would have
+    produced. Raises `LlmNetworkError` when curl is missing or non-zero,
+    so the caller surfaces a clean task_error instead of crashing the
+    worker. NOTE: this is the non-streaming path (we drop `stream=true`
+    from the payload before calling so curl can return a single JSON
+    blob; the SSE streaming path stays on urllib).
+
+    `runner` is injectable for tests so we don't shell out for real.
+    """
+    run = runner or subprocess.run
+    try:
+        proc = run(
+            [
+                "curl",
+                "-sS",
+                "--max-time",
+                str(max(int(timeout), 5)),
+                "-X",
+                "POST",
+                "-H",
+                f"x-api-key: {api_key}",
+                "-H",
+                "content-type: application/json",
+                "-H",
+                "anthropic-version: 2023-06-01",
+                "-H",
+                "user-agent: agentflow-desktop/0.2-curl",
+                "--data-binary",
+                "@-",
+                url,
+            ],
+            input=body,
+            capture_output=True,
+            check=False,
+            timeout=max(int(timeout) + 5, 10),
+        )
+    except FileNotFoundError as exc:
+        raise LlmNetworkError(f"curl missing: {exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise LlmNetworkError(f"curl timeout after {timeout}s") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise LlmNetworkError(f"curl subprocess failed: {exc}") from exc
+    if proc.returncode != 0:
+        stderr = (proc.stderr or b"").decode("utf-8", "replace")[:300]
+        raise LlmNetworkError(f"curl rc={proc.returncode}: {stderr}")
+    stdout = proc.stdout or b""
+    if not stdout:
+        raise LlmNetworkError("curl returned empty body")
+    try:
+        return json.loads(stdout.decode("utf-8", "replace"))
+    except json.JSONDecodeError as exc:
+        raise LlmNetworkError(
+            f"curl returned non-JSON: {stdout[:200]!r}"
+        ) from exc
+
+
 def post_llm_cancellable(
     url: str,
     api_key: str,
@@ -313,18 +380,72 @@ def post_llm_cancellable(
         },
     )
 
+    # Default urlopen на Windows иногда срывает TLS handshake с
+    # `EOF occurred in violation of protocol (_ssl.c:2427)` — особенно
+    # когда CA bundle Python'а отстаёт от Cloudflare-pin'а или антивирус
+    # MITM-итает трафик. Принудительный TLS 1.2 minimum + system trust
+    # store даёт более устойчивый handshake.
     try:
-        resp = urllib.request.urlopen(req, timeout=timeout)
+        import ssl as _ssl
+        ctx = _ssl.create_default_context()
+        ctx.minimum_version = _ssl.TLSVersion.TLSv1_2
+    except Exception:  # noqa: BLE001
+        ctx = None  # fallback на default behaviour
+
+    def _open_with_retry():
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            try:
+                if ctx is not None:
+                    return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+                return urllib.request.urlopen(req, timeout=timeout)
+            except urllib.error.HTTPError:
+                raise
+            except (urllib.error.URLError, TimeoutError, OSError) as exc_inner:
+                last_exc = exc_inner
+                msg = str(exc_inner)
+                # Retry один раз на «EOF occurred in violation of protocol»
+                # (transient TLS reset Cloudflare/MITM) или 10060 timeout.
+                if attempt == 0 and (
+                    "EOF occurred in violation" in msg
+                    or "WinError 10060" in msg
+                    or "_ssl.c" in msg
+                ):
+                    continue
+                raise
+        assert last_exc is not None
+        raise last_exc
+
+    try:
+        resp = _open_with_retry()
     except urllib.error.HTTPError:
         # 4xx/5xx — caller wants to read the body to surface a useful
         # message, so propagate the structured exception unchanged.
         raise
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         # Connect-phase failure: no DNS, no SYN-ACK, TLS handshake stall,
-        # or the dreaded `WinError 10060` on a NAT'd network. Surface a
-        # boundary exception so run_task can translate it into a clean
-        # task_error and the daemon keeps serving the next dispatch.
-        raise LlmNetworkError(f"llm connect failed: {exc}") from exc
+        # or the dreaded `WinError 10060` on a NAT'd network. Before we
+        # give up, try the system `curl` binary — Schannel-backed curl
+        # often survives a Defender MITM that mangles Python's OpenSSL
+        # handshake. Drop `stream=true` so curl returns one JSON blob
+        # we can fold straight back into the caller's expected shape.
+        nonstream_payload = dict(payload)
+        nonstream_payload.pop("stream", None)
+        nonstream_body = json.dumps(nonstream_payload).encode()
+        try:
+            result = _curl_post_messages(
+                url, api_key, nonstream_body, timeout=timeout
+            )
+        except LlmNetworkError as curl_exc:
+            raise LlmNetworkError(
+                f"llm connect failed (urlopen + curl fallback): "
+                f"urlopen={exc} curl={curl_exc}"
+            ) from exc
+        # Curl succeeded — we have a complete non-stream response. Skip
+        # the SSE assembly path and return immediately.
+        if abort_flag.is_set():
+            raise TaskCancelled() from None
+        return result
 
     # Watchdog: closes the response socket within poll_interval of an
     # abort, or after stream_idle_timeout of silence on the stream.
