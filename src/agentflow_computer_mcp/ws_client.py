@@ -16,6 +16,7 @@ from . import __version__
 from .auth import build_connect_headers, save_auth
 from .config import AUTH_FILE, AppConfig
 from .health import get_health
+from .ws_log_uploader import get_handler as get_ws_log_handler
 
 log = logging.getLogger(__name__)
 
@@ -153,6 +154,12 @@ class WSClient:
             }
             await ws.send(json.dumps(hello))
 
+            # Wire the WS log uploader so WARN+ records start flowing to
+            # the backend. Backlog accumulated while offline drains on
+            # this call.
+            log_handler = get_ws_log_handler()
+            log_handler.set_publisher(self.publish)
+
             heartbeat_task = asyncio.create_task(self._heartbeat_loop())
             try:
                 await self._recv_loop()
@@ -160,6 +167,10 @@ class WSClient:
                 heartbeat_task.cancel()
                 with suppress_cancelled():
                     await heartbeat_task
+                # Detach the log uploader BEFORE clearing self._ws so
+                # any final records queue locally instead of being
+                # silently dropped by `publish`.
+                log_handler.set_publisher(None)
                 # On disconnect, drop the stream subscription so the capture
                 # loop stops emitting WS frames into the void.
                 if self._on_stream_subscribe is not None:

@@ -33,6 +33,8 @@ from .driver import (
 from .driver.desktop_tools import grab_full_png
 from .driver.loop import DEFAULT_LLM_URL, DEFAULT_MODEL, run_task
 from .driver.selfmod_worker import SelfmodWorker
+from .logging_setup import init_logging
+from .ws_log_uploader import get_handler as get_ws_log_handler
 
 log = logging.getLogger(__name__)
 
@@ -127,10 +129,9 @@ def _start_ws_bridge(
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
-    )
+    log_path = init_logging(args.log_level, extra_handlers=[get_ws_log_handler()])
+    if log_path:
+        log.info("daemon log file: %s", log_path)
 
     api_key = _resolve_api_key(args.api_key)
     if not api_key:
@@ -252,10 +253,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def cmd_drive(args: argparse.Namespace) -> int:
     """One-shot: run a single task without viewer/queue."""
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
-    )
+    init_logging(args.log_level)
     api_key = _resolve_api_key(args.api_key)
     if not api_key:
         print("no API key found", file=sys.stderr)
