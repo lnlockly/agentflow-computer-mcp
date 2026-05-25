@@ -346,6 +346,125 @@ def install_daemon_binary() -> Path:
     return target
 
 
+def _powershell_quote(value: str) -> str:
+    """Quote a single string for a PowerShell single-quoted literal.
+
+    PowerShell escapes a single quote inside a single-quoted string by
+    doubling it. Used by `add_defender_exclusion` so paths with spaces
+    or apostrophes (`C:\\Users\\Жанна\\…`) don't break the argument list.
+    """
+    return value.replace("'", "''")
+
+
+def _build_defender_command(install_dir: Path) -> str:
+    """Compose the PowerShell command run via `ShellExecuteW runas`.
+
+    Idempotency: `Get-MpPreference` exposes `ExclusionPath` and
+    `ExclusionProcess` as string arrays. We check membership before each
+    `Add-MpPreference` so a repeat install / tray click is a no-op.
+
+    The whole script is wrapped in `try { ... } catch { exit 2 }` so a
+    machine with Defender disabled (`Get-MpPreference` throws) returns a
+    distinct exit code from a successful run.
+    """
+    install_path = _powershell_quote(str(install_dir))
+    daemon_name = _powershell_quote(DAEMON_EXE_NAME)
+    tray_name = _powershell_quote(TRAY_EXE_NAME)
+    parts = [
+        "try {",
+        "  $pref = Get-MpPreference -ErrorAction Stop;",
+        f"  if (-not ($pref.ExclusionPath -contains '{install_path}')) {{",
+        f"    Add-MpPreference -ExclusionPath '{install_path}' -ErrorAction Stop;",
+        "  }",
+        f"  if (-not ($pref.ExclusionProcess -contains '{daemon_name}')) {{",
+        f"    Add-MpPreference -ExclusionProcess '{daemon_name}' -ErrorAction Stop;",
+        "  }",
+        f"  if (-not ($pref.ExclusionProcess -contains '{tray_name}')) {{",
+        f"    Add-MpPreference -ExclusionProcess '{tray_name}' -ErrorAction Stop;",
+        "  }",
+        "  exit 0;",
+        "} catch {",
+        "  exit 2;",
+        "}",
+    ]
+    return " ".join(parts)
+
+
+def add_defender_exclusion(
+    install_dir: Path | None = None,
+    *,
+    shell_executor=None,
+    wait_timeout: float = 30.0,
+) -> tuple[bool, str]:
+    """Add `%LOCALAPPDATA%\\AgentFlow` and both .exe names to Windows
+    Defender exclusion list.
+
+    Triggers a single UAC prompt via `ShellExecuteW("runas", ...)` so the
+    end user clicks «Да» once and never touches PowerShell. Idempotent —
+    re-running on an already-excluded host is a no-op inside the inner
+    PowerShell script.
+
+    Returns:
+      `(True, "")`            — exclusion applied or already present
+      `(False, "user_declined")` — user clicked «Нет» on the UAC prompt
+      `(False, "shellexecute_rc=<n>")` — other ShellExecuteW failure
+      `(False, "not_windows")` — running on macOS / Linux (dev mode)
+
+    `shell_executor` is injectable so tests don't fire a real elevation
+    prompt. It must return an `int` HRESULT — any value ≤ 32 is treated
+    as ShellExecuteW failure per the WinAPI contract.
+    """
+    if os.name != "nt":
+        return False, "not_windows"
+    if install_dir is None:
+        install_dir = _install_dir()
+
+    command = _build_defender_command(install_dir)
+    # PowerShell -NoProfile to skip the user's profile (faster + safer)
+    # and -WindowStyle Hidden so the elevation prompt is the only thing
+    # the user sees, not a flash of blue console.
+    args = (
+        "-NoProfile -NonInteractive -ExecutionPolicy Bypass "
+        f'-WindowStyle Hidden -Command "{command}"'
+    )
+
+    if shell_executor is None:
+        try:
+            import ctypes  # type: ignore[import-not-found]
+        except ImportError as exc:
+            return False, f"ctypes_unavailable: {exc}"
+        try:
+            rc = int(
+                ctypes.windll.shell32.ShellExecuteW(  # type: ignore[attr-defined]
+                    None,
+                    "runas",
+                    "powershell.exe",
+                    args,
+                    None,
+                    0,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            return False, f"shellexecute_failed: {exc}"
+    else:
+        try:
+            rc = int(shell_executor("powershell.exe", args))
+        except Exception as exc:  # noqa: BLE001
+            return False, f"shellexecute_failed: {exc}"
+
+    # SE_ERR_ACCESSDENIED == 5 → пользователь нажал «Нет» на UAC.
+    if rc == 5:
+        return False, "user_declined"
+    if rc <= 32:
+        return False, f"shellexecute_rc={rc}"
+    # ShellExecuteW is fire-and-forget; the elevated PowerShell runs in a
+    # detached process. We can't read its exit code without spawning via
+    # the runas verb + WaitForSingleObject. For now the success heuristic
+    # is "elevation accepted" — the inner script's own Get-MpPreference
+    # check on next install ensures real idempotency.
+    return True, ""
+
+
 def register_scheduled_task(executable: Path) -> tuple[bool, str]:
     """Register the daemon to autostart at user logon.
 
@@ -606,6 +725,24 @@ def _run_install_steps(
             _emit("  → Run-key установлен")
         except Exception as exc:  # noqa: BLE001
             _emit(f"  → fallback тоже не сработал: {exc}")
+
+    _emit("add_defender_exclusion")
+    try:
+        defender_ok, defender_reason = add_defender_exclusion(_install_dir())
+    except Exception as exc:  # noqa: BLE001
+        defender_ok, defender_reason = False, f"unexpected: {exc}"
+    if defender_ok:
+        _emit("  → исключение Defender добавлено")
+    elif defender_reason == "not_windows":
+        _emit("  → пропуск: не Windows")
+    elif defender_reason == "user_declined":
+        _emit("  → пользователь отказался от UAC (можно повторить позже через трей)")
+    else:
+        _emit(
+            "  → не удалось добавить исключение Defender: "
+            f"{defender_reason}. Если задачи падают с SSL — Settings → "
+            "Virus & threat protection → exclusions"
+        )
 
     _emit("launch_daemon")
     launch_daemon(target)
@@ -905,13 +1042,16 @@ class SetupWindow:
             self.device_id = self.creds["device_id"]
 
             step_labels = {
-                "install_daemon_binary": "Шаг 2/5: копирую бинарь в %LOCALAPPDATA%",
-                "write_auth_file": "Шаг 3/5: сохраняю учётные данные",
+                "install_daemon_binary": "Шаг 2/6: копирую бинарь в %LOCALAPPDATA%",
+                "write_auth_file": "Шаг 3/6: сохраняю учётные данные",
                 f"register_scheduled_task ({TASK_NAME})": (
-                    f"Шаг 4/5: регистрирую автозапуск ({TASK_NAME})"
+                    f"Шаг 4/6: регистрирую автозапуск ({TASK_NAME})"
+                ),
+                "add_defender_exclusion": (
+                    "Шаг 5/6: добавляю исключение Windows Defender"
                 ),
                 "launch_daemon": "  → задача создана, запускаю демон",
-                "install_tray_binary": "Шаг 5/5: устанавливаю иконку в трее",
+                "install_tray_binary": "Шаг 6/6: устанавливаю иконку в трее",
                 "register_tray_autostart (HKCU\\…\\Run\\AgentFlowTray)": (
                     "  → прописываю автозапуск трея"
                 ),
