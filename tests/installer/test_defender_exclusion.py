@@ -12,8 +12,25 @@ prompt during pytest.
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
+
+import pytest
+
+# Тесты подменяют `setup_gui.os.name` на "nt", после чего стандартный
+# pathlib.Path() пытается инстанциировать WindowsPath. На Linux/macOS
+# WindowsPath не имеет flavour и падает с NotImplementedError. Сами
+# Windows-сценарии покрываются на test-windows job в CI; на не-Win
+# хосте остаётся только test_add_defender_exclusion_no_op_on_non_windows,
+# который тоже зависит от Path-инстанций — поэтому проще скипнуть
+# модуль целиком.
+if os.name != "nt":
+    pytest.skip(
+        "Defender exclusion tests run only on Windows runner "
+        "(monkeypatching os.name breaks Path on Posix)",
+        allow_module_level=True,
+    )
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "installer"))
