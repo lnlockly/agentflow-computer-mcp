@@ -96,6 +96,11 @@ RUN chmod +x /usr/local/bin/agentflow-entrypoint
 USER agentflow
 WORKDIR /data
 
+# AF_HOSTED=1 signals the Python config layer (load_scope) that there's no
+# user to dismiss native confirm dialogs — every confirm() defaults to
+# allow, the cabinet remains the only authority via /me/devices/:id/scope.
+ENV AF_HOSTED=1
+
 # Healthcheck — daemon HTTP listener on :8765 (control plane), used by
 # the hosted-device reconciler to mark the device Ready.
 # Port 6080 — noVNC web client (browser opens it in iframe от cabinet).

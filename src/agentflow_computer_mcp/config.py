@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -15,6 +16,16 @@ HARD_DENY_PATHS: tuple[str, ...] = (
 )
 
 DEFAULT_CONFIRM_BEFORE: tuple[str, ...] = ("computer.fs.write", "computer.shell.exec")
+
+# Hosted daemons (kind=daemon pods, AF_HOSTED=1 env) have no user sitting at
+# a screen to dismiss native confirm dialogs — every confirm() would block
+# forever and then auto-deny. The owner already configures the device's
+# scope via /me/devices/:id/scope (sent over WS at every task dispatch),
+# so the confirm gate is redundant in that context. Default to "no
+# pre-confirms" for hosted; the cabinet remains the single source of truth.
+HOSTED_MODE: bool = os.environ.get("AF_HOSTED") == "1"
+if HOSTED_MODE:
+    DEFAULT_CONFIRM_BEFORE = ()
 
 AGENTFLOW_DIR = Path.home() / ".agentflow"
 SCOPE_FILE = AGENTFLOW_DIR / "computer-scope.toml"

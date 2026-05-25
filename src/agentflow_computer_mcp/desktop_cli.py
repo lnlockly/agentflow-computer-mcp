@@ -83,8 +83,9 @@ def _start_ws_bridge(
         return await _dispatch_tool(name, args, config)
 
     def on_task_dispatch(task_id: str, task: str, scope: dict[str, Any] | None) -> None:
-        log.info("ws task_dispatch id=%s task=%s", task_id, task[:80])
-        state.enqueue_task(task, task_id)
+        log.info("ws task_dispatch id=%s scope_keys=%s task=%s",
+                 task_id, list(scope.keys()) if scope else None, task[:80])
+        state.enqueue_task(task, task_id, scope=scope)
 
     def on_stream_subscribe(subscribe: bool) -> None:
         if subscribe:
