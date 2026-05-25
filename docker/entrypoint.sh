@@ -186,6 +186,9 @@ elif [[ -z "${AF_API_KEY:-}" ]]; then
 fi
 
 # Hand off. `exec` so signals (SIGTERM from kubectl delete) reach the
-# Python process directly.
+# Python process directly. No `--headless` flag — `agentflow-desktop run`
+# is headless by default (Xvfb provides the display via env DISPLAY=:99).
+# Passing `--headless` aborted the CLI with «unrecognized arguments» so
+# the pod looped through CrashLoopBackOff until this was fixed.
 echo "[entrypoint] handing off to agentflow-desktop run" >&2
-exec agentflow-desktop run --headless
+exec agentflow-desktop run
