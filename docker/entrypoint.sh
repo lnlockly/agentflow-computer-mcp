@@ -53,6 +53,18 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# /tmp/.X11-unix must exist with sticky 1777 before Xvfb starts. The
+# image creates it at build time but if anything mounts an emptyDir over
+# /tmp the directory is gone — re-create here. Without this Xvfb logs
+# «euid != 0,directory /tmp/.X11-unix will not be created» and every
+# X11 client (pyautogui, tk) fails with «Cannot connect to display».
+if [[ ! -d /tmp/.X11-unix ]]; then
+  mkdir -p /tmp/.X11-unix
+fi
+# chmod is no-op if already 1777; sudo so it works whether we're root or
+# the agentflow user (the image gives agentflow NOPASSWD for chmod).
+sudo -n chmod 1777 /tmp/.X11-unix 2>/dev/null || chmod 1777 /tmp/.X11-unix 2>/dev/null || true
+
 echo "[entrypoint] starting Xvfb on $DISPLAY @ $XVFB_WHD" >&2
 Xvfb "$DISPLAY" -screen 0 "$XVFB_WHD" -ac +extension RANDR -nolisten tcp &
 XVFB_PID=$!
