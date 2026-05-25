@@ -125,6 +125,46 @@ def test_mint_device_via_api_happy_path() -> None:
     }
 
 
+def test_mint_device_accepts_nested_device_object() -> None:
+    """Production POST /me/devices returns `{ok, device: {id, ...}, enrollment_token}`.
+
+    The installer used to read `data.get("id")` only, which left device_id
+    empty and aborted the install with «нет device_id или enrollment_token».
+    Lock the nested-shape parse path so the regression cannot return.
+    """
+    class FakeResp:
+        def __init__(self, body: bytes) -> None:
+            self._buf = BytesIO(body)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return self._buf.read()
+
+    def fake_open(req, timeout):  # noqa: ARG001
+        return FakeResp(
+            json.dumps(
+                {
+                    "ok": True,
+                    "device": {"id": "dev-uuid-nested", "name": "Win"},
+                    "enrollment_token": "aft_nested",
+                }
+            ).encode("utf-8")
+        )
+
+    out = mint_device_via_api(
+        "af_live_xyz",
+        api_base="https://example.test/_agents",
+        opener=fake_open,
+    )
+    assert out["device_id"] == "dev-uuid-nested"
+    assert out["device_token"] == "aft_nested"
+
+
 def test_mint_device_rejects_non_af_key() -> None:
     with pytest.raises(ValueError, match="af_"):
         mint_device_via_api("nope_abc", opener=lambda *_a, **_k: None)
