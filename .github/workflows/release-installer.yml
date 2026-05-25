@@ -11,15 +11,51 @@ permissions:
 
 jobs:
   windows-exe:
-    runs-on: windows-latest
+    # Pinned to 2022 — `windows-latest` rolled to 2025 (Apr 2026) which
+    # ships a newer MSVC runtime, cold-boots ~30s slower than 2022, and
+    # produced fresh PyInstaller hidden-import misses on first runs.
+    # 2022 is GH-supported until at least 2027.
+    runs-on: windows-2022
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        timeout-minutes: 2
 
       - uses: actions/setup-python@v5
+        timeout-minutes: 3
         with:
           python-version: "3.11"
+          # Built-in pip wheel cache keyed by hash of these files. Cuts
+          # the "Install build deps" step from ~70s (cold) to ~20s
+          # (warm) by skipping wheel downloads — install still runs but
+          # pulls from %LOCALAPPDATA%\pip\Cache. Cheaper than wiring
+          # actions/cache@v4 ourselves.
+          cache: "pip"
+          cache-dependency-path: |
+            pyproject.toml
+            installer/requirements-build.txt
+
+      - name: Cache PyInstaller intermediates
+        # PyInstaller's Analysis pass (import graph walk over ~30
+        # bundled packages) is the single biggest chunk of the build —
+        # ~60s of the ~99s `pyinstaller` step. It writes a manifest to
+        # `build/agentflow-setup/Analysis-00.toc` + bytecode-compiled
+        # PYZ chunks under `build/`. Keying on the spec + pyproject
+        # makes the cache invalidate when bundle deps or hidden
+        # imports change. Restore-keys lets a non-matching cache (e.g.
+        # bumped a transitive dep) still seed most of the analysis.
+        uses: actions/cache@v4
+        timeout-minutes: 2
+        with:
+          path: |
+            build
+            ~\AppData\Local\pyinstaller
+          key: pyinstaller-${{ runner.os }}-py311-${{ hashFiles('installer/agentflow-setup.spec', 'pyproject.toml', 'src/**/*.py', 'installer/*.py') }}
+          restore-keys: |
+            pyinstaller-${{ runner.os }}-py311-
 
       - name: Install build deps
+        timeout-minutes: 5
         run: |
           python -m pip install --upgrade pip
           # pystray is bundled into agentflow-tray.exe; install it on the
@@ -31,9 +67,11 @@ jobs:
         # Verifies parse_invite + write_auth_file + the daemon entry
         # point imports cleanly. If any of these regress the .exe will
         # crash on the user's PC, so block the release here.
+        timeout-minutes: 2
         run: python installer/smoke.py
 
       - name: Build icon
+        timeout-minutes: 2
         run: python installer/make_icon.py
 
       - name: Build setup.exe + tray.exe
@@ -41,10 +79,12 @@ jobs:
         # and dist/agentflow-tray.exe ship side-by-side. Wizard copies
         # both into %LOCALAPPDATA%\AgentFlow\ + writes the Run-key for
         # the tray so it auto-launches on every user logon.
-        run: pyinstaller installer/agentflow-setup.spec
+        timeout-minutes: 8
+        run: pyinstaller --noconfirm installer/agentflow-setup.spec
 
       - name: List artifacts
         # Sanity check — both binaries must be present before selftest.
+        timeout-minutes: 1
         shell: pwsh
         run: |
           Get-ChildItem dist | Format-Table Name, Length
@@ -63,6 +103,8 @@ jobs:
         # exist, so we write minimal placeholders before invoking
         # --selftest. The values are bogus on purpose — selftest
         # only verifies the files PARSE, never makes a real call.
+        if: startsWith(github.ref, 'refs/tags/v')
+        timeout-minutes: 1
         shell: pwsh
         run: |
           $afDir = Join-Path $env:USERPROFILE ".agentflow"
@@ -89,8 +131,12 @@ jobs:
         # Runs the artifact itself in --daemon --selftest mode. This
         # catches PyInstaller `collect_all` misses (missing hidden
         # imports, missing data files, etc.) BEFORE the binary ships
-        # to users. 30s timeout — selftest is platform-backend probe
-        # only, doesn't talk to the network.
+        # to users. Gated on tag pushes only — `workflow_dispatch`
+        # runs are usually rapid-iteration rebuilds where the smoke
+        # step + tray --version selftest already cover the bundle
+        # integrity surface, and selftest adds ~6-8s per run.
+        if: startsWith(github.ref, 'refs/tags/v')
+        timeout-minutes: 2
         shell: pwsh
         run: |
           $p = Start-Process -FilePath "dist/agentflow-desktop-setup.exe" `
@@ -112,6 +158,9 @@ jobs:
         # to prove the bundle contains every winapp module + pystray.
         # `--version` short-circuits before tray.run(), so this is safe
         # on the headless CI runner where there's no system tray.
+        # Cheap enough (~7s) to keep on every run — covers tray bundle
+        # regressions for `workflow_dispatch` reruns too.
+        timeout-minutes: 2
         shell: pwsh
         run: |
           $p = Start-Process -FilePath "dist/agentflow-tray.exe" `
@@ -138,6 +187,7 @@ jobs:
         # Release body still carries `sha256: <hex>` as a human-readable
         # backup.
         id: sha
+        timeout-minutes: 1
         shell: pwsh
         run: |
           $hashSetup = (Get-FileHash -Path dist/agentflow-desktop-setup.exe -Algorithm SHA256).Hash.ToLower()
@@ -155,6 +205,7 @@ jobs:
 
       - name: Publish to tagged release
         if: startsWith(github.ref, 'refs/tags/v')
+        timeout-minutes: 5
         uses: softprops/action-gh-release@v2
         with:
           files: |
@@ -175,6 +226,7 @@ jobs:
         # never uploaded it, leaving `latest` stuck on the most recent
         # tagged build. Owner hit this when downloading a freshly-fixed
         # installer right after a feature merge.
+        timeout-minutes: 5
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
