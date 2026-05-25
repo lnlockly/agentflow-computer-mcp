@@ -183,7 +183,7 @@ def _fake_urlopen_factory(release_json: dict[str, Any], asset_bytes: bytes):
 
 @pytest.mark.skipif(
     sys.platform == "win32",
-    reason="NTFS не хранит exec-bit — assert st_mode & 0o111 даст 0 даже после chmod +x. Real exec-bit pinning тестируется на Linux/macOS runner'ах.",
+    reason="NTFS не хранит exec-bit; assert на 0o111 даёт 0 даже после chmod +x.",
 )
 def test_install_opencode_happy_path_macos(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
