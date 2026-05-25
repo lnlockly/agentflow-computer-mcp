@@ -5,7 +5,6 @@ strips them when running without a logged-in AgentFlow session.
 """
 from __future__ import annotations
 
-
 AF_TOOLS = (
     "\nAgentFlow API tools (`af_*`) — используй их вместо UI-кликов когда возможно:\n"
     "  • af_list_projects / af_get_project / af_create_project / af_approve_project — проекты.\n"

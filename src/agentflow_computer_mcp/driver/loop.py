@@ -15,7 +15,7 @@ from .desktop_tools import (
     get_window_list,
     jpeg_b64_full,
 )
-from .prompts import HOST_OS, HOST_OS_RELEASE, build_system_prompt
+from .prompts import build_system_prompt
 from .state import DriverState
 from .streamer import compress_png_for_viewer
 

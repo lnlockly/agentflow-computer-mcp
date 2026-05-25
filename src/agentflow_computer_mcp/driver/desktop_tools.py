@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import io
 import json
 import platform
@@ -409,39 +410,27 @@ class PlaywrightHost:
         self._browser = None
         self._pw = None
         if page is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await page.close()
-            except Exception:
-                pass
         if context is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await context.close()
-            except Exception:
-                pass
         if browser is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await browser.close()
-            except Exception:
-                pass
         if pw is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await pw.stop()
-            except Exception:
-                pass
 
     def close(self, timeout: int = 15) -> None:
         loop = self._loop
         thread = self._thread
         if loop is None:
             return
-        try:
+        with contextlib.suppress(Exception):
             asyncio.run_coroutine_threadsafe(self._close(), loop).result(timeout=timeout)
-        except Exception:
-            pass
-        try:
+        with contextlib.suppress(RuntimeError):
             loop.call_soon_threadsafe(loop.stop)
-        except RuntimeError:
-            pass
         if thread is not None:
             thread.join(timeout=1.0)
         self._loop = None
@@ -993,14 +982,10 @@ class ToolExecutor:
         return self._base_scope
 
     def close(self) -> None:
-        try:
+        with contextlib.suppress(Exception):
             self._pw.close()
-        except Exception:
-            pass
-        try:
+        with contextlib.suppress(Exception):
             self._firefox.close()
-        except Exception:
-            pass
 
     def _announce(self, action: str, detail: str = "") -> None:
         if self._state is None:
