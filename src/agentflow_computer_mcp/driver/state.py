@@ -22,7 +22,7 @@ class DriverState:
     actions: list[dict[str, Any]] = field(default_factory=list)
     last_cursor: list[int] = field(default_factory=lambda: [0, 0])
     actions_lock: threading.Lock = field(default_factory=threading.Lock)
-    task_queue: queue.Queue[tuple[str, str]] = field(default_factory=queue.Queue)
+    task_queue: queue.Queue[tuple] = field(default_factory=queue.Queue)
     stream_frame: dict[str, Any] = field(
         default_factory=lambda: {"jpeg": b"", "ts": 0.0}
     )
@@ -101,10 +101,25 @@ class DriverState:
                 }
             )
 
-    def enqueue_task(self, task: str, task_id: str = "") -> str:
-        """Queue a task with an optional pre-assigned id. Returns the id."""
+    def enqueue_task(
+        self,
+        task: str,
+        task_id: str = "",
+        scope: dict[str, Any] | None = None,
+    ) -> str:
+        """Queue a task with optional pre-assigned id + per-task scope override.
+
+        scope (if not None) becomes the third element of the queue tuple and is
+        applied via `ToolExecutor.apply_task_scope` before the task runs. The
+        cabinet sends `device.scope_json` for every dispatch, so the daemon
+        always sees the latest owner-configured scope — including hosted
+        daemons where there's no on-device YAML to edit.
+        """
         tid = task_id or f"local-{int(time.time() * 1000)}"
-        self.task_queue.put((tid, task))
+        if scope is not None:
+            self.task_queue.put((tid, task, scope))
+        else:
+            self.task_queue.put((tid, task))
         return tid
 
     # ─────────── action log ───────────
