@@ -422,3 +422,195 @@ def test_mcp_tool_names_include_opencode() -> None:
     assert "computer.opencode.install" in TOOL_NAMES
     assert "computer.opencode.patch_config" in TOOL_NAMES
     assert "computer.opencode.status" in TOOL_NAMES
+
+
+# ─── alias mode ───────────────────────────────────────────────────────────────
+
+
+def test_normalise_alias_accepts_clean_names() -> None:
+    assert opencode_installer._normalise_alias("flow") == "flow"
+    assert opencode_installer._normalise_alias("  FLOW  ") == "flow"
+    assert opencode_installer._normalise_alias("flow_2") == "flow_2"
+    assert opencode_installer._normalise_alias("flow-prod") == "flow-prod"
+
+
+def test_normalise_alias_passes_through_none() -> None:
+    assert opencode_installer._normalise_alias(None) is None
+    assert opencode_installer._normalise_alias("") is None
+    assert opencode_installer._normalise_alias("   ") is None
+
+
+def test_normalise_alias_rejects_bad_input() -> None:
+    for bad in ("a", "_flow", "-flow", "flow!", "flow space", "x" * 65):
+        with pytest.raises(ValueError, match="invalid_alias"):
+            opencode_installer._normalise_alias(bad)
+
+
+def test_patch_config_alias_openai_mode(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    with patch.object(platform, "system", return_value="Darwin"), patch.object(
+        platform, "machine", return_value="arm64"
+    ):
+        result = opencode_installer.patch_opencode_config(
+            api_key="af_live_fake",
+            alias="flow",
+        )
+
+    assert result["alias"] == "flow"
+    assert result["alias_mode"] == "openai"
+    assert result["provider"] == "agentflow-openai"
+    assert result["model"] == "agentflow-openai/flow"
+
+    data = json.loads(Path(result["config_path"]).read_text())
+    # Alias is registered on the openai provider, not anthropic.
+    assert "flow" in data["provider"]["agentflow-openai"]["models"]
+    assert "flow" not in data["provider"]["agentflow"]["models"]
+    # Canonical models are kept alongside the alias.
+    assert "gpt-5.3-codex" in data["provider"]["agentflow-openai"]["models"]
+    assert data["model"] == "agentflow-openai/flow"
+
+
+def test_patch_config_alias_anthropic_mode(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    with patch.object(platform, "system", return_value="Darwin"), patch.object(
+        platform, "machine", return_value="arm64"
+    ):
+        result = opencode_installer.patch_opencode_config(
+            api_key="af_live_fake",
+            alias="myassistant",
+            alias_mode="anthropic",
+        )
+
+    assert result["provider"] == "agentflow"
+    assert result["model"] == "agentflow/myassistant"
+
+    data = json.loads(Path(result["config_path"]).read_text())
+    assert "myassistant" in data["provider"]["agentflow"]["models"]
+    assert "claude-opus-4-7" in data["provider"]["agentflow"]["models"]
+
+
+def test_patch_config_alias_rejects_bad_name(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    with patch.object(platform, "system", return_value="Darwin"), patch.object(
+        platform, "machine", return_value="arm64"
+    ), pytest.raises(ValueError, match="invalid_alias"):
+        opencode_installer.patch_opencode_config(
+            api_key="af_live_fake",
+            alias="bad name!",
+        )
+
+
+def test_patch_config_alias_rejects_unknown_mode(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    with patch.object(platform, "system", return_value="Darwin"), patch.object(
+        platform, "machine", return_value="arm64"
+    ), pytest.raises(ValueError, match="invalid_alias_mode"):
+        opencode_installer.patch_opencode_config(
+            api_key="af_live_fake",
+            alias="flow",
+            alias_mode="weird",
+        )
+
+
+def test_set_default_alias_repoints_model_without_touching_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    with patch.object(platform, "system", return_value="Darwin"), patch.object(
+        platform, "machine", return_value="arm64"
+    ):
+        # Seed the provider blocks first.
+        opencode_installer.patch_opencode_config(api_key="af_live_fake")
+        # Now swap default model to an alias without re-supplying the key.
+        result = opencode_installer.set_opencode_default_alias("flow")
+
+    assert result["ok"] is True
+    assert result["alias"] == "flow"
+    assert result["provider"] == "agentflow-openai"
+    assert result["model"] == "agentflow-openai/flow"
+
+    data = json.loads(Path(result["config_path"]).read_text())
+    # Original API key block stays intact — only `model` + the models map
+    # under the chosen provider changed.
+    assert data["provider"]["agentflow-openai"]["options"]["apiKey"] == "af_live_fake"
+    assert data["model"] == "agentflow-openai/flow"
+    assert "flow" in data["provider"]["agentflow-openai"]["models"]
+
+
+def test_set_default_alias_anthropic_mode(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    with patch.object(platform, "system", return_value="Darwin"), patch.object(
+        platform, "machine", return_value="arm64"
+    ):
+        opencode_installer.patch_opencode_config(api_key="af_live_fake")
+        result = opencode_installer.set_opencode_default_alias(
+            "myhelper", alias_mode="anthropic"
+        )
+
+    assert result["provider"] == "agentflow"
+    assert result["model"] == "agentflow/myhelper"
+
+
+def test_set_default_alias_when_config_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    with patch.object(platform, "system", return_value="Darwin"), patch.object(
+        platform, "machine", return_value="arm64"
+    ):
+        result = opencode_installer.set_opencode_default_alias("flow")
+
+    assert result["ok"] is False
+    assert result["error"] == "config_missing"
+    assert "patch_opencode_config" in result["hint"]
+
+
+def test_set_default_alias_when_provider_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    with patch.object(platform, "system", return_value="Darwin"), patch.object(
+        platform, "machine", return_value="arm64"
+    ):
+        cfg = opencode_installer.opencode_config_path()
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        # Config exists but has no AgentFlow provider blocks — emulates a
+        # user who hand-rolled their opencode.json before the daemon ran.
+        cfg.write_text(json.dumps({"provider": {"openrouter": {"npm": "x"}}}))
+        result = opencode_installer.set_opencode_default_alias("flow")
+
+    assert result["ok"] is False
+    assert result["error"] == "provider_missing"
+    assert result["provider"] == "agentflow-openai"
+
+
+def test_set_default_alias_rejects_bad_inputs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    with patch.object(platform, "system", return_value="Darwin"), patch.object(
+        platform, "machine", return_value="arm64"
+    ):
+        opencode_installer.patch_opencode_config(api_key="af_live_fake")
+        with pytest.raises(ValueError, match="invalid_alias"):
+            opencode_installer.set_opencode_default_alias("bad name")
+        with pytest.raises(ValueError, match="alias is required"):
+            opencode_installer.set_opencode_default_alias("")
+        with pytest.raises(ValueError, match="invalid_alias_mode"):
+            opencode_installer.set_opencode_default_alias("flow", alias_mode="weird")
+
+
+def test_patch_config_no_alias_keeps_legacy_model_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Sanity: when no alias is passed the existing PR #68 behaviour is preserved."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    with patch.object(platform, "system", return_value="Darwin"), patch.object(
+        platform, "machine", return_value="arm64"
+    ):
+        result = opencode_installer.patch_opencode_config(api_key="af_live_fake")
+
+    assert result["alias"] is None
+    assert result["alias_mode"] is None
+    assert result["provider"] == "agentflow"
+    assert result["model"] == f"agentflow/{opencode_installer.DEFAULT_AF_MODEL}"
