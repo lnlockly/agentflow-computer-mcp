@@ -126,8 +126,19 @@ def chrome_open_url(url: str, new_tab: bool = True) -> str:
     """
     if PLATFORM == "mac":
         if new_tab:
+            # `make new tab` creates AND returns the tab but doesn't
+            # activate it — subsequent `chrome_run_js` was hitting the
+            # caller's previous active tab (localhost dev server,
+            # whatever was front), not this freshly-opened URL. Set it
+            # active in the same AppleScript so chrome_eval picks it up
+            # without needing chrome_list_tabs + tab_index.
             rc, out = osa(
-                f'tell application "Google Chrome" to tell front window to make new tab with properties {{URL:"{url}"}}',
+                'tell application "Google Chrome"\n'
+                f'  tell front window\n'
+                f'    set newTab to make new tab with properties {{URL:"{url}"}}\n'
+                f'    set active tab index to (count of tabs)\n'
+                f'  end tell\n'
+                'end tell',
                 timeout=10,
             )
         else:
