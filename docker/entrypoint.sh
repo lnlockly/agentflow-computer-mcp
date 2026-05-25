@@ -33,12 +33,39 @@
 #                         Дефолт «выкл», чтобы пользователи без визуальной
 #                         нужды не платили за лишние процессы.
 #   AF_VNC_PASSWORD     — пароль для x11vnc (auto-gen если не задан)
+#   AF_SHELL_WHITELIST  — comma- or newline-separated list of programs the
+#                         daemon may pass to `code_run_command`. Defaults
+#                         below to a safe dev baseline (git, gh, node, npm,
+#                         python, pip, pytest, kubectl, curl, bash, …) so
+#                         autonomous plans aren't blocked by an empty
+#                         scope. Owner override per-device via
+#                         `POST /me/devices/:id/scope`. See Bug C in
+#                         qa-reports/2026-05-25/hosted-autonomous-goals-e2e.md.
 
 set -euo pipefail
 
 : "${DISPLAY:=:99}"
 : "${XVFB_WHD:=1440x900x24}"
 : "${AF_ENABLE_SCREEN:=0}"
+
+# Baseline shell whitelist for hosted daemons. Without this, autonomous
+# LLM plans that call `git fetch` / `pytest` / `npm install` hit
+# `shell_whitelist is empty; shell.exec disabled` and abort the session
+# as COMPLETION_BLOCKED. The daemon merges per-device scope on top, so
+# owners can narrow this through the cabinet without redeploying the
+# image. Argument-level guard for `rm -r` lives in scope.py.
+if [[ -z "${AF_SHELL_WHITELIST:-}" ]]; then
+  export AF_SHELL_WHITELIST="ls, cat, head, tail, grep, find, wc, tree, pwd, whoami, env, echo, date, uname, which, file, stat
+git, gh
+node, npm, yarn, pnpm, npx, tsc
+python, python3, pip, pip3, uv, pytest, ruff, black, mypy
+docker, kubectl
+curl, wget, jq
+mkdir, rmdir, rm, cp, mv, touch, chmod, ln
+tar, gzip, gunzip, unzip, zip
+bash, sh, awk, sed
+make, cmake, go, cargo, rustc"
+fi
 
 # Emit a wizard step event on stdout so the cabinet pod-log tail can
 # attribute log lines to install-wizard row updates. Format must match
