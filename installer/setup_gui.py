@@ -242,7 +242,15 @@ def mint_device_via_api(
         data = json.loads(payload)
     except Exception as exc:
         raise ValueError(f"Кабинет вернул не-JSON ответ: {payload[:200]}") from exc
-    device_id = (data.get("id") or data.get("device_id") or "").strip()
+    # POST /me/devices returns `{ok, device: {id, ...}, enrollment_token}`.
+    # Older variants returned device fields at the top level — accept both.
+    device_obj = data.get("device") if isinstance(data.get("device"), dict) else {}
+    device_id = (
+        device_obj.get("id")
+        or data.get("id")
+        or data.get("device_id")
+        or ""
+    ).strip()
     enrollment_token = (
         data.get("enrollment_token") or data.get("token") or ""
     ).strip()
