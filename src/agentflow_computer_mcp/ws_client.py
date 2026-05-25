@@ -18,6 +18,10 @@ from .config import AUTH_FILE, AppConfig
 from .health import get_health
 from .ws_log_uploader import get_handler as get_ws_log_handler
 
+# Imported lazily inside the handler to keep `from .ws_client import …` cheap
+# for the test suite (auto_updater pulls in urllib + hashlib at import).
+_CHECK_AND_APPLY_ONCE: Callable[..., dict[str, Any]] | None = None
+
 log = logging.getLogger(__name__)
 
 HEARTBEAT_INTERVAL_S = 15
@@ -209,7 +213,41 @@ class WSClient:
             if mtype == "unsubscribe_stream":
                 self._handle_stream_subscription(False)
                 continue
+            if mtype == "check_update":
+                asyncio.create_task(self._handle_check_update(msg))
+                continue
             log.debug("unknown message type: %s", mtype)
+
+    async def _handle_check_update(self, msg: dict[str, Any]) -> None:
+        """Run an on-demand update probe and reply with the result.
+
+        Runs the synchronous probe on a worker thread so the WS event
+        loop keeps reading frames (download can take seconds). On Unix
+        an applied update re-execs the process via ``os.execv``, so the
+        ack frame may never reach the wire — that's expected; the
+        backend's wait loop will hit its timeout and the cabinet shows
+        a "перезагружаем агент" toast either way.
+        """
+        call_id = str(msg.get("id") or "")
+        check = _resolve_check_and_apply_once()
+        try:
+            result = await asyncio.to_thread(check)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("on-demand update probe crashed: %s", exc)
+            result = {
+                "ok": False,
+                "current_version": __version__,
+                "latest_version": None,
+                "applied": False,
+                "restarting": False,
+                "reason": f"probe_crashed: {exc}",
+            }
+        with contextlib.suppress(Exception):
+            await self._send({
+                "type": "check_update_result",
+                "id": call_id,
+                "result": result,
+            })
 
     def _handle_task_dispatch(self, msg: dict[str, Any]) -> None:
         task_id = str(msg.get("id") or "").strip()
@@ -292,6 +330,21 @@ class WSClient:
     async def _send(self, payload: dict[str, Any]) -> None:
         assert self._ws is not None
         await self._ws.send(json.dumps(payload))
+
+
+def _resolve_check_and_apply_once() -> Callable[..., dict[str, Any]]:
+    """Lazy-import :func:`auto_updater.check_and_apply_once`.
+
+    Avoids importing the urllib stack at module-load time and lets the
+    unit test monkeypatch the function via ``ws_client._CHECK_AND_APPLY_ONCE``.
+    """
+    global _CHECK_AND_APPLY_ONCE
+    if _CHECK_AND_APPLY_ONCE is not None:
+        return _CHECK_AND_APPLY_ONCE
+    from . import auto_updater
+
+    _CHECK_AND_APPLY_ONCE = auto_updater.check_and_apply_once
+    return _CHECK_AND_APPLY_ONCE
 
 
 class suppress_cancelled:

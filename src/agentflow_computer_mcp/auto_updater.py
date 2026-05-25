@@ -382,6 +382,142 @@ def check_now(
     return status
 
 
+def check_and_apply_once(
+    *,
+    _check=check_now,
+    allow_unfrozen: bool = False,
+) -> dict:
+    """On-demand update probe for the cabinet button.
+
+    Wraps :func:`check_now` so the WS handler returns a stable shape:
+
+        {
+          ok: bool,
+          current_version: str,           # __version__ on this build
+          latest_version: str | None,     # tag pulled from GitHub
+          applied: bool,                  # download + swap succeeded
+          restarting: bool,               # daemon will exit/restart now
+          reason: str | None,             # 'up_to_date' | 'applied'
+                                          # | 'major_bump_refused'
+                                          # | 'no_sha256' | 'no_release'
+                                          # | 'download_failed'
+                                          # | 'platform_unsupported'
+                                          # | 'apply_failed'
+                                          # | str (passthrough)
+        }
+
+    The underlying :func:`check_now` already handles the restart hand-off
+    on Unix via ``os.execv`` and on Windows via ``sys.exit(0)``, so when
+    ``applied=True`` we report ``restarting=True`` — the daemon is on
+    the way out by the time the WS frame is read on the backend.
+
+    ``_check`` is injected so the unit test can pin every branch without
+    touching the network. ``allow_unfrozen`` lets a developer trigger the
+    flow from a ``pip install -e .`` checkout for manual smoke tests.
+    """
+    current = __version__
+    try:
+        verdict = _check(allow_unfrozen=allow_unfrozen)
+    except SystemExit:
+        # check_now → _apply_update → _replace_windows raises SystemExit
+        # after spawning the .bat. Treat as a successful applied run.
+        return {
+            "ok": True,
+            "current_version": current,
+            "latest_version": None,
+            "applied": True,
+            "restarting": True,
+            "reason": "applied",
+        }
+    except Exception as exc:  # noqa: BLE001
+        log.warning("auto-update on-demand: probe crashed: %s", exc)
+        return {
+            "ok": False,
+            "current_version": current,
+            "latest_version": None,
+            "applied": False,
+            "restarting": False,
+            "reason": f"probe_crashed: {exc}",
+        }
+
+    status = verdict.get("status") or ""
+    latest = verdict.get("latest") or None
+    raw_reason = verdict.get("reason") or ""
+
+    if status == "applied":
+        # Process re-exec'd already on Unix; this return value is for the
+        # tests only. On Windows _replace_windows raised SystemExit which
+        # we caught above.
+        return {
+            "ok": True,
+            "current_version": current,
+            "latest_version": latest,
+            "applied": True,
+            "restarting": True,
+            "reason": "applied",
+        }
+
+    if status == "current":
+        return {
+            "ok": True,
+            "current_version": current,
+            "latest_version": latest,
+            "applied": False,
+            "restarting": False,
+            "reason": "up_to_date",
+        }
+
+    if status == "skipped":
+        # Map the common skipped reasons to short codes so the cabinet
+        # can render a friendly toast without parsing free text.
+        code: str
+        if "running from source" in raw_reason:
+            code = "platform_unsupported"
+        elif "refusing major bump" in raw_reason:
+            code = "major_bump_refused"
+        elif "no sha256" in raw_reason:
+            code = "no_sha256"
+        else:
+            code = raw_reason or "skipped"
+        return {
+            "ok": True,
+            "current_version": current,
+            "latest_version": latest,
+            "applied": False,
+            "restarting": False,
+            "reason": code,
+        }
+
+    if status == "available":
+        # check_now returns 'available' only when the download / apply
+        # step itself failed mid-flight — surface as not-applied.
+        return {
+            "ok": False,
+            "current_version": current,
+            "latest_version": latest,
+            "applied": False,
+            "restarting": False,
+            "reason": raw_reason or "download_failed",
+        }
+
+    # status == "error" or unknown.
+    code = "download_failed" if "download" in raw_reason else (
+        "no_release" if "no tag_name" in raw_reason else (
+            "apply_failed" if "apply failed" in raw_reason else (
+                raw_reason or "error"
+            )
+        )
+    )
+    return {
+        "ok": False,
+        "current_version": current,
+        "latest_version": latest,
+        "applied": False,
+        "restarting": False,
+        "reason": code,
+    }
+
+
 def _interval_minutes() -> int:
     """Parse AF_UPDATE_INTERVAL_MIN. 0 disables the loop."""
     raw = os.environ.get("AF_UPDATE_INTERVAL_MIN", "").strip()
@@ -442,6 +578,7 @@ __all__ = [
     "GITHUB_LATEST_PAGE",
     "SHA256SUMS_NAME",
     "UpdateError",
+    "check_and_apply_once",
     "check_now",
     "fetch_latest_release",
     "start_in_background",
