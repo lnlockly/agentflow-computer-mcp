@@ -32,7 +32,7 @@ from .driver import (
     task_worker,
 )
 from .driver.desktop_tools import grab_full_png
-from .driver.loop import DEFAULT_LLM_URL, DEFAULT_MODEL, run_task
+from .driver.loop import DEFAULT_LLM_URL, DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, run_task
 from .driver.selfmod_worker import SelfmodWorker
 from .logging_setup import init_logging
 from .ws_log_uploader import get_handler as get_ws_log_handler
@@ -216,7 +216,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         f"\n{'=' * 70}\n"
         f"AgentFlow Desktop {__version__}\n"
         f"  viewer:  http://{args.host}:{args.port}\n"
-        f"  model:   {args.model}\n"
+        f"  model:   {args.model} (reasoning_effort={args.reasoning_effort})\n"
         f"  presets: {len(presets)}\n"
         f"  ws:      {'on' if bridge else 'off (enroll via /me/devices to enable)'}\n"
         f"{'=' * 70}\n",
@@ -251,6 +251,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             api_key,
             llm_url=args.llm_url,
             model=args.model,
+            reasoning_effort=args.reasoning_effort,
         )
     except KeyboardInterrupt:
         log.info("interrupted, shutting down")
@@ -284,7 +285,15 @@ def cmd_drive(args: argparse.Namespace) -> int:
         else None
     )
     executor = ToolExecutor(state.last_cursor, af_client=af, pw=PlaywrightHost(), state=state)
-    answer = run_task(args.task, state, executor, api_key, llm_url=args.llm_url, model=args.model)
+    answer = run_task(
+        args.task,
+        state,
+        executor,
+        api_key,
+        llm_url=args.llm_url,
+        model=args.model,
+        reasoning_effort=args.reasoning_effort,
+    )
     print(answer)
     return 0
 
@@ -467,6 +476,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--api-key", default=None, help="overrides AGENTFLOW_API_KEY / auth.json")
     run.add_argument("--llm-url", default=DEFAULT_LLM_URL)
     run.add_argument("--model", default=DEFAULT_MODEL)
+    run.add_argument(
+        "--reasoning-effort",
+        default=DEFAULT_REASONING_EFFORT,
+        choices=("low", "medium", "high"),
+        help="reasoning_effort hint for gpt-5 / o-series upstreams (default: medium)",
+    )
     run.add_argument("--presets", default=None, help="path to preset yaml")
     run.add_argument("--no-af-tools", action="store_true", help="hide af_* tools from LLM")
     run.add_argument(
@@ -509,6 +524,12 @@ def build_parser() -> argparse.ArgumentParser:
     drive.add_argument("--api-key", default=None)
     drive.add_argument("--llm-url", default=DEFAULT_LLM_URL)
     drive.add_argument("--model", default=DEFAULT_MODEL)
+    drive.add_argument(
+        "--reasoning-effort",
+        default=DEFAULT_REASONING_EFFORT,
+        choices=("low", "medium", "high"),
+        help="reasoning_effort hint for gpt-5 / o-series upstreams (default: medium)",
+    )
     drive.add_argument("--no-af-tools", action="store_true")
     drive.add_argument("--log-level", default="INFO")
     drive.set_defaults(func=cmd_drive)

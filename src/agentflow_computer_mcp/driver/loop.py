@@ -24,13 +24,68 @@ from .state import DriverState
 from .streamer import compress_png_for_viewer
 
 DEFAULT_LLM_URL = "https://agentflow.website/_agents/llm/v1/messages"
-# Speed beats raw IQ for desktop loops — sonnet handles screenshot→tool
-# decisions in 2-3 seconds vs opus 10-15 sec, and an extra iteration is
-# cheaper than a slow one. Owner can override via AF_DESKTOP_MODEL env;
-# scope-level model override (per task) still wins.
-DEFAULT_MODEL = os.environ.get("AF_DESKTOP_MODEL", "claude-sonnet-4-6")
+# `gpt-5.3-codex` через codex.sale upstream — owner-выбор: быстрая
+# tool-use модель оптимизирована под coding/agent циклы. Маршрутизация
+# идёт через тот же public AgentFlow ai-router (`/llm/v1/messages`):
+# Anthropic-формат body → `anthropic-openai-bridge` на стороне backend
+# переводит на OpenAI shape для codex.sale, биллинг через `recordUsage`
+# в `agentflow-agents/src/routes/public-llm.ts`.
+# Owner может override через AF_DESKTOP_MODEL env; scope-level override
+# (per task) всё равно выигрывает.
+DEFAULT_MODEL = os.environ.get("AF_DESKTOP_MODEL", "gpt-5.3-codex")
+# Reasoning effort для GPT-5 серии: `medium` = fast-mode (быстрее `high`,
+# точнее `low`). Передаётся в body как `reasoning_effort` если модель
+# из gpt-5.* семейства. Anthropic-модели поле игнорируют.
+DEFAULT_REASONING_EFFORT = os.environ.get("AF_DESKTOP_REASONING_EFFORT", "medium")
 MAX_ITERS = 40
 HISTORY_IMAGE_KEEP_RECENT_MESSAGES = 1
+
+
+def _is_gpt5_family(model: str) -> bool:
+    """True if the model id belongs to the OpenAI gpt-5.* / o-series family
+    that accepts a `reasoning_effort` hint.
+
+    codex.sale fronts these under names like `gpt-5.3-codex`, `gpt-5.4`, and
+    `o3-mini` — they all honour the field. Anthropic / claude-* models
+    silently ignore it, but we still skip the addition to keep the upstream
+    body clean for east-api-3.
+    """
+    if not model:
+        return False
+    m = model.lower()
+    if m.startswith("gpt-5") or m.startswith("gpt5"):
+        return True
+    # OpenAI o-series reasoning models (o1, o3, o4, …). Match `o<digit>` to
+    # avoid catching unrelated names that happen to start with `o`.
+    if len(m) >= 2 and m[0] == "o" and m[1].isdigit():
+        return True
+    return False
+
+
+def _augment_body_with_reasoning(
+    body: dict[str, Any], model: str, reasoning_effort: str | None
+) -> dict[str, Any]:
+    """Attach `metadata.reasoning_effort` to the outgoing body when model
+    is part of the gpt-5 / o-series family.
+
+    Why `metadata.*` instead of a top-level field — the daemon talks
+    Anthropic wire format to `/llm/v1/messages`. The Anthropic schema has
+    no `reasoning_effort` slot, but it does accept arbitrary `metadata`
+    on the request envelope. The backend bridge
+    (`agentflow-agents/src/services/anthropic-openai-bridge.ts`) reads
+    `metadata.reasoning_effort` and forwards it as a top-level field on
+    the upstream OpenAI request, which is what codex.sale expects.
+    """
+    if not reasoning_effort or not _is_gpt5_family(model):
+        return body
+    meta = body.get("metadata")
+    if not isinstance(meta, dict):
+        meta = {}
+    else:
+        meta = dict(meta)
+    meta["reasoning_effort"] = reasoning_effort
+    body["metadata"] = meta
+    return body
 
 
 def _env_int(name: str, default: int) -> int:
@@ -566,6 +621,7 @@ def _request_checkpoint(
     system_msg: str,
     messages: list[dict[str, Any]],
     abort_flag: Any,
+    reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
     """Inject a synthetic reflection turn and ask the LLM if it's on track.
 
@@ -583,18 +639,15 @@ def _request_checkpoint(
     probe_messages = list(messages) + [
         {"role": "user", "content": [{"type": "text", "text": reflection_prompt}]}
     ]
+    body: dict[str, Any] = {
+        "model": model,
+        "max_tokens": 256,
+        "system": system_msg,
+        "messages": probe_messages,
+    }
+    body = _augment_body_with_reasoning(body, model, reasoning_effort)
     try:
-        resp = post_llm_cancellable(
-            llm_url,
-            api_key,
-            {
-                "model": model,
-                "max_tokens": 256,
-                "system": system_msg,
-                "messages": probe_messages,
-            },
-            abort_flag,
-        )
+        resp = post_llm_cancellable(llm_url, api_key, body, abort_flag)
     except Exception as exc:  # noqa: BLE001
         print(f"[loop] checkpoint LLM error: {exc}", flush=True)
         return fallback
@@ -788,6 +841,7 @@ def run_task(
     model: str = DEFAULT_MODEL,
     max_iters: int = MAX_ITERS,
     max_usd: float = LOOP_MAX_USD,
+    reasoning_effort: str = DEFAULT_REASONING_EFFORT,
 ) -> str:
     update_live(state, "start", task)
     wins = get_window_list()
@@ -928,19 +982,16 @@ def run_task(
 
         iterations = i + 1
         print(f"\n--- iter {iterations} ---", flush=True)
+        body: dict[str, Any] = {
+            "model": model,
+            "max_tokens": 1024,
+            "system": system_msg,
+            "tools": tools,
+            "messages": messages,
+        }
+        body = _augment_body_with_reasoning(body, model, reasoning_effort)
         try:
-            resp = post_llm_cancellable(
-                llm_url,
-                api_key,
-                {
-                    "model": model,
-                    "max_tokens": 1024,
-                    "system": system_msg,
-                    "tools": tools,
-                    "messages": messages,
-                },
-                state.abort_flag,
-            )
+            resp = post_llm_cancellable(llm_url, api_key, body, state.abort_flag)
         except TaskCancelled:
             return _emit_cancel()
         except urllib.error.HTTPError as exc:
@@ -1133,7 +1184,13 @@ def run_task(
             last_checkpoint_at = tool_calls_count
             print(f"  ⟳ checkpoint @ step {tool_calls_count}", flush=True)
             check = _request_checkpoint(
-                llm_url, api_key, model, system_msg, messages, state.abort_flag
+                llm_url,
+                api_key,
+                model,
+                system_msg,
+                messages,
+                state.abort_flag,
+                reasoning_effort=reasoning_effort,
             )
             check_usage = check.get("usage") or {}
             total_cost_usd += _budget_record_llm(model, check_usage)
@@ -1204,6 +1261,7 @@ def task_worker(
     *,
     llm_url: str = DEFAULT_LLM_URL,
     model: str = DEFAULT_MODEL,
+    reasoning_effort: str = DEFAULT_REASONING_EFFORT,
 ) -> None:
     """Blocking loop: pull tasks off the queue, run them sequentially."""
     update_live(state, "idle", "ожидаю задачу из чат-инпута")
@@ -1225,18 +1283,31 @@ def task_worker(
             # global ceiling — if it's higher than the env default, trust it.
             base_budget = float(getattr(executor.base_scope, "budget_usd", 0) or 0)
             max_usd = max(LOOP_MAX_USD, base_budget) if base_budget > 0 else LOOP_MAX_USD
+            # Per-task scope.model / scope.reasoning_effort win over the
+            # daemon-wide defaults. Useful for cabinet-side overrides — eg
+            # a coding task can ask for `gpt-5.3-codex` + `high` while
+            # casual chats stay on `medium`.
+            run_model = model
+            run_reasoning = reasoning_effort
             if isinstance(task_scope, dict):
                 raw_budget = task_scope.get("budget_usd")
                 if isinstance(raw_budget, (int, float)) and raw_budget > 0:
                     max_usd = float(raw_budget)
+                scope_model = task_scope.get("model")
+                if isinstance(scope_model, str) and scope_model.strip():
+                    run_model = scope_model.strip()
+                scope_reasoning = task_scope.get("reasoning_effort")
+                if isinstance(scope_reasoning, str) and scope_reasoning.strip():
+                    run_reasoning = scope_reasoning.strip()
             run_task(
                 task,
                 state,
                 executor,
                 api_key,
                 llm_url=llm_url,
-                model=model,
+                model=run_model,
                 max_usd=max_usd,
+                reasoning_effort=run_reasoning,
             )
         except Exception as exc:  # noqa: BLE001
             update_live(state, "error", f"{type(exc).__name__}: {exc}")
