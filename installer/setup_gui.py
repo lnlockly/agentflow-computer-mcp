@@ -319,30 +319,90 @@ def _self_exe_path() -> Path:
     return Path(__file__).resolve()
 
 
-def install_daemon_binary() -> Path:
+def _stop_running_daemon() -> None:
+    """Best-effort: остановить старый daemon перед копированием новой
+    версии. Windows не даёт перезаписать running .exe — без этого вызов
+    `shutil.copy2` падает с `PermissionError` и юзер видит «не могу
+    скопировать» при обновлении v0.4.x → v0.5.x.
+
+    Тушим в три приёма (любой может быть no-op — все они best-effort):
+      1. `schtasks /End /TN AgentFlowDesktop` — останавливает scheduled
+         task; если процесс остался — переходим к шагу 2.
+      2. `taskkill /F /IM agentflow-desktop.exe /IM agentflow-tray.exe`
+         — добивает оставшиеся процессы.
+      3. Маленький sleep чтобы файлы успели отпуститься на NTFS.
+    """
+    if os.name != "nt":
+        return
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    for cmd in (
+        ["schtasks", "/End", "/TN", TASK_NAME],
+        ["taskkill", "/F", "/IM", DAEMON_EXE_NAME],
+        ["taskkill", "/F", "/IM", TRAY_EXE_NAME],
+    ):
+        try:
+            subprocess.run(
+                cmd,
+                check=False,
+                capture_output=True,
+                timeout=10,
+                creationflags=creationflags,
+            )
+        except Exception:  # noqa: BLE001
+            # taskkill / schtasks отсутствуют — игнор; copy всё равно
+            # попробует и при необходимости пойдёт через .new sidecar.
+            pass
+    import time as _time
+    _time.sleep(0.5)
+
+
+def install_daemon_binary(progress_cb=None) -> Path:
     """Copy this .exe to %LOCALAPPDATA%\\AgentFlow\\agentflow-desktop.exe
     so the scheduled task survives the user moving / deleting the
-    download from the Downloads folder."""
+    download from the Downloads folder.
+
+    `progress_cb` — optional callable(str) called on every meaningful step
+    so the GUI log line («Шаг 2/6: копирую…») gets sub-updates instead of
+    appearing frozen for the 60-120 s antivirus scan window.
+    """
+    def _p(msg: str) -> None:
+        if progress_cb:
+            try:
+                progress_cb(msg)
+            except Exception:
+                pass
+
     target_dir = _install_dir()
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / DAEMON_EXE_NAME
     src = _self_exe_path()
     if src.resolve() == target.resolve():
-        # Already running from the installed location — nothing to copy.
+        _p("  → уже в %LOCALAPPDATA%, копировать не нужно")
         return target
-    # On Windows you can't overwrite a running .exe. We're running from
-    # the downloaded copy, not the target, so a plain copy is fine. If
-    # the target is locked (previous daemon still running) try to delete
-    # it first; if that fails fall back to a `.new` sidecar that the
-    # task will pick up on next logon.
-    try:
-        if target.exists():
+    _stop_running_daemon()
+    _p("  → старый процесс остановлен (или не работал)")
+    if target.exists():
+        try:
             target.unlink()
+            _p("  → старый файл удалён")
+        except PermissionError as exc:
+            _p(f"  → не удалить старый файл: {exc} (пойдём через .new)")
+            sidecar = target.with_suffix(".new.exe")
+            shutil.copy2(src, sidecar)
+            _p(f"  → скопировано в sidecar: {sidecar}")
+            return sidecar
+    _p(f"  → копирую {src.stat().st_size:,} байт…")
+    try:
         shutil.copy2(src, target)
-    except PermissionError:
+    except PermissionError as exc:
+        _p(f"  → PermissionError: {exc}")
         sidecar = target.with_suffix(".new.exe")
         shutil.copy2(src, sidecar)
+        _p(f"  → fallback .new: {sidecar}")
         return sidecar
+    except Exception as exc:  # noqa: BLE001
+        _p(f"  → copy fail: {type(exc).__name__}: {exc}")
+        raise
     return target
 
 
@@ -705,9 +765,22 @@ def _run_install_steps(
             except Exception:
                 pass
 
+    import time as _t
+
     _emit("install_daemon_binary")
-    target = install_daemon_binary()
-    _emit(f"  → {target}")
+    src = _self_exe_path()
+    tgt_dir = _install_dir()
+    src_bytes = 0
+    try:
+        src_bytes = src.stat().st_size
+    except OSError:
+        pass
+    _emit(f"  src={src}")
+    _emit(f"  target_dir={tgt_dir}")
+    _emit(f"  src_bytes={src_bytes:,}")
+    _t0 = _t.monotonic()
+    target = install_daemon_binary(progress_cb=_emit)
+    _emit(f"  → copy done in {_t.monotonic() - _t0:.1f}s → {target}")
 
     _emit("write_auth_file")
     auth_path = write_auth_file(creds)

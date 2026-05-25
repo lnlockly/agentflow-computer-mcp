@@ -55,7 +55,7 @@ def test_install_step_4_falls_back_to_run_key(monkeypatch, tmp_path) -> None:
     target = tmp_path / "agentflow-desktop.exe"
     target.write_bytes(b"stub")
 
-    monkeypatch.setattr(setup_gui, "install_daemon_binary", lambda: target)
+    monkeypatch.setattr(setup_gui, "install_daemon_binary", lambda **_kw: target)
     monkeypatch.setattr(setup_gui, "write_auth_file", lambda creds: tmp_path / "auth.json")
     monkeypatch.setattr(
         setup_gui,
