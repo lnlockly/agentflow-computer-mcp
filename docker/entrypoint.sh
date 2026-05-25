@@ -61,9 +61,10 @@ node, npm, yarn, pnpm, npx, tsc
 python, python3, pip, pip3, uv, pytest, ruff, black, mypy
 docker, kubectl
 curl, wget, jq
-mkdir, rmdir, rm, cp, mv, touch, chmod, ln
+mkdir, rmdir, rm, cp, mv, touch, chmod, ln, cd
 tar, gzip, gunzip, unzip, zip
 bash, sh, awk, sed
+nohup, kill, ps, true
 make, cmake, go, cargo, rustc"
 fi
 

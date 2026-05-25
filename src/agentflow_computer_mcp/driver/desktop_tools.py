@@ -11,6 +11,7 @@ import base64
 import contextlib
 import io
 import json
+import os
 import platform
 import shutil
 import subprocess
@@ -653,6 +654,40 @@ DESKTOP_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "project_clone_and_setup",
+        "description": (
+            "Clone a GitHub Next.js template into /workspace/proj-<slug>, reinit "
+            "git, install dependencies (npm/pnpm/yarn auto-detected by lockfile), "
+            "start `npm run dev` in the background, wait for port 3000, then POST "
+            "the result to /internal/projects/<id>/clone-status. Returns "
+            "{ok, port_reachable, dev_pid, project_dir} or {ok:false, error:<code>}. "
+            "Invoked by the platform after /me/projects/:id/approve; daemon-only."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "template_repo_full": {
+                    "type": "string",
+                    "description": "GitHub repo in 'owner/repo' form, e.g. 'ixartz/Next-JS-Landing-Page-Starter-Template'.",
+                },
+                "slug": {
+                    "type": "string",
+                    "description": "Project slug — workspace dir becomes /workspace/proj-<slug>.",
+                },
+                "project_id": {
+                    "type": "integer",
+                    "description": "Backend projects.id for the clone-status callback.",
+                },
+                "port": {
+                    "type": "integer",
+                    "default": 3000,
+                    "description": "Dev-server port to wait for. Default 3000.",
+                },
+            },
+            "required": ["template_repo_full", "slug", "project_id"],
+        },
+    },
+    {
         "name": "clipboard_write",
         "description": "Write text to clipboard.",
         "input_schema": {
@@ -1131,6 +1166,52 @@ class ToolExecutor:
                     ),
                 )
             except Exception as exc:  # noqa: BLE001 — surface as tool_result, never crash the loop
+                result = {
+                    "ok": False,
+                    "error": f"unexpected: {exc.__class__.__name__}",
+                    "detail": str(exc),
+                }
+            return json.dumps(result, ensure_ascii=False), None
+        if name == "project_clone_and_setup":
+            # Phase A3 — clone GitHub template + start dev server + report.
+            # See driver/tools/project_setup.py for the full flow.
+            from .tools.project_setup import project_clone_and_setup
+
+            # Backend coords: the platform-set AF_INTERNAL_API_SECRET grants
+            # the daemon write access to /internal/projects/:id/clone-status.
+            # Falls back to selftest if missing so a misconfigured pod surfaces
+            # a clean tool_result instead of a stack trace.
+            internal_secret = os.environ.get("AF_INTERNAL_API_SECRET", "")
+            if self._af is not None:
+                api_base = self._af._base  # noqa: SLF001 — daemon owns this
+            else:
+                api_base = os.environ.get(
+                    "AF_API_URL", "https://agentflow.website"
+                ).rstrip("/")
+                if not api_base.endswith("/_agents"):
+                    api_base = api_base + "/_agents"
+            if not internal_secret:
+                return (
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "error": "missing_internal_secret",
+                            "hint": "AF_INTERNAL_API_SECRET env var not set on hosted pod.",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    None,
+                )
+            try:
+                result = project_clone_and_setup(
+                    template_repo_full=str(args.get("template_repo_full", "")),
+                    slug=str(args.get("slug", "")),
+                    project_id=int(args.get("project_id", 0) or 0),
+                    api_base=api_base,
+                    internal_secret=internal_secret,
+                    port=int(args.get("port", 3000) or 3000),
+                )
+            except Exception as exc:  # noqa: BLE001 — surface as tool_result
                 result = {
                     "ok": False,
                     "error": f"unexpected: {exc.__class__.__name__}",
