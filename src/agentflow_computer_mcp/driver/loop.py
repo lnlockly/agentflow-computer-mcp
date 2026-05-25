@@ -197,13 +197,33 @@ def _assemble_anthropic_sse(events: list[dict[str, Any]]) -> dict[str, Any]:
     return skeleton
 
 
+# Default per-call ceiling for the streaming LLM POST. Lower than the legacy
+# 180 s so a half-open TCP socket (eg WinError 10060) frees the AI loop in
+# under a minute; ops can dial it via env. The watchdog also enforces a
+# per-chunk inactivity cap so a long stream that goes silent mid-flight
+# does not park the daemon for the full ceiling.
+DEFAULT_LLM_CONNECT_TIMEOUT_S = _env_int("AF_LLM_CONNECT_TIMEOUT_S", 60)
+DEFAULT_LLM_STREAM_IDLE_TIMEOUT_S = _env_int("AF_LLM_STREAM_IDLE_TIMEOUT_S", 45)
+
+
+class LlmNetworkError(Exception):
+    """Raised when the LLM endpoint is unreachable or the stream stalls.
+
+    Wraps urllib/OSError/socket failures so callers see one boundary type
+    they can convert into a clean task_error frame instead of letting the
+    raw exception bubble through the task_worker. The original cause is
+    preserved via ``__cause__`` for log greppability.
+    """
+
+
 def post_llm_cancellable(
     url: str,
     api_key: str,
     payload: dict[str, Any],
     abort_flag: Any,
-    timeout: int = 180,
+    timeout: int = DEFAULT_LLM_CONNECT_TIMEOUT_S,
     poll_interval: float = 0.2,
+    stream_idle_timeout: int = DEFAULT_LLM_STREAM_IDLE_TIMEOUT_S,
 ) -> dict[str, Any]:
     """POST /v1/messages with stream=true and tear the connection down
     within ~poll_interval seconds when ``abort_flag`` fires.
@@ -212,6 +232,11 @@ def post_llm_cancellable(
     We register a watchdog thread that closes the response object the
     instant the flag is set, which surfaces as a read error on the main
     thread; we then translate it to ``TaskCancelled``.
+
+    The watchdog also enforces a per-chunk inactivity cap: if the SSE
+    stream stays silent for ``stream_idle_timeout`` seconds, close the
+    socket so the next ``resp.read`` raises and we surface a clean
+    ``LlmNetworkError`` instead of waiting out the full timeout.
 
     On normal completion, the SSE event list is folded back into the
     standard /v1/messages response shape so the caller sees the same
@@ -233,18 +258,40 @@ def post_llm_cancellable(
         },
     )
 
-    resp = urllib.request.urlopen(req, timeout=timeout)
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError:
+        # 4xx/5xx — caller wants to read the body to surface a useful
+        # message, so propagate the structured exception unchanged.
+        raise
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        # Connect-phase failure: no DNS, no SYN-ACK, TLS handshake stall,
+        # or the dreaded `WinError 10060` on a NAT'd network. Surface a
+        # boundary exception so run_task can translate it into a clean
+        # task_error and the daemon keeps serving the next dispatch.
+        raise LlmNetworkError(f"llm connect failed: {exc}") from exc
 
-    # Watchdog: closes the response socket within poll_interval of an abort.
+    # Watchdog: closes the response socket within poll_interval of an
+    # abort, or after stream_idle_timeout of silence on the stream.
     import threading as _th
 
     stop_watch = _th.Event()
     aborted = _th.Event()
+    idle_timeout_fired = _th.Event()
+    last_byte_ts = [time.monotonic()]
+    idle_deadline_s = max(int(stream_idle_timeout or 0), 0)
 
     def _watch() -> None:
         while not stop_watch.is_set():
             if abort_flag.is_set():
                 aborted.set()
+                with contextlib.suppress(Exception):
+                    resp.close()
+                return
+            if idle_deadline_s > 0 and (
+                time.monotonic() - last_byte_ts[0] > idle_deadline_s
+            ):
+                idle_timeout_fired.set()
                 with contextlib.suppress(Exception):
                     resp.close()
                 return
@@ -268,9 +315,16 @@ def post_llm_cancellable(
             except Exception as exc:  # noqa: BLE001
                 if aborted.is_set() or abort_flag.is_set():
                     raise TaskCancelled() from exc
-                raise
+                if idle_timeout_fired.is_set():
+                    raise LlmNetworkError(
+                        f"llm stream idle for {idle_deadline_s}s"
+                    ) from exc
+                # Any other read failure (RST, TLS error mid-stream) is
+                # a network problem from the daemon's point of view.
+                raise LlmNetworkError(f"llm stream read failed: {exc}") from exc
             if not chunk:
                 break
+            last_byte_ts[0] = time.monotonic()
             buffer += chunk
             while b"\n" in buffer:
                 line, buffer = buffer.split(b"\n", 1)
@@ -893,6 +947,31 @@ def run_task(
             body = exc.read().decode()[:300]
             print(f"http {exc.code}: {body}", flush=True)
             update_live(state, "error", f"llm http {exc.code}: {body}")
+            if state.current_task_id:
+                state.publish_outbound(
+                    {
+                        "type": "task_error",
+                        "task_id": state.current_task_id,
+                        "error": f"llm_http_{exc.code}: {body[:160]}",
+                    }
+                )
+            return ""
+        except LlmNetworkError as exc:
+            # Surfaces fast (≤ AF_LLM_CONNECT_TIMEOUT_S or stream-idle cap)
+            # instead of blocking the task_worker for the full urllib
+            # default. Print + log + WS frame so the cabinet flips off the
+            # "running" spinner instead of waiting for the backend reaper.
+            reason = f"llm_unreachable: {exc}"
+            print(reason, flush=True)
+            update_live(state, "error", reason)
+            if state.current_task_id:
+                state.publish_outbound(
+                    {
+                        "type": "task_error",
+                        "task_id": state.current_task_id,
+                        "error": reason[:240],
+                    }
+                )
             return ""
         if resp.get("type") == "error":
             update_live(state, "error", f"api error: {resp}")

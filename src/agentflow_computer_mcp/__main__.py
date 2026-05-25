@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import logging
 import sys
 
 from . import __version__
+from .logging_setup import init_logging
 
 
 def main() -> int:
@@ -19,10 +19,7 @@ def main() -> int:
         print(__version__)
         return 0
 
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
-    )
+    init_logging(args.log_level)
 
     from .server import run
 
