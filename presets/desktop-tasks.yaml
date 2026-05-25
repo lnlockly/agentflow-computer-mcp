@@ -114,6 +114,22 @@
     (если 1361064246 — это owner). af_send_telegram_message с chat_id=
     "1361064246" и составленным текстом. task_complete.
 
+- label: "Element: проверь Matrix-комнаты"
+  task: |
+    firefox_open + firefox_navigate https://chat.agentflow.website → firefox_snapshot →
+    firefox_eval достань список комнат с unread > 0 → markdown в clipboard. task_complete.
+
+- label: "Element: новый чат с {USERNAME}"
+  task: |
+    firefox_open chat.agentflow.website → найди /msg / новое сообщение → отправь
+    {USERNAME} приветствие. Если нужно создать комнату — fallback af_post_matrix_room.
+
+- label: "Onboard cookies для {DOMAIN}"
+  task: |
+    firefox_get_cookies(domain="{DOMAIN}") → найди соответствующую страницу AgentFlow
+    (cabinet/integrations/{DOMAIN}) → firefox_export_cookies_to. После confirm-dialog
+    юзера — verify success-toast. af_remember с уроком.
+
 - label: "Иди зарабатывай (kwork)"
   task: |
     Цикл по поиску оплачиваемых заказов на kwork. Юзер уже залогинен в
