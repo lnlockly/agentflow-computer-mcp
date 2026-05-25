@@ -502,6 +502,54 @@ def check_loop_caps_constants() -> None:
     )
 
 
+def check_steps_json_loads() -> None:
+    """The wizard step manifest (installer/steps.json) is the single source
+    of truth shared with the cabinet React wizard. If it fails to load or
+    drifts off the schema the loader expects, both surfaces break — gate
+    the release here so we catch it before publish.
+    """
+    log("steps manifest: load + canonical names + surface filter")
+    from installer.steps import (
+        SUPPORTED_SCHEMA_VERSION,
+        Step,
+        load_steps,
+    )
+
+    steps = load_steps()
+    if not steps:
+        fail("steps.json loaded empty list")
+    if not all(isinstance(s, Step) for s in steps):
+        fail("load_steps returned non-Step entries")
+
+    expected_names = {
+        "prepare_workspace",
+        "verify_token",
+        "request_permissions",
+        "install_daemon_binary",
+        "write_auth_json",
+        "autostart_register",
+        "install_opencode_cli",
+        "install_pencil_mcp",
+        "sync_skill_packs",
+        "register_mcp_servers",
+        "launch_daemon",
+        "verify_install",
+    }
+    got_names = {s.name for s in steps}
+    missing = expected_names - got_names
+    extra = got_names - expected_names
+    if missing or extra:
+        fail(f"steps manifest drift — missing={missing} extra={extra}")
+
+    # Surface filter is the contract the cabinet relies on for hosted.
+    hosted_names = {s.name for s in load_steps(surface="hosted")}
+    for off_surface in ("request_permissions", "install_daemon_binary", "autostart_register"):
+        if off_surface in hosted_names:
+            fail(f"{off_surface} leaked into hosted surface")
+
+    log(f"  ok — manifest v{SUPPORTED_SCHEMA_VERSION}, {len(steps)} steps, hosted filter holds")
+
+
 def check_loop_checkpoint_abort() -> None:
     """Drive a fake run_task that hits a checkpoint returning on_track=false
     and assert the loop aborts cleanly (task_error emitted, no exception).
@@ -655,6 +703,7 @@ def main() -> None:
     check_os_aware_tool_filter()
     check_os_aware_system_prompt()
     check_loop_caps_constants()
+    check_steps_json_loads()
     check_loop_checkpoint_abort()
     log("ALL GREEN")
 

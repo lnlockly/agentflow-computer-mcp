@@ -1,0 +1,110 @@
+{
+  "version": 1,
+  "description": "Canonical install-wizard step manifest. Consumed by installer/steps.py (Tk wizard), docker/entrypoint.sh (hosted pod), and agentflow-landing/public/install-wizard-steps.json (React cabinet UI). See subsystems/install-wizard.mdx in agentflow-code-docs.",
+  "steps": [
+    {
+      "name": "prepare_workspace",
+      "label_ru": "Готовим папку",
+      "label_en": "Preparing workspace",
+      "surfaces": ["win", "mac", "linux", "hosted"],
+      "required": true,
+      "status": "real"
+    },
+    {
+      "name": "verify_token",
+      "label_ru": "Проверяем токен",
+      "label_en": "Verifying token",
+      "surfaces": ["win", "mac", "linux", "hosted"],
+      "required": true,
+      "status": "real"
+    },
+    {
+      "name": "request_permissions",
+      "label_ru": "Спрашиваем разрешения системы",
+      "label_en": "Requesting permissions",
+      "surfaces": ["win", "mac"],
+      "required": false,
+      "status": "real"
+    },
+    {
+      "name": "install_daemon_binary",
+      "label_ru": "Ставим демона",
+      "label_en": "Installing daemon",
+      "surfaces": ["win", "mac", "linux"],
+      "required": true,
+      "status": "real"
+    },
+    {
+      "name": "write_auth_json",
+      "label_ru": "Сохраняем доступ",
+      "label_en": "Saving credentials",
+      "surfaces": ["win", "mac", "linux", "hosted"],
+      "required": true,
+      "status": "real"
+    },
+    {
+      "name": "autostart_register",
+      "label_ru": "Включаем автозапуск",
+      "label_en": "Enabling autostart",
+      "surfaces": ["win", "mac", "linux"],
+      "required": false,
+      "status": "real"
+    },
+    {
+      "name": "install_opencode_cli",
+      "label_ru": "Ставим OpenCode",
+      "label_en": "Installing OpenCode",
+      "surfaces": ["win", "mac", "linux", "hosted"],
+      "required": false,
+      "status": "real",
+      "notes": "Calls daemon MCP tool computer.opencode.install + computer.opencode.patch_config. See subsystems/opencode-integration.mdx."
+    },
+    {
+      "name": "install_pencil_mcp",
+      "label_ru": "Ставим Pencil MCP",
+      "label_en": "Installing Pencil MCP",
+      "surfaces": ["win", "mac", "linux", "hosted"],
+      "required": false,
+      "status": "planned",
+      "issue": "https://github.com/lnlockly/agentflow-computer-mcp/issues/78",
+      "unblocks_with": "Confirm canonical Pencil MCP package name and registration contract."
+    },
+    {
+      "name": "sync_skill_packs",
+      "label_ru": "Скачиваем навыки",
+      "label_en": "Syncing skill packs",
+      "surfaces": ["win", "mac", "linux", "hosted"],
+      "required": false,
+      "status": "planned",
+      "issue": "https://github.com/lnlockly/agentflow-computer-mcp/issues/79",
+      "unblocks_with": "Publish agentflow-skills GitHub release with versioned bundles; daemon downloads on demand."
+    },
+    {
+      "name": "register_mcp_servers",
+      "label_ru": "Подключаем MCP-серверы",
+      "label_en": "Registering MCP servers",
+      "surfaces": ["win", "mac", "linux", "hosted"],
+      "required": false,
+      "status": "planned",
+      "issue": "https://github.com/lnlockly/agentflow-computer-mcp/issues/80",
+      "unblocks_with": "Confirm local ~/.opencode/mcp.json (or equivalent) schema and decide registration order."
+    },
+    {
+      "name": "launch_daemon",
+      "label_ru": "Запускаем демона",
+      "label_en": "Launching daemon",
+      "surfaces": ["win", "mac", "linux", "hosted"],
+      "required": true,
+      "status": "real"
+    },
+    {
+      "name": "verify_install",
+      "label_ru": "Проверяем что всё работает",
+      "label_en": "Verifying install",
+      "surfaces": ["win", "mac", "linux", "hosted"],
+      "required": true,
+      "status": "real",
+      "notes": "Dispatches hello-world task via POST /me/devices/:id/dispatch_task, waits up to 60s for artifact via SSE /me/devices/:id/tasks/stream."
+    }
+  ]
+}

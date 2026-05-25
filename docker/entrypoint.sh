@@ -40,6 +40,20 @@ set -euo pipefail
 : "${XVFB_WHD:=1440x900x24}"
 : "${AF_ENABLE_SCREEN:=0}"
 
+# Emit a wizard step event on stdout so the cabinet pod-log tail can
+# attribute log lines to install-wizard row updates. Format must match
+# installer/steps.json names and StepStatusRuntime from installer/steps.py
+# (running|ok|error|skipped_surface|skipped_planned). See
+# agentflow-code-docs/subsystems/install-wizard.mdx for the contract.
+emit_step() {
+  local name="$1" status="$2" detail="${3:-}"
+  if [[ -n "$detail" ]]; then
+    printf 'STEP %s %s %s\n' "$name" "$status" "$detail"
+  else
+    printf 'STEP %s %s\n' "$name" "$status"
+  fi
+}
+
 # PIDs of optional background processes; cleanup kills them all.
 XVFB_PID=""
 FLUXBOX_PID=""
@@ -52,6 +66,15 @@ cleanup() {
   done
 }
 trap cleanup EXIT INT TERM
+
+# Mark hosted-only steps as skipped so the cabinet UI keeps row order.
+emit_step request_permissions skipped_surface
+emit_step install_daemon_binary skipped_surface
+emit_step autostart_register skipped_surface
+
+emit_step prepare_workspace running
+mkdir -p "$HOME/.agentflow"
+emit_step prepare_workspace ok
 
 # /tmp/.X11-unix must exist with sticky 1777 before Xvfb starts. The
 # image creates it at build time but if anything mounts an emptyDir over
@@ -188,10 +211,21 @@ JSON
 
 # Detect mode and act accordingly.
 if [[ -n "${AF_DEVICE_ID:-}" ]]; then
+  emit_step verify_token running
+  emit_step write_auth_json running
   if ! write_hosted_auth; then
+    emit_step write_auth_json error "hosted enrollment failed"
+    emit_step verify_token error "no enrollment_token"
     echo "[entrypoint] hosted enrollment failed — running selftest only" >&2
     exec agentflow-desktop selftest
   fi
+  emit_step verify_token ok
+  emit_step write_auth_json ok
+  # install_opencode_cli runs inside the daemon (MCP tool computer.opencode.install).
+  # Planned rows are display-only — emit so the cabinet keeps row order.
+  emit_step install_pencil_mcp skipped_planned
+  emit_step sync_skill_packs skipped_planned
+  emit_step register_mcp_servers skipped_planned
 elif [[ -z "${AF_API_KEY:-}" ]]; then
   echo "[entrypoint] AF_API_KEY missing — running selftest only" >&2
   exec agentflow-desktop selftest
@@ -202,5 +236,8 @@ fi
 # is headless by default (Xvfb provides the display via env DISPLAY=:99).
 # Passing `--headless` aborted the CLI with «unrecognized arguments» so
 # the pod looped through CrashLoopBackOff until this was fixed.
+# The daemon itself emits `STEP launch_daemon ok` after WS handshake and
+# `STEP verify_install <status>` after the hello-world task completes.
+emit_step launch_daemon running
 echo "[entrypoint] handing off to agentflow-desktop run" >&2
 exec agentflow-desktop run
