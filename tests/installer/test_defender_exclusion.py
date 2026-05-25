@@ -156,7 +156,7 @@ def test_run_install_steps_does_not_crash_when_defender_fails(
     target = tmp_path / "agentflow-desktop.exe"
     target.write_bytes(b"stub")
 
-    monkeypatch.setattr(setup_gui, "install_daemon_binary", lambda: target)
+    monkeypatch.setattr(setup_gui, "install_daemon_binary", lambda **_kw: target)
     monkeypatch.setattr(setup_gui, "write_auth_file", lambda creds: tmp_path / "auth.json")
     monkeypatch.setattr(
         setup_gui, "register_scheduled_task", lambda exe: (True, "")
