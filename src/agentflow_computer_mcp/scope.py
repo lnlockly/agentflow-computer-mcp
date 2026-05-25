@@ -58,6 +58,25 @@ def check_shell(cmd: str, scope: Scope) -> str:
     program = head[0]
     if program not in scope.shell_whitelist:
         raise ScopeDenied(f"command not in shell_whitelist: {program}")
+
+    # Hard reject of recursive deletes. Hosted whitelists routinely
+    # include `rm` so the agent can clean its own temp files, but a
+    # mis-quoted prompt that ends with `rm -rf /` would otherwise nuke
+    # the daemon's home directory. The whitelist is for programs, not
+    # for arguments — this is the one argument-level guard.
+    if program == "rm":
+        for arg in head[1:]:
+            if not arg.startswith("-"):
+                continue
+            if arg in ("-r", "-R", "-rf", "-fr", "-rfv", "-vrf"):
+                raise ScopeDenied("rm with recursive flag is denied")
+            if arg == "--recursive" or arg.startswith("--recursive"):
+                raise ScopeDenied("rm with --recursive is denied")
+            # Compact GNU-style cluster like `-rfv` or `-rfi` — refuse if
+            # `r` or `R` is anywhere inside the cluster (and it's not a
+            # long option).
+            if not arg.startswith("--") and ("r" in arg[1:] or "R" in arg[1:]):
+                raise ScopeDenied("rm with recursive flag is denied")
     return cmd
 
 
