@@ -319,6 +319,43 @@ def _self_exe_path() -> Path:
     return Path(__file__).resolve()
 
 
+def _stop_running_daemon() -> None:
+    """Best-effort: остановить старый daemon перед копированием новой
+    версии. Windows не даёт перезаписать running .exe — без этого вызов
+    `shutil.copy2` падает с `PermissionError` и юзер видит «не могу
+    скопировать» при обновлении v0.4.x → v0.5.x.
+
+    Тушим в три приёма (любой может быть no-op — все они best-effort):
+      1. `schtasks /End /TN AgentFlowDesktop` — останавливает scheduled
+         task; если процесс остался — переходим к шагу 2.
+      2. `taskkill /F /IM agentflow-desktop.exe /IM agentflow-tray.exe`
+         — добивает оставшиеся процессы.
+      3. Маленький sleep чтобы файлы успели отпуститься на NTFS.
+    """
+    if os.name != "nt":
+        return
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    for cmd in (
+        ["schtasks", "/End", "/TN", TASK_NAME],
+        ["taskkill", "/F", "/IM", DAEMON_EXE_NAME],
+        ["taskkill", "/F", "/IM", TRAY_EXE_NAME],
+    ):
+        try:
+            subprocess.run(
+                cmd,
+                check=False,
+                capture_output=True,
+                timeout=10,
+                creationflags=creationflags,
+            )
+        except Exception:  # noqa: BLE001
+            # taskkill / schtasks отсутствуют — игнор; copy всё равно
+            # попробует и при необходимости пойдёт через .new sidecar.
+            pass
+    import time as _time
+    _time.sleep(0.5)
+
+
 def install_daemon_binary() -> Path:
     """Copy this .exe to %LOCALAPPDATA%\\AgentFlow\\agentflow-desktop.exe
     so the scheduled task survives the user moving / deleting the
@@ -330,6 +367,10 @@ def install_daemon_binary() -> Path:
     if src.resolve() == target.resolve():
         # Already running from the installed location — nothing to copy.
         return target
+    # Stop the previous daemon process before touching the file —
+    # without this the update path (v0.4.x → v0.5.x) fails on Windows
+    # because the old `.exe` is still loaded and ALL handle write locks.
+    _stop_running_daemon()
     # On Windows you can't overwrite a running .exe. We're running from
     # the downloaded copy, not the target, so a plain copy is fine. If
     # the target is locked (previous daemon still running) try to delete
