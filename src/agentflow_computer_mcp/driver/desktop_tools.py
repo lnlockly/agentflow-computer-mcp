@@ -616,6 +616,23 @@ DESKTOP_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "chrome_export_cookies",
+        "description": (
+            "Export cookies (HttpOnly + non-HttpOnly) for a domain from user's Chrome profile by "
+            "reading the local SQLite store and decrypting via macOS Keychain. Result is "
+            "Playwright storage_state.cookies compatible. Use ONLY after a successful "
+            "chrome_open_url+chrome_eval login probe."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "domain": {"type": "string"},
+                "profile": {"type": "string", "default": "Default"},
+            },
+            "required": ["domain"],
+        },
+    },
+    {
         "name": "clipboard_write",
         "description": "Write text to clipboard.",
         "input_schema": {
@@ -1056,6 +1073,14 @@ class ToolExecutor:
             return chrome_list_tabs(), None
         if name == "chrome_eval":
             return chrome_run_js(args["js"], args.get("tab_index")), None
+        if name == "chrome_export_cookies":
+            from .chrome_cookies import export_cookies
+
+            try:
+                result = export_cookies(args["domain"], args.get("profile", "Default"))
+            except Exception as exc:  # noqa: BLE001 — surface as tool_result, never crash the loop
+                result = {"ok": False, "error": f"unexpected: {exc.__class__.__name__}"}
+            return json.dumps(result, ensure_ascii=False), None
         if name == "clipboard_write":
             asyncio.run(clipboard.write(args["text"]))
             return "ok", None
