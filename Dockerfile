@@ -49,6 +49,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         wmctrl \
         chromium \
         chromium-driver \
+        fluxbox \
         fonts-dejavu \
         fonts-noto-color-emoji \
         fonts-noto-cjk \
@@ -60,6 +61,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         tini \
         procps \
         sudo \
+        x11vnc \
+        novnc \
+        websockify \
+        python3-websockify \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user. Pod's default uid is 0 in many vclusters but the daemon
@@ -93,7 +98,9 @@ WORKDIR /data
 
 # Healthcheck — daemon HTTP listener on :8765 (control plane), used by
 # the hosted-device reconciler to mark the device Ready.
-EXPOSE 8765
+# Port 6080 — noVNC web client (browser opens it in iframe от cabinet).
+# Port 5900 — raw VNC if кому-то нужен прямой клиент.
+EXPOSE 8765 6080 5900
 
 HEALTHCHECK --interval=20s --timeout=5s --start-period=15s --retries=3 \
   CMD curl -fsS http://localhost:8765/health || exit 1
