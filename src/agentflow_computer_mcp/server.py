@@ -13,6 +13,7 @@ from .tools import code as code_tool
 from .tools import fs as fs_tool
 from .tools import keyboard as keyboard_tool
 from .tools import mouse as mouse_tool
+from .tools import opencode_installer
 from .tools import screen as screen_tool
 from .tools import screen_record as screen_record_tool
 from .tools import shell as shell_tool
@@ -45,6 +46,9 @@ TOOL_NAMES: list[str] = [
     "computer.screen_record.start",
     "computer.screen_record.stop",
     "computer.screen_record.status",
+    "computer.opencode.install",
+    "computer.opencode.patch_config",
+    "computer.opencode.status",
 ]
 
 
@@ -182,6 +186,34 @@ def build_mcp(config: AppConfig) -> FastMCP:
     def screen_record_status() -> dict[str, Any]:
         return screen_record_tool.get_recorder().status()
 
+    @mcp.tool(name="computer.opencode.install")
+    def opencode_install(version: str = "latest") -> dict[str, Any]:
+        return opencode_installer.install_opencode(version=version)
+
+    @mcp.tool(name="computer.opencode.patch_config")
+    def opencode_patch_config(
+        api_key: str | None = None,
+        base_url: str | None = None,
+        model: str | None = None,
+    ) -> dict[str, Any]:
+        key = api_key or config.auth.api_key
+        if not key:
+            raise ValueError("no_api_key: pass api_key or enroll the device first")
+        return opencode_installer.patch_opencode_config(
+            api_key=key, base_url=base_url, model=model
+        )
+
+    @mcp.tool(name="computer.opencode.status")
+    def opencode_status() -> dict[str, Any]:
+        binary = opencode_installer.opencode_binary_path()
+        cfg = opencode_installer.opencode_config_path()
+        return {
+            "binary_path": str(binary),
+            "binary_present": binary.exists(),
+            "config_path": str(cfg),
+            "config_present": cfg.exists(),
+        }
+
     return mcp
 
 
@@ -291,6 +323,26 @@ async def _dispatch_tool(name: str, args: dict[str, Any], config: AppConfig) -> 
         return screen_record_tool.get_recorder().stop()
     if name == "computer.screen_record.status":
         return screen_record_tool.get_recorder().status()
+    if name == "computer.opencode.install":
+        return opencode_installer.install_opencode(version=args.get("version", "latest"))
+    if name == "computer.opencode.patch_config":
+        key = args.get("api_key") or config.auth.api_key
+        if not key:
+            raise ValueError("no_api_key: pass api_key or enroll the device first")
+        return opencode_installer.patch_opencode_config(
+            api_key=key,
+            base_url=args.get("base_url"),
+            model=args.get("model"),
+        )
+    if name == "computer.opencode.status":
+        binary = opencode_installer.opencode_binary_path()
+        cfg = opencode_installer.opencode_config_path()
+        return {
+            "binary_path": str(binary),
+            "binary_present": binary.exists(),
+            "config_path": str(cfg),
+            "config_present": cfg.exists(),
+        }
     raise LookupError(f"unknown tool: {name}")
 
 
