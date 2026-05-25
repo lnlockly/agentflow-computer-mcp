@@ -232,6 +232,11 @@ def make_handler(state: DriverState, presets: list[dict[str, str]]) -> type[Base
 
         def _serve_mjpeg(self) -> None:
             boundary = b"--agentflow-frame"
+            # Count this open MJPEG client so the capture loop keeps
+            # producing frames even when the cabinet has the cloud feed
+            # toggled off. Released in `finally` so a crashed client
+            # never leaves the counter inflated.
+            state.acquire_local_viewer()
             try:
                 self.send_response(200)
                 self.send_header("age", "0")
@@ -259,6 +264,8 @@ def make_handler(state: DriverState, presets: list[dict[str, str]]) -> type[Base
                     self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 return
+            finally:
+                state.release_local_viewer()
 
     return H
 

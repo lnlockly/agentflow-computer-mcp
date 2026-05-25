@@ -76,6 +76,8 @@ class CaptureLoop:
         fps: int = 20,
         stream_subscribed: threading.Event | None = None,
         outbound_publisher: Callable[[dict[str, Any]], None] | None = None,
+        has_consumer: Callable[[], bool] | None = None,
+        wake_event: threading.Event | None = None,
     ) -> None:
         self._frame = stream_frame
         self._cond = stream_cond
@@ -90,6 +92,13 @@ class CaptureLoop:
         # Adaptive rate state
         self._ws_emit_interval = WS_STREAM_MIN_INTERVAL_S
         self._consecutive_failures = 0
+        # Idle gating: when no consumer is around (no WS subscribe + no
+        # local viewer), the loop sleeps on `wake_event` rather than
+        # capturing. Skips mss, JPEG encode, and dedup hashing entirely.
+        # Both arguments are optional for backward-compat with existing
+        # callers — if either is None, the loop captures unconditionally.
+        self._has_consumer = has_consumer
+        self._wake_event = wake_event
 
     def set_outbound_publisher(
         self, publisher: Callable[[dict[str, Any]], None] | None
@@ -105,6 +114,11 @@ class CaptureLoop:
 
     def stop(self) -> None:
         self._stop.set()
+        # Unblock `_wait_for_consumer` if the loop is parked on the wake
+        # event — otherwise the daemon could sit in shutdown for up to a
+        # second waiting on the next 1 s ceiling tick.
+        if self._wake_event is not None:
+            self._wake_event.set()
 
     def _maybe_publish_ws(self, frame: bytes, now: float) -> None:
         if self._publisher is None or self._stream_subscribed is None:
@@ -147,8 +161,33 @@ class CaptureLoop:
                 self._ws_emit_interval * 2,
             )
 
+    def _wait_for_consumer(self) -> None:
+        """Block until some downstream consumer wants frames.
+
+        Returns immediately when the loop has no consumer gate wired
+        (`_has_consumer is None`), preserving the legacy "always capture"
+        behaviour for unit tests and the one-shot `drive` command.
+
+        The wait is interrupted by either `_wake_event.set()` (a
+        `subscribe_stream` frame or a fresh local-viewer connection) or
+        the loop's own `_stop`. A 1 s ceiling guards against a missed
+        wake — the cost of capturing one stale frame is far cheaper than
+        the cost of a dead screen feed when the wake signal is lost.
+        """
+        if self._has_consumer is None or self._wake_event is None:
+            return
+        while not self._stop.is_set():
+            if self._has_consumer():
+                self._wake_event.clear()
+                return
+            self._wake_event.wait(timeout=1.0)
+            self._wake_event.clear()
+
     def _run(self) -> None:
         while not self._stop.is_set():
+            self._wait_for_consumer()
+            if self._stop.is_set():
+                break
             t0 = time.time()
             try:
                 frame = fast_capture_jpeg()
