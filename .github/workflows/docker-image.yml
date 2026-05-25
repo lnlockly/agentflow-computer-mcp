@@ -18,7 +18,12 @@ concurrency:
 
 jobs:
   build:
-    runs-on: [self-hosted, ff-france]
+    # Self-hosted runner registered with label `computer-mcp` (see GitHub
+    # repo settings → Actions → Runners). Previously requested label
+    # `ff-france` matched no runner, so docker-image builds queued
+    # forever and the daemon image was never pushed to ghcr.io —
+    # hosted-device pods hit ImagePullBackOff because of this.
+    runs-on: [self-hosted, computer-mcp]
     permissions:
       contents: read
       packages: write
