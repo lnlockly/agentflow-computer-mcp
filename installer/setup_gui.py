@@ -22,12 +22,15 @@ from __future__ import annotations
 import base64
 import json
 import os
+import platform
 import queue
 import shutil
 import subprocess
 import sys
 import threading
 import tkinter as tk
+import urllib.error
+import urllib.request
 import webbrowser
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -41,6 +44,7 @@ MUTED = "#7A7A85"
 
 WINDOW_TITLE = "AgentFlow Desktop · Установка"
 DEFAULT_WS_URL = "wss://agentflow.website/_agents/_devices/connect"
+DEFAULT_API_BASE = "https://agentflow.website/_agents"
 TASK_NAME = "AgentFlowDesktop"
 DAEMON_DIR_NAME = "AgentFlow"
 DAEMON_EXE_NAME = "agentflow-desktop.exe"
@@ -141,20 +145,24 @@ def _select_all(widget: tk.Widget) -> str:
 
 
 def parse_invite(blob: str) -> dict:
-    """Decode a base64url invite blob and validate the three fields."""
+    """Decode a base64url invite blob and validate the three fields.
+
+    Legacy format kept for users with old install instructions. New flow
+    pastes a single `af_live_*` / `af_install_*` token; see `parse_token`.
+    """
     blob = blob.strip()
     if not blob:
-        raise ValueError("Invite-код пустой")
+        raise ValueError("Токен пустой")
     try:
         raw = b64url_decode(blob)
         data = json.loads(raw.decode("utf-8"))
     except Exception as exc:
-        raise ValueError(f"Не получилось распарсить invite-код: {exc}") from exc
+        raise ValueError(f"Не получилось распарсить токен: {exc}") from exc
     api_key = data.get("k") or ""
     device_id = data.get("d") or ""
     device_token = data.get("t") or ""
     if not api_key or not device_id or not device_token:
-        raise ValueError("В invite-коде не хватает полей (k / d / t)")
+        raise ValueError("В токене не хватает полей (k / d / t)")
     if not api_key.startswith("af_"):
         raise ValueError("api_key должен начинаться с af_")
     if not device_token.startswith("aft_"):
@@ -164,6 +172,109 @@ def parse_invite(blob: str) -> dict:
         "device_id": device_id,
         "device_token": device_token,
     }
+
+
+def _default_device_name() -> str:
+    """Friendly device name for `POST /me/devices`. Falls back to a
+    generic label if the host name lookup fails (sandbox / locked-down
+    runners)."""
+    try:
+        host = platform.node() or ""
+    except Exception:
+        host = ""
+    host = host.strip()
+    if not host:
+        host = "Windows PC"
+    osname = "Windows" if os.name == "nt" else platform.system() or "Desktop"
+    return f"{osname} · {host}"[:64]
+
+
+def mint_device_via_api(
+    api_key: str,
+    *,
+    api_base: str | None = None,
+    name: str | None = None,
+    opener=None,
+    timeout: float = 15.0,
+) -> dict:
+    """Exchange a long-lived `af_live_*` key for a fresh device row.
+
+    Calls `POST {api_base}/me/devices` with `x-api-key: <key>` and
+    returns the `device_id` + one-time `enrollment_token` straight from
+    the server. The daemon then upgrades that token to a permanent
+    `device_secret` on first WS connect.
+
+    `opener` is the HTTP transport (defaults to `urllib.request.urlopen`)
+    so tests can inject a fake without touching the network.
+    """
+    if not api_key.startswith("af_"):
+        raise ValueError("api_key должен начинаться с af_")
+    base = (api_base or os.environ.get("AF_API_BASE") or DEFAULT_API_BASE).rstrip("/")
+    url = f"{base}/me/devices"
+    body = json.dumps({"name": name or _default_device_name()}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "x-api-key": api_key,
+            "content-type": "application/json",
+            "accept": "application/json",
+            "user-agent": "agentflow-desktop-setup",
+        },
+    )
+    _open = opener or urllib.request.urlopen
+    try:
+        with _open(req, timeout=timeout) as resp:  # noqa: S310
+            payload = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace") if hasattr(exc, "read") else ""
+        if exc.code == 401:
+            raise ValueError(
+                "Токен не принят кабинетом (401). Открой кабинет и получи новый."
+            ) from exc
+        raise ValueError(
+            f"Не получилось создать устройство: HTTP {exc.code} {detail[:200]}"
+        ) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise ValueError(f"Кабинет недоступен: {exc}") from exc
+    try:
+        data = json.loads(payload)
+    except Exception as exc:
+        raise ValueError(f"Кабинет вернул не-JSON ответ: {payload[:200]}") from exc
+    device_id = (data.get("id") or data.get("device_id") or "").strip()
+    enrollment_token = (
+        data.get("enrollment_token") or data.get("token") or ""
+    ).strip()
+    if not device_id or not enrollment_token:
+        raise ValueError(
+            f"В ответе кабинета нет device_id или enrollment_token: {payload[:200]}"
+        )
+    if not enrollment_token.startswith("aft_"):
+        raise ValueError(
+            f"enrollment_token должен начинаться с aft_, получили: {enrollment_token[:12]}…"
+        )
+    return {
+        "api_key": api_key,
+        "device_id": device_id,
+        "device_token": enrollment_token,
+    }
+
+
+def parse_token(raw: str, *, mint=mint_device_via_api) -> dict:
+    """Single-field entry point — figures out whether `raw` is a modern
+    `af_live_*` / `af_install_*` key or a legacy base64url invite blob and
+    returns the three credentials the daemon expects.
+
+    `mint` is injectable so unit tests don't reach the network.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        raise ValueError("Токен пустой")
+    if raw.startswith("af_live_") or raw.startswith("af_install_"):
+        return mint(raw)
+    # Legacy path: base64url JSON blob with api_key + device_id + token.
+    return parse_invite(raw)
 
 
 def write_auth_file(creds: dict) -> Path:
@@ -515,19 +626,28 @@ class SetupWindow:
 
         tk.Label(
             wrap,
-            text="Вставь invite-код из кабинета AgentFlow",
+            text="Вставь токен установки из кабинета AgentFlow",
             bg=BG,
             fg=FG,
             font=("Segoe UI", 10),
             anchor="w",
         ).pack(fill="x")
 
+        tk.Label(
+            wrap,
+            text="Один токен — одно поле. Кабинет выдаёт af_install_… или af_live_…",
+            bg=BG,
+            fg=MUTED,
+            font=("Segoe UI", 9),
+            anchor="w",
+        ).pack(fill="x", pady=(0, 4))
+
         invite_row = tk.Frame(wrap, bg=BG)
-        invite_row.pack(fill="x", pady=(4, 6))
+        invite_row.pack(fill="x", pady=(0, 6))
 
         self.invite = tk.Text(
             invite_row,
-            height=3,
+            height=2,
             bg=FIELD_BG,
             fg=FG,
             insertbackground=FG,
@@ -553,11 +673,14 @@ class SetupWindow:
             padx=10,
             pady=2,
             cursor="hand2",
-        ).pack(side="left", padx=(6, 0), ipady=18)
+        ).pack(side="left", padx=(6, 0), ipady=12)
 
+        # Advanced параметры скрыты по умолчанию: 9 из 10 пользователей
+        # вставляют один токен и больше ничего трогать не должны. Power-
+        # users разворачивают блок, чтобы ввести три старых поля вручную.
         self.advanced_toggle = tk.Label(
             wrap,
-            text="▸ Расширенные настройки",
+            text="▸ Расширенные параметры",
             bg=BG,
             fg=MUTED,
             font=("Segoe UI", 9),
@@ -647,12 +770,12 @@ class SetupWindow:
         )
         self.action_btn.pack(side="right")
 
-        # «Проверить обновление» link — calls auto_updater.check_now()
-        # synchronously and writes the result into the log view. Placed
-        # under the install card so it's visible before AND after install.
+        # «Получить обновление» — calls auto_updater.check_now() synchronously
+        # and writes the result into the log view. Placed under the install
+        # card so it's visible before AND after install.
         self.update_link = tk.Label(
             wrap,
-            text="Проверить обновление",
+            text="Получить обновление",
             bg=BG,
             fg=MUTED,
             font=("Segoe UI", 9, "underline"),
@@ -665,22 +788,22 @@ class SetupWindow:
     def _toggle_advanced(self) -> None:
         self.adv_open = not self.adv_open
         if self.adv_open:
-            self.advanced_toggle.configure(text="▾ Расширенные настройки")
+            self.advanced_toggle.configure(text="▾ Расширенные параметры")
             self.advanced_frame.pack(fill="x", pady=(4, 0), after=self.advanced_toggle)
             self.root.geometry("520x540")
         else:
-            self.advanced_toggle.configure(text="▸ Расширенные настройки")
+            self.advanced_toggle.configure(text="▸ Расширенные параметры")
             self.advanced_frame.pack_forget()
             self.root.geometry("520x440")
 
     def _collect_creds(self) -> dict:
         blob = self.invite.get("1.0", "end").strip()
         if blob:
-            return parse_invite(blob)
+            return parse_token(blob)
         manual = {k: e.get().strip() for k, e in self.fields.items()}
         if not all(manual.values()):
             raise ValueError(
-                "Вставь invite-код или открой «Расширенные настройки» и заполни все три поля."
+                "Вставь токен установки или открой «Расширенные параметры» и заполни три поля."
             )
         if not manual["api_key"].startswith("af_"):
             raise ValueError("api_key должен начинаться с af_")
@@ -786,21 +909,33 @@ class SetupWindow:
         webbrowser.open(url)
 
     def _on_check_update(self) -> None:
-        """Call auto_updater.check_now() synchronously and surface the
-        result. Runs in the GUI thread because the call is short (single
-        HTTPS GET to api.github.com) — no need to spawn a worker."""
+        """Hit GitHub releases, verify sha256, swap binary, restart daemon.
+
+        In a PyInstaller-frozen build this runs the full download → verify →
+        in-place replace pipeline shipped by `auto_updater.check_now()`. The
+        running .exe lock is handled by the platform-specific apply step
+        (`update.bat` on Windows, `os.execv` on Unix).
+
+        From source (dev mode) GitHub releases don't ship the wheel so we
+        delegate to `_dev_update()` which does git pull + pip install + a
+        best-effort daemon restart through `schtasks` (Windows) or `pkill`
+        (Unix). Either path streams progress into the log so the user sees
+        motion.
+        """
         try:
             from agentflow_computer_mcp import __version__ as local_version
-            from agentflow_computer_mcp.auto_updater import check_now
+            from agentflow_computer_mcp.auto_updater import _is_frozen, check_now
         except Exception as exc:  # noqa: BLE001
             self._log(f"Не получилось загрузить модуль обновления: {exc}")
             return
 
+        if not _is_frozen():
+            self._dev_update(local_version)
+            return
+
         self._log("Проверяю обновление…")
         try:
-            # allow_unfrozen=True so the link works when the wizard runs
-            # outside the PyInstaller bundle (manual `python setup_gui.py`).
-            result = check_now(allow_unfrozen=True)
+            result = check_now(allow_unfrozen=False)
         except Exception as exc:  # noqa: BLE001
             self._log(f"Ошибка проверки: {exc}")
             return
@@ -817,6 +952,68 @@ class SetupWindow:
             self._log(f"Пропущено: {result.get('reason', '')}")
         else:
             self._log(f"Не получилось: {result.get('reason', '')}")
+
+    def _dev_update(self, local_version: str) -> None:
+        """Source-mode counterpart of `check_now()`: `git pull` in the
+        repo root, `pip install -e .` to refresh deps, then nudge the
+        running daemon. Each subprocess result lands in the log so a
+        broken `git pull` is visible instead of swallowed.
+        """
+        repo_root = Path(__file__).resolve().parent.parent
+        self._log(f"Источник: {repo_root}")
+        steps: list[tuple[str, list[str]]] = [
+            ("git pull", ["git", "pull", "--ff-only"]),
+            ("pip install -e .", [sys.executable, "-m", "pip", "install", "-e", "."]),
+        ]
+        for label, cmd in steps:
+            self._log(f"→ {label}")
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=repo_root,
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"  ошибка: {exc}")
+                return
+            tail = (proc.stdout or proc.stderr or "").strip().splitlines()[-2:]
+            for line in tail:
+                self._log(f"  {line[:160]}")
+            if proc.returncode != 0:
+                self._log(f"  fail ({proc.returncode})")
+                return
+        # Best-effort daemon restart. We deliberately don't fail the
+        # whole update on a missing daemon — the user can launch it from
+        # the cabinet button afterwards.
+        self._log("→ перезапуск демона")
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["schtasks", "/End", "/TN", TASK_NAME],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                subprocess.run(
+                    ["schtasks", "/Run", "/TN", TASK_NAME],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            else:
+                subprocess.run(
+                    ["pkill", "-f", "agentflow-desktop"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"  предупреждение: не получилось перезапустить ({exc})")
+        self._log(f"Готово. Версия {local_version} обновлена из исходников.")
 
     def run(self) -> None:
         self.root.mainloop()
