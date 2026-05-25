@@ -43,7 +43,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -152,7 +153,7 @@ def fetch_registry(
 
 def _find_provider(
     registry: list[dict[str, Any]], slug: str
-) -> Optional[dict[str, Any]]:
+) -> dict[str, Any] | None:
     target = slug.strip().lower()
     for entry in registry:
         if not isinstance(entry, dict):
@@ -196,7 +197,7 @@ def connect_integration(
     api_key: str,
     api_base: str = DEFAULT_API_BASE,
     chrome_open_url: Callable[[str, bool], str],
-    chrome_eval: Callable[[str, Optional[int]], str],
+    chrome_eval: Callable[[str, int | None], str],
     chrome_export_cookies: Callable[[str, str], dict[str, Any]],
     sleep: Callable[[float], None] = time.sleep,
     http_get: Callable[[str], Any] = _http_get_json,

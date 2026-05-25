@@ -16,7 +16,6 @@ import pytest
 
 from agentflow_computer_mcp.driver.tools import integrations as ci
 
-
 KWORK_ENTRY = {
     "slug": "kwork",
     "display_name": "Kwork",
