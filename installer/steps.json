@@ -66,7 +66,7 @@
       "surfaces": ["win", "mac", "linux", "hosted"],
       "required": false,
       "status": "planned",
-      "issue": "https://github.com/lnlockly/agentflow-agents/issues/TBD-pencil",
+      "issue": "https://github.com/lnlockly/agentflow-computer-mcp/issues/78",
       "unblocks_with": "Confirm canonical Pencil MCP package name and registration contract."
     },
     {
@@ -76,7 +76,7 @@
       "surfaces": ["win", "mac", "linux", "hosted"],
       "required": false,
       "status": "planned",
-      "issue": "https://github.com/lnlockly/agentflow-agents/issues/TBD-skills",
+      "issue": "https://github.com/lnlockly/agentflow-computer-mcp/issues/79",
       "unblocks_with": "Publish agentflow-skills GitHub release with versioned bundles; daemon downloads on demand."
     },
     {
@@ -86,7 +86,7 @@
       "surfaces": ["win", "mac", "linux", "hosted"],
       "required": false,
       "status": "planned",
-      "issue": "https://github.com/lnlockly/agentflow-agents/issues/TBD-mcp",
+      "issue": "https://github.com/lnlockly/agentflow-computer-mcp/issues/80",
       "unblocks_with": "Confirm local ~/.opencode/mcp.json (or equivalent) schema and decide registration order."
     },
     {
