@@ -51,6 +51,7 @@ DAEMON_EXE_NAME = "agentflow-desktop.exe"
 TRAY_EXE_NAME = "agentflow-tray.exe"
 TRAY_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 TRAY_RUN_VALUE = "AgentFlowTray"
+DAEMON_RUN_VALUE = "AgentFlowDaemon"
 
 
 def b64url_decode(s: str) -> bytes:
@@ -345,13 +346,18 @@ def install_daemon_binary() -> Path:
     return target
 
 
-def register_scheduled_task(executable: Path) -> None:
+def register_scheduled_task(executable: Path) -> tuple[bool, str]:
     """Register the daemon to autostart at user logon.
 
     Uses schtasks /XML instead of /TR because /TR's quoting is broken
     when the executable path contains spaces (e.g. `C:\\Users\\Mick
     Thomson\\…`). XML schema sidesteps all quoting and is the same
     format the Windows Task Scheduler UI exports.
+
+    Returns `(ok, detail)`. `ok=False` means the install can keep going
+    via the `HKCU\\…\\Run\\AgentFlowDaemon` fallback — Task Scheduler
+    needs `Log on as a batch job` rights or a non-locked-down policy,
+    which some corporate / Windows Home installs don't grant.
     """
     import tempfile
     from xml.sax.saxutils import escape as xml_escape
@@ -391,7 +397,7 @@ def register_scheduled_task(executable: Path) -> None:
         fp.write(xml)
         xml_path = fp.name
     try:
-        subprocess.run(
+        proc = subprocess.run(
             [
                 "schtasks",
                 "/Create",
@@ -401,7 +407,7 @@ def register_scheduled_task(executable: Path) -> None:
                 xml_path,
                 "/F",
             ],
-            check=True,
+            check=False,
             capture_output=True,
             text=True,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -411,6 +417,34 @@ def register_scheduled_task(executable: Path) -> None:
             os.unlink(xml_path)
         except OSError:
             pass
+    if proc.returncode == 0:
+        return True, ""
+    detail = ((proc.stderr or "") + (proc.stdout or "")).strip()
+    return False, f"schtasks rc={proc.returncode} {detail[:300]}"
+
+
+def register_daemon_run_key(executable: Path) -> None:
+    """Fallback autostart — `HKCU\\…\\Run\\AgentFlowDaemon = "<exe> --daemon"`.
+
+    Less robust than Task Scheduler (no rerun on crash, doesn't survive a
+    locked screen if the user is signed out) but it works on every
+    Windows edition without needing batch-job rights. Wizard falls back
+    here when `schtasks /Create` fails.
+    """
+    if os.name != "nt":
+        return
+    import winreg  # type: ignore[import-not-found]
+
+    with winreg.OpenKey(
+        winreg.HKEY_CURRENT_USER, TRAY_RUN_KEY, 0, winreg.KEY_SET_VALUE
+    ) as key:
+        winreg.SetValueEx(
+            key,
+            DAEMON_RUN_VALUE,
+            0,
+            winreg.REG_SZ,
+            f'"{executable}" --daemon',
+        )
 
 
 def launch_daemon(executable: Path) -> None:
@@ -561,8 +595,17 @@ def _run_install_steps(
     _emit(f"  → {auth_path}")
 
     _emit(f"register_scheduled_task ({TASK_NAME})")
-    register_scheduled_task(target)
-    _emit("  → task created")
+    ok, detail = register_scheduled_task(target)
+    if ok:
+        _emit("  → task created")
+    else:
+        _emit(f"  → schtasks отказал: {detail}")
+        _emit("  → fallback: HKCU\\…\\Run\\AgentFlowDaemon")
+        try:
+            register_daemon_run_key(target)
+            _emit("  → Run-key установлен")
+        except Exception as exc:  # noqa: BLE001
+            _emit(f"  → fallback тоже не сработал: {exc}")
 
     _emit("launch_daemon")
     launch_daemon(target)
