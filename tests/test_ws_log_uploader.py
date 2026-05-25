@@ -13,7 +13,6 @@ import pytest
 
 from agentflow_computer_mcp.ws_log_uploader import (
     DEFAULT_MAX_QUEUE,
-    EXC_TRUNCATE_CHARS,
     MESSAGE_TRUNCATE_CHARS,
     WsLogHandler,
     reset_for_tests,

@@ -21,6 +21,7 @@ recent error trail without the user touching the disk.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import platform
@@ -93,10 +94,8 @@ def init_logging(
     if force:
         for handler in list(root.handlers):
             root.removeHandler(handler)
-            try:
+            with contextlib.suppress(Exception):
                 handler.close()
-            except Exception:  # noqa: BLE001
-                pass
     root.setLevel(resolved_level)
 
     formatter = logging.Formatter(LOG_FORMAT)
