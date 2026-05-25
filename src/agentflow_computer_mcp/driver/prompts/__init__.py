@@ -16,6 +16,7 @@ from .browser import BROWSER_EFFICIENCY, TASK_EFFICIENCY
 from .cabinet import CABINET_MAP
 from .coding import CODING_WORKFLOW
 from .element import ELEMENT_BLOCK
+from .integrations import INTEGRATIONS_BLOCK
 from .intent import intent_map
 from .knowledge import KNOWLEDGE, PITFALLS, VISIBILITY
 from .lolzteam import LOLZTEAM_BLOCK
@@ -56,6 +57,7 @@ def build_system_prompt(window_summary: str, af_tools_present: bool) -> str:
         f"{CABINET_MAP}"
         f"{ELEMENT_BLOCK}"
         f"{LOLZTEAM_BLOCK}"
+        f"{INTEGRATIONS_BLOCK}"
         f"{TASK_EFFICIENCY}"
         f"{VISIBILITY}"
         "Scope hard rules: paths `~/.ssh`, `~/.config`, `~/Library/Keychains`, `~/.aws`, `~/.gnupg` всегда запрещены "
