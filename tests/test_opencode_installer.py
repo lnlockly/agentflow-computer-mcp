@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import json
 import platform
+import sys
 import tarfile
 import zipfile
 from pathlib import Path
@@ -180,6 +181,10 @@ def _fake_urlopen_factory(release_json: dict[str, Any], asset_bytes: bytes):
     return _fake_urlopen
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="NTFS не хранит exec-bit — assert st_mode & 0o111 даст 0 даже после chmod +x. Real exec-bit pinning тестируется на Linux/macOS runner'ах.",
+)
 def test_install_opencode_happy_path_macos(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     with patch.object(platform, "system", return_value="Darwin"), patch.object(
