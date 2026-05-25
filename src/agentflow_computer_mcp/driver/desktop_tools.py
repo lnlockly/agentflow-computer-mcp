@@ -24,7 +24,7 @@ from ..config import Scope, load_scope, scope_from_mapping
 from ..confirm import confirm, confirm_summary
 from ..platform import PLATFORM, backend
 from ..scope import requires_confirm
-from ..tools import clipboard, keyboard, mouse, screen, window
+from ..tools import clipboard, keyboard, mouse, opencode_installer, screen, window
 from ..tools import code as code_tool
 from ..tools import screen_record as screen_record_tool
 from .af_client import AF_TOOL_DESCRIPTORS, AFClient, dispatch_af_tool
@@ -917,6 +917,53 @@ DESKTOP_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "opencode_install",
+        "description": (
+            "Install the OpenCode CLI (https://github.com/sst/opencode) into "
+            "~/.agentflow/bin. Auto-detects the host OS/arch and pulls the "
+            "matching release archive from GitHub. Re-running overwrites the "
+            "existing binary. Returns {ok, version, binary_path, bytes}."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "version": {
+                    "type": "string",
+                    "description": "Release tag (e.g. v1.15.10) or 'latest'.",
+                    "default": "latest",
+                },
+            },
+        },
+    },
+    {
+        "name": "opencode_patch_config",
+        "description": (
+            "Write/merge ~/.config/opencode/opencode.json (Windows: "
+            "%APPDATA%\\opencode\\opencode.json) so OpenCode routes through "
+            "the AgentFlow LLM gateway. Existing provider entries are "
+            "preserved; the top-level model is only switched when empty or "
+            "already pointing at agentflow/*. If api_key is omitted the "
+            "daemon's enrolled auth.json key is used."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "api_key": {"type": "string"},
+                "base_url": {"type": "string"},
+                "model": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "opencode_status",
+        "description": (
+            "Report whether OpenCode is installed and configured for "
+            "AgentFlow: {binary_path, binary_present, config_path, "
+            "config_present}. Cheap — no shell calls."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "task_complete",
         "description": "Finish with answer.",
         "input_schema": {
@@ -1295,6 +1342,52 @@ class ToolExecutor:
         if name == "start_app":
             self._announce("start_app", f"name={args.get('name', '')}")
             return start_app(args.get("name", "")), None
+        if name == "opencode_install":
+            version = str(args.get("version", "latest"))
+            self._announce("opencode_install", f"version={version}")
+            try:
+                result = opencode_installer.install_opencode(version=version)
+                return json.dumps(result, ensure_ascii=False), None
+            except Exception as exc:  # noqa: BLE001
+                return json.dumps({"ok": False, "error": str(exc)}), None
+        if name == "opencode_patch_config":
+            self._announce(
+                "opencode_patch_config", f"model={args.get('model') or 'default'}"
+            )
+            key = args.get("api_key")
+            if not key and self._af is not None:
+                # AFClient stores its key on a private slot; reuse it so the
+                # driver doesn't need a second copy of auth.json.
+                key = getattr(self._af, "_key", "") or getattr(self._af, "api_key", "") or ""
+            if not key:
+                return json.dumps({"ok": False, "error": "no_api_key"}), None
+            try:
+                result = opencode_installer.patch_opencode_config(
+                    api_key=key,
+                    base_url=args.get("base_url"),
+                    model=args.get("model"),
+                )
+                return json.dumps(result, ensure_ascii=False), None
+            except Exception as exc:  # noqa: BLE001
+                return json.dumps({"ok": False, "error": str(exc)}), None
+        if name == "opencode_status":
+            try:
+                binary = opencode_installer.opencode_binary_path()
+                cfg = opencode_installer.opencode_config_path()
+                return (
+                    json.dumps(
+                        {
+                            "binary_path": str(binary),
+                            "binary_present": binary.exists(),
+                            "config_path": str(cfg),
+                            "config_present": cfg.exists(),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                return json.dumps({"ok": False, "error": str(exc)}), None
         if name == "task_complete":
             return "__DONE__", None
         return f"unknown tool: {name}", None
