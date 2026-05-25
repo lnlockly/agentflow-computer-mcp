@@ -4,8 +4,6 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import platform
-import sys
 import time
 import urllib.error
 import urllib.request
@@ -17,6 +15,11 @@ from .desktop_tools import (
     get_window_list,
     jpeg_b64_full,
 )
+from .prompts import (
+    HOST_OS,  # noqa: F401 — re-exported for installer-smoke + downstream
+    HOST_OS_RELEASE,  # noqa: F401 — re-exported, used by health probes
+    build_system_prompt,
+)
 from .state import DriverState
 from .streamer import compress_png_for_viewer
 
@@ -27,6 +30,7 @@ DEFAULT_LLM_URL = "https://agentflow.website/_agents/llm/v1/messages"
 # scope-level model override (per task) still wins.
 DEFAULT_MODEL = os.environ.get("AF_DESKTOP_MODEL", "claude-sonnet-4-6")
 MAX_ITERS = 40
+HISTORY_IMAGE_KEEP_RECENT_MESSAGES = 1
 
 
 def _env_int(name: str, default: int) -> int:
@@ -56,10 +60,13 @@ def _env_float(name: str, default: float) -> float:
 
 
 # Per-task hard caps. Configurable via env so ops can tune without a redeploy.
-# Defaults: 50 tool calls and $0.50 USD spend — generous for normal tasks,
-# cheap-fail for runaway agent loops.
+# Defaults: 50 tool calls and $2 USD spend — generous for normal tasks,
+# cheap-fail for runaway agent loops. Per-task scope.budget_usd overrides
+# this when the dispatch frame supplies one, and `~/.agentflow/computer-scope.toml`
+# `budget_usd` lifts the floor at daemon-config load time (see the scope-aware
+# fallback in run_task's caller).
 LOOP_MAX_STEPS = _env_int("LOOP_MAX_STEPS", 50)
-LOOP_MAX_USD = _env_float("LOOP_MAX_USD", 0.50)
+LOOP_MAX_USD = _env_float("LOOP_MAX_USD", 2.0)
 # Reflection cadence. Every Nth tool call we inject a "are you on track?"
 # turn; 0 disables. Short tasks (< 3 steps) skip the check regardless.
 LOOP_CHECKPOINT_EVERY = _env_int("LOOP_CHECKPOINT_EVERY", 8)
@@ -68,265 +75,9 @@ LOOP_CHECKPOINT_EVERY = _env_int("LOOP_CHECKPOINT_EVERY", 8)
 # on track".
 CHECKPOINT_MIN_STEPS = 3
 
-# Host platform string, captured once at module load. Used by build_system_prompt
-# to inject an OS-context block so the LLM doesn't try osascript on Windows
-# or PowerShell on macOS. `platform.system()` returns 'Darwin' | 'Linux' |
-# 'Windows' which lines up with the documentation tone we want in the prompt.
-HOST_OS = platform.system()
-HOST_OS_RELEASE = platform.release()
-
-
-def _current_os() -> str:
-    """One of 'macos' | 'linux' | 'windows' — used to swap the OS-specific
-    section of the intent map so the model doesn't try to drive Mail.app
-    on Ubuntu or hit Cmd+Space on a Windows box."""
-    if sys.platform.startswith("darwin"):
-        return "macos"
-    if sys.platform.startswith("linux"):
-        return "linux"
-    if sys.platform.startswith("win"):
-        return "windows"
-    # Best-effort fallback — treat anything exotic as Linux since the
-    # Linux block is the most generic (browser-first, no native keybinds).
-    return "linux"
-
-
-_OS_INTENT_BLOCK = {
-    "macos": (
-        "  • «открой Mail / проверь почту» → activate_app('Mail') → wait 0.5 → screen_region.\n"
-        "  • «напиши email на X тему Y» → activate_app('Mail') → keypress Cmd+N → "
-        "Tab-driven type To/Subject/body. НЕ нажимай Send без явного «отправляй».\n"
-        "  • «открой Terminal / iTerm» → activate_app('iTerm2') или activate_app('Terminal'); "
-        "wait 0.4 → read_terminal.\n"
-        "  • shell-shortcuts: Cmd+C / Cmd+V / Cmd+Space (Spotlight).\n"
-    ),
-    "linux": (
-        "  • «открой почту / проверь mail» → если Thunderbird установлен — activate_app('Thunderbird'), "
-        "иначе browser_open + browser_navigate https://mail.google.com (Gmail web).\n"
-        "  • «напиши email на X тему Y» — на Linux браузерный Gmail надёжнее десктопного клиента: "
-        "browser_open + navigate https://mail.google.com → browser_click 'Compose' → "
-        "fill To/Subject/body. НЕ нажимай Send без явного «отправляй».\n"
-        "  • «открой Terminal» → activate_app('gnome-terminal') / 'konsole' / 'xterm' "
-        "(пробуй в этом порядке).\n"
-        "  • shell-shortcuts: Ctrl+C / Ctrl+V; нет Spotlight — используй активацию окна.\n"
-    ),
-    "windows": (
-        "  • «открой почту / проверь mail» → если Outlook установлен — activate_app('Outlook'), "
-        "иначе browser_open + browser_navigate https://outlook.live.com или https://mail.google.com.\n"
-        "  • «напиши email на X тему Y» — браузерный путь обычно надёжнее десктопного: "
-        "browser_open + соответствующий navigate, потом fill полей. НЕ нажимай Send без явного «отправляй».\n"
-        "  • «открой Terminal» → activate_app('WindowsTerminal') (Windows Terminal), "
-        "fallback 'powershell' или 'cmd'.\n"
-        "  • shell-shortcuts: Ctrl+C / Ctrl+V; Win+R = Run dialog (аналог Spotlight).\n"
-    ),
-}
-
-
-def build_system_prompt(window_summary: str, af_tools_present: bool) -> str:
-    af_block = ""
-    if af_tools_present:
-        af_block = (
-            "\nAgentFlow API tools (`af_*`) — используй их вместо UI-кликов когда возможно:\n"
-            "  • af_list_projects / af_get_project / af_create_project / af_approve_project — проекты.\n"
-            "  • af_list_devices / af_get_device — мои desktop-машины.\n"
-            "  • af_list_agents / af_send_agent_message — общение с агентами маркетплейса.\n"
-            "  • af_send_telegram_message(chat_id, text) — отправить TG-сообщение через MCP.\n"
-            "      chat_id='me' → Saved Messages. chat_id='1361064246' → owner.\n"
-            "  • af_telegram_dialogs / af_telegram_messages / af_telegram_search / "
-            "af_telegram_react / af_telegram_whoami — читать TG без UI-кликов.\n"
-            "  • af_post_matrix_room(room_id, text) — Matrix-сообщение через MCP.\n"
-            "  • af_recall(tags=[...], limit=20) — на старте задачи вспомни уроки прошлых "
-            "прогонов в этом домене (kwork, mail, captcha). Newest-first.\n"
-            "  • af_remember(kind='lesson'|'observation'|'fact', text=..., tags=[...]) — "
-            "в конце задачи запиши что сработало / что нет.\n"
-        )
-
-    # Concrete mapping from common user phrases to the right tool. The model
-    # needs this because "напиши в TG" used to trigger UI-driven Telegram-app
-    # automation, which was slow, brittle, and visually noisy. The af_* path
-    # is silent, idempotent, and works even when the Telegram window is
-    # closed.
-    intent_map = (
-        "\nКонкретные сопоставления (запрос юзера → инструмент):\n"
-        "  • «напиши в TG / отправь сообщение в Telegram / в Saved» → "
-        "af_send_telegram_message(chat_id='me', text=...). НЕ открывай приложение Telegram.\n"
-        "  • «напиши в TG юзеру X / chat_id N» → af_send_telegram_message(chat_id=N, text=...).\n"
-        "  • «покажи последние диалоги в TG / что у меня в Telegram» → af_telegram_dialogs(limit=20).\n"
-        "  • «прочитай переписку с X / что писал Y» → af_telegram_search(q=\"X\") → "
-        "af_telegram_messages(chat_id=<found>).\n"
-        "  • «ответь Y / напиши Y» — если Y не chat_id: af_telegram_search(q=\"Y\") → возьми первый "
-        "chat_id → af_send_telegram_message.\n"
-        "  • «поставь лайк на сообщение в чате X» → af_telegram_react(chat_id, message_id, emoji='👍').\n"
-        "  • «напиши в Matrix / в комнату X» → af_post_matrix_room(room_id=..., text=...).\n"
-        f"{_OS_INTENT_BLOCK[_current_os()]}"
-        "  • «открой kwork / kwork.ru / посмотри заказы на kwork / посмотри письма в браузере / "
-        "открой Firefox / Telegram Web» → firefox_open → firefox_navigate <url> → "
-        "firefox_snapshot → firefox_eval. firefox_* запускает РЕАЛЬНЫЙ Firefox юзера с его "
-        "профилем — он уже залогинен в kwork / TG Web / mail. browser_* (headed Chromium) — "
-        "только для анонимного скрейпа.\n"
-        "  • «открой документ X / напиши в файл» → fs.write (с подтверждением), либо открой через "
-        "activate_app соответствующего редактора, потом keypress/type.\n"
-        "  • «прочитай экран / что сейчас открыто» → screen_capture + краткое описание.\n"
-        "  • «напиши код для X / сделай скрипт Y» → активируй редактор (Cursor / VSCode / iTerm), "
-        "читай существующий код через code_read_file, правь через code_edit_file/code_write_file "
-        "(с подтверждением). Перед изменением — короткий план в text-блоке.\n"
-        "  • «сделай проект Y / реализуй X как отдельный сервис» → af_spawn_subagent(brief=...) "
-        "и стриминг прогресса через af_get_project_events. Не пытайся сделать всё внутри одного "
-        "task если scope большой.\n"
-        "  • «запусти под-агента / делегируй X» → af_spawn_subagent(brief=...). После старта верни "
-        "project_id и slug, не жди до конца если время > 60с.\n"
-        "  • «запиши видео экрана / сохрани видео что я делаю / clip последних N секунд» → "
-        "screen_record_start(path=~/Movies/agentflow-<ts>.mp4, max_duration_s=120) → выполняй задачу → "
-        "screen_record_stop. Если пользователь скажет «достаточно» / «хватит» — screen_record_stop сразу.\n"
-        "  • Не запускай запись без явной просьбы. После stop напиши путь к файлу и его размер "
-        "в task_complete.\n"
-    )
-
-    browser_efficiency = (
-        "\nBrowser efficiency (use these patterns, not screenshot+click):\n"
-        "  • Чтобы извлечь данные с веба — browser_eval с JS-выражением, не screenshot+OCR:\n"
-        "    browser_eval(\"Array.from(document.querySelectorAll('.card')).map(c => c.innerText).slice(0,10)\")\n"
-        "  • Чтобы заполнить форму — browser_fill(selector, value), не activate_app + type.\n"
-        "  • Чтобы нажать кнопку — browser_click(selector с aria-label или text content).\n"
-        "  • Когда сайт уже открыт у юзера в браузере (kwork.ru, Telegram Web) — это другой\n"
-        "    реальный браузер с сессией; используй chrome_eval / chrome_open_url (не headed\n"
-        "    Chromium). browser_* открывает чистую сессию без логина юзера.\n"
-        "  • Перед browser_click — всегда browser_snapshot чтобы убедиться элемент существует.\n"
-        "    Не кликай по координатам — клик по селектору идемпотентен.\n"
-    )
-
-    task_efficiency = (
-        "\nЭффективность простых задач:\n"
-        "  • Прочитать что в Telegram — af_recall(tags=['tg']) или browser_eval на Telegram Web,\n"
-        "    НЕ activate_app + screenshot.\n"
-        "  • Открыть kwork — chrome_open_url https://kwork.ru/projects если юзер залогинен\n"
-        "    в Chrome, иначе browser_open + DOM extraction.\n"
-        "  • Не больше 3 итераций на простое чтение. Если 3 шага не дали результат — task_complete\n"
-        "    с честным «не получилось, нужно X» вместо бесконечного цикла.\n"
-    )
-
-    coding_workflow = (
-        "\nCoding workflow:\n"
-        "  1. Read first: code_list_dir для обзора, code_read_file для конкретных файлов. "
-        "Не редактируй вслепую.\n"
-        "  2. Batch edits: один code_edit_file per logical change. Большие новые файлы → "
-        "code_write_file(mode='replace'). Дописать в конец → mode='append'.\n"
-        "  3. Run + react: после code_run_command всегда читай stderr. Если exit_code != 0 — "
-        "fix по stderr перед следующим шагом, не повторяй ту же команду.\n"
-        "  4. Delegate when big: фича на 3+ файла или новый сервис — af_spawn_subagent, не "
-        "пиши руками на десктопе.\n"
-    )
-
-    memory_block = ""
-    if af_tools_present:
-        memory_block = (
-            "\nПамять задач (af_remember / af_recall):\n"
-            "  • На старте долгой/повторяющейся задачи (kwork, mail, captcha-обходы) — "
-            "af_recall(tags=['<domain>']) и прочти 5-10 свежих lessons.\n"
-            "  • В конце задачи — af_remember(kind='lesson', tags=['<domain>', '<action>'], "
-            "text='короткое утверждение: что сделал и что узнал'). Тэги — короткие, в нижнем регистре.\n"
-        )
-
-    visibility_block = (
-        "\nВизуализация для юзера:\n"
-        "  • Перед каждым tool_use делай text-блок с одной строкой что ты сейчас будешь делать "
-        "(«открываю kwork.ru», «пишу в Saved Messages», «читаю iTerm»). Юзер видит это в action timeline.\n"
-        "  • Между шагами — короткие констатации факта («нашёл 10 заказов», «отправлено, message_id=…»). "
-        "Не пиши простыни рассуждений. Никаких 'really/simply/actually/literally'.\n"
-        "  • Когда задача про сообщение — task_complete с message_id или подтверждением, а не пересказ "
-        "того что ты написал.\n"
-    )
-
-    os_label = {"macos": "Mac", "linux": "Linux", "windows": "Windows"}[_current_os()]
-
-    # OS-aware tool guidance. The agent boots on whatever host the user runs
-    # — macOS, Windows, or Linux — and historically had a Mac-centric prompt
-    # that pushed it to call osascript / pbcopy / AppleScript on Windows.
-    # This block hard-pins which tools are real on the current host so the
-    # LLM stops reaching for nonexistent commands.
-    os_context = (
-        f"\nОС хоста: {HOST_OS} ({HOST_OS_RELEASE})\n"
-        "Доступные инструменты — только те, что работают на этой ОС:\n"
-        "  • macOS:   AppleScript (osascript), Quartz screen capture, pbcopy/pbpaste, "
-        "chrome_open_url / chrome_eval / chrome_tabs (через AppleScript), read_terminal "
-        "(iTerm/Terminal через AppleScript), `open -a <App>`.\n"
-        "  • Windows: PowerShell (`powershell -Command \"...\"`) через powershell_exec, "
-        "winget_search / winget_install для пакетов, pywin32 windows через activate_app, "
-        "pyperclip для буфера. Chrome — только через chrome_open_url + chrome_eval "
-        "(headed Chromium / Firefox), НЕ AppleScript.\n"
-        "  • Linux:   bash, xdotool / wmctrl (X11) либо wl-tools (Wayland), xclip / wl-copy "
-        "для буфера, `xdg-open <url>` для дефолтного браузера.\n"
-    )
-    if HOST_OS == "Darwin":
-        os_context += (
-            "\nТы на macOS: AppleScript-инструменты разрешены. НЕ зови powershell_exec / winget_*.\n"
-        )
-    elif HOST_OS == "Windows":
-        os_context += (
-            "\nТы на Windows: osascript / AppleScript / pbcopy / `open -a` НЕДОСТУПНЫ. "
-            "Для shell — powershell_exec. Для запуска приложений — start_app(name). "
-            "Для установки софта — winget_search / winget_install. Chrome через chrome_open_url "
-            "+ chrome_eval (headed). read_terminal вернёт PowerShell history, а не iTerm.\n"
-        )
-    else:
-        os_context += (
-            "\nТы на Linux: AppleScript / PowerShell / winget недоступны. Используй bash через "
-            "code_run_command, xdg-open для браузера, activate_app для X11/Wayland окон.\n"
-        )
-
-    # Knowledge block for terms that the LLM consistently confuses across
-    # OS contexts. «Кодекс» = OpenAI Codex CLI / web app, NOT agentflow's
-    # llm-cabinet. Package managers are OS-specific.
-    knowledge = (
-        "\nСправочник терминов и инструментов:\n"
-        "  • Codex / Кодекс = OpenAI Codex (https://chatgpt.com/codex или CLI `npm i -g @openai/codex`). "
-        "Это НЕ agentflow.website/llm-cabinet — кабинет это наш биллинг LLM-ключей.\n"
-        "  • npm / node / git — кросс-платформенные. Установка: macOS `brew install node git`; "
-        "Windows `winget install OpenJS.NodeJS Git.Git`; Linux `apt install nodejs git`.\n"
-        "  • Vercel CLI: `npm i -g vercel`. Логин — `vercel login`.\n"
-        "  • Package managers по ОС: macOS `brew`, Windows `winget` / `scoop`, Linux `apt` / `dnf` / `pacman`.\n"
-        "  • Перед `winget install <id>` сначала `winget_search <query>` чтобы получить точный Id.\n"
-    )
-
-    # Known foot-guns that come up in incident reports. Keep this block
-    # short — the LLM ignores walls of text. One line per gap, written as
-    # a rule the model can apply at decision time.
-    pitfalls = (
-        "\nИзвестные подводные камни:\n"
-        "  • Windows-хост: `osascript` / AppleScript / `open -a` НЕДОСТУПНЫ. Используй "
-        "chrome_open_url, powershell_exec, start_app.\n"
-        "  • Codex ≠ AgentFlow. «Кодекс» = OpenAI Codex (chatgpt.com/codex или CLI). "
-        "agentflow.website/llm-cabinet — это биллинг LLM-ключей, не редактор кода.\n"
-        "  • Перед загрузкой больших файлов проверь свободное место: `shutil.disk_usage` "
-        "через code_run_command, не качай вслепую.\n"
-        "  • Если задача меньше 3 шагов — не делай чекпоинт-рефлексию, это лишний LLM-вызов.\n"
-    )
-
-    return (
-        f"Ты управляешь {os_label} пользователя. Перед действием — короткая мысль в text-блоке. "
-        "Не извиняйся, не повторяй очевидное. Стратегия:\n"
-        "  • для содержимого окон: activate_app → wait 0.5 → screen_region(bounds) — быстро и детально.\n"
-        "  • для содержимого терминала: read_terminal даёт точный текст активной вкладки.\n"
-        "  • для веб-задач (открыть сайт, прочитать DOM, нажать кнопку): browser_open → browser_navigate → "
-        "browser_snapshot → browser_click/browser_fill/browser_press/browser_eval. Это headed Chromium, "
-        "ОТДЕЛЬНЫЙ от пользовательского браузера. Видим в live viewer.\n"
-        "  • для авторизованного веба (где у юзера уже залогинено): chrome_eval / chrome_open_url — реальный "
-        "Google Chrome с его сессией.\n"
-        f"{os_context}"
-        f"{knowledge}"
-        f"{pitfalls}"
-        f"{af_block}"
-        f"{intent_map}"
-        f"{browser_efficiency}"
-        f"{memory_block}"
-        f"{coding_workflow}"
-        f"{task_efficiency}"
-        f"{visibility_block}"
-        "Scope hard rules: paths `~/.ssh`, `~/.config`, `~/Library/Keychains`, `~/.aws`, `~/.gnupg` всегда запрещены "
-        "к чтению/записи. fs.write и shell.exec требуют подтверждения. Не пытайся это обходить.\n"
-        f"Окна сейчас:\n{window_summary}\n"
-        "Когда выполнил — task_complete с кратким ответом. Отвечай по-русски."
-    )
+# Prompt blocks (cabinet, terminal, element, intent map, etc.) live under
+# driver/prompts/. build_system_prompt is re-imported at the top of this
+# module from .prompts so callers don't change.
 
 
 class TaskCancelled(Exception):
@@ -650,6 +401,14 @@ def _budget_record_llm(model: str, usage: dict[str, Any]) -> float:
         return 0.0
 
 
+def _usage_total_tokens(usage: dict[str, Any]) -> int:
+    """Best-effort total tokens across one LLM response payload."""
+    try:
+        return int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0)
+    except Exception:
+        return 0
+
+
 def _memory_save_outcome(
     task: str,
     *,
@@ -833,6 +592,138 @@ def _fetch_skills_prompt_block(af_client: Any) -> str:
     return block.strip() if isinstance(block, str) else ""
 
 
+def _tool_failure_reason(tool_name: str, out: Any) -> str | None:
+    """Return a concise failure reason when a tool output represents failure."""
+    if tool_name == "task_complete":
+        return None
+    if not isinstance(out, str):
+        return None
+    stripped = out.strip()
+    lower = stripped.lower()
+    if lower.startswith("error:") or lower.startswith("firefox error:") or lower.startswith("unknown tool:"):
+        return stripped[:200]
+    try:
+        parsed = json.loads(stripped)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    if parsed.get("ok") is False:
+        detail = str(parsed.get("error") or stripped)
+        return detail[:200]
+    exit_code = parsed.get("exit_code")
+    if isinstance(exit_code, int) and exit_code != 0:
+        detail = str(parsed.get("stderr") or "").strip() or f"exit_code={exit_code}"
+        return detail[:200]
+    return None
+
+
+def _tool_is_observation_only(tool_name: str) -> bool:
+    if tool_name.startswith("af_list_") or tool_name.startswith("af_get_"):
+        return True
+    return tool_name in {
+        "af_telegram_dialogs",
+        "af_telegram_messages",
+        "af_telegram_search",
+        "af_telegram_whoami",
+        "browser_eval",
+        "browser_snapshot",
+        "chrome_eval",
+        "chrome_tabs",
+        "code_list_dir",
+        "code_read_file",
+        "goal_list",
+        "goal_show",
+        "list_windows",
+        "read_terminal",
+        "screen_capture",
+        "screen_record_status",
+        "screen_region",
+        "winget_search",
+    }
+
+
+def _content_has_image(blocks: list[dict[str, Any]]) -> bool:
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "image":
+            return True
+        nested = block.get("content")
+        if isinstance(nested, list) and _content_has_image(nested):
+            return True
+    return False
+
+
+def _compact_content_images(blocks: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+    compacted: list[dict[str, Any]] = []
+    removed_any = False
+    for block in blocks:
+        if not isinstance(block, dict):
+            compacted.append(block)
+            continue
+        if block.get("type") == "image":
+            removed_any = True
+            continue
+        nested = block.get("content")
+        if isinstance(nested, list):
+            nested_compacted, nested_removed = _compact_content_images(nested)
+            if nested_removed:
+                removed_any = True
+                block = {**block, "content": nested_compacted}
+        compacted.append(block)
+    if removed_any:
+        compacted.append(
+            {
+                "type": "text",
+                "text": "[earlier screenshot omitted from history to bound memory]",
+            }
+        )
+    return compacted, removed_any
+
+
+def _compact_message_history(messages: list[dict[str, Any]]) -> None:
+    image_message_indexes: list[int] = []
+    for idx, message in enumerate(messages):
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        if _content_has_image(content):
+            image_message_indexes.append(idx)
+
+    keep = set(image_message_indexes[-HISTORY_IMAGE_KEEP_RECENT_MESSAGES:])
+    for idx in image_message_indexes:
+        if idx in keep:
+            continue
+        content = messages[idx].get("content")
+        if not isinstance(content, list):
+            continue
+        compacted, removed_any = _compact_content_images(content)
+        if not removed_any:
+            continue
+        messages[idx]["content"] = compacted
+
+
+def _task_complete_answer_indicates_failure(answer: str) -> bool:
+    text = answer.strip().lower()
+    if not text:
+        return False
+    failure_markers = (
+        "❌",
+        "задача не выполн",
+        "не выполнена",
+        "не удалось",
+        "невозможно",
+        "заблокирован",
+        "cannot ",
+        "can't ",
+        "failed",
+        "blocked",
+        "unable to",
+    )
+    return any(marker in text for marker in failure_markers)
+
+
 def run_task(
     task: str,
     state: DriverState,
@@ -842,6 +733,7 @@ def run_task(
     llm_url: str = DEFAULT_LLM_URL,
     model: str = DEFAULT_MODEL,
     max_iters: int = MAX_ITERS,
+    max_usd: float = LOOP_MAX_USD,
 ) -> str:
     update_live(state, "start", task)
     wins = get_window_list()
@@ -932,8 +824,11 @@ def run_task(
     tool_calls_count = 0
     tools_used: list[str] = []
     total_cost_usd = 0.0
+    total_tokens_used = 0
     last_checkpoint_at = 0
     abandon_reason: str | None = None
+    unresolved_tool_error: str | None = None
+    budget_finalization_turn_allowed = False
 
     def _emit_abort(reason: str, kind: str) -> str:
         """Emit task_error + persist outcome lesson, then return.
@@ -969,13 +864,13 @@ def run_task(
         if state.abort_flag.is_set():
             return _emit_cancel()
 
-        # Cost cap: check before issuing the next LLM call so a runaway
-        # task doesn't burn one final $0.X call past the limit.
-        if total_cost_usd >= LOOP_MAX_USD:
+        in_budget_finalization_turn = total_cost_usd >= max_usd and budget_finalization_turn_allowed
+        if total_cost_usd >= max_usd and not in_budget_finalization_turn:
             return _emit_abort(
-                f"cost_cap_exceeded: spent ${total_cost_usd:.4f} >= ${LOOP_MAX_USD:.2f}",
+                f"cost_cap_exceeded: spent ${total_cost_usd:.4f} >= ${max_usd:.2f}",
                 "cost_cap",
             )
+        budget_finalization_turn_allowed = False
 
         iterations = i + 1
         print(f"\n--- iter {iterations} ---", flush=True)
@@ -1003,7 +898,9 @@ def run_task(
             update_live(state, "error", f"api error: {resp}")
             return ""
 
-        total_cost_usd += _budget_record_llm(model, resp.get("usage") or {})
+        usage = resp.get("usage") or {}
+        total_cost_usd += _budget_record_llm(model, usage)
+        total_tokens_used += _usage_total_tokens(usage)
 
         content = resp.get("content", [])
         texts = [b["text"] for b in content if b.get("type") == "text"]
@@ -1016,6 +913,11 @@ def run_task(
 
         if not tool_uses:
             print(f"\n=== END (no tools, stop_reason={resp.get('stop_reason')}) ===", flush=True)
+            if unresolved_tool_error:
+                return _emit_abort(
+                    f"completion_blocked_after_tool_error: {unresolved_tool_error}",
+                    "completion_blocked",
+                )
             # Persist a success outcome — the model finished without further tools.
             _memory_save_outcome(
                 task,
@@ -1025,6 +927,15 @@ def run_task(
                 answer=final_answer or thinking,
             )
             return final_answer
+
+        # Once we enter the single grace turn after hitting the budget cap,
+        # only a terminal task_complete is allowed. Any further non-terminal
+        # tool work gets blocked before the executor mutates more state.
+        if in_budget_finalization_turn and any(tu.get("name") != "task_complete" for tu in tool_uses):
+            return _emit_abort(
+                f"cost_cap_exceeded: spent ${total_cost_usd:.4f} >= ${max_usd:.2f}",
+                "cost_cap",
+            )
 
         messages.append({"role": "assistant", "content": content})
         results: list[dict[str, Any]] = []
@@ -1054,9 +965,24 @@ def run_task(
                 tu["name"],
                 f"args: {args_preview}\nresult: {out[:600] if isinstance(out, str) else out}",
             )
+            failure = _tool_failure_reason(tu["name"], out)
+            if failure:
+                unresolved_tool_error = f"{tu['name']}: {failure}"[:240]
+            elif tu["name"] != "task_complete" and not _tool_is_observation_only(tu["name"]):
+                unresolved_tool_error = None
             if out == "__DONE__":
-                done = True
                 final_answer = tu["input"].get("answer", "")
+                if unresolved_tool_error:
+                    return _emit_abort(
+                        f"completion_blocked_after_tool_error: {unresolved_tool_error}",
+                        "completion_blocked",
+                    )
+                if _task_complete_answer_indicates_failure(final_answer):
+                    return _emit_abort(
+                        f"task_complete_reported_failure: {final_answer[:200]}",
+                        "completion_blocked",
+                    )
+                done = True
                 results.append({"type": "tool_result", "tool_use_id": tu["id"], "content": "ok"})
                 continue
             if image is not None:
@@ -1082,6 +1008,7 @@ def run_task(
                     {"type": "tool_result", "tool_use_id": tu["id"], "content": str(out)}
                 )
         messages.append({"role": "user", "content": results})
+        _compact_message_history(messages)
 
         if hit_step_cap:
             return _emit_abort(
@@ -1106,11 +1033,14 @@ def run_task(
                         "task_id": state.current_task_id,
                         "answer": final_answer,
                         "iterations": iterations,
-                        "tokens_used": 0,
+                        "tokens_used": total_tokens_used,
                         "cost_usd": round(total_cost_usd, 6),
                     }
                 )
             return final_answer
+
+        if total_cost_usd >= max_usd:
+            budget_finalization_turn_allowed = True
 
         # Checkpoint reflection: fires every LOOP_CHECKPOINT_EVERY tool calls,
         # but skips when the task is too short to warrant the overhead. The
@@ -1126,7 +1056,9 @@ def run_task(
             check = _request_checkpoint(
                 llm_url, api_key, model, system_msg, messages, state.abort_flag
             )
-            total_cost_usd += _budget_record_llm(model, check.get("usage") or {})
+            check_usage = check.get("usage") or {}
+            total_cost_usd += _budget_record_llm(model, check_usage)
+            total_tokens_used += _usage_total_tokens(check_usage)
             on_track = bool(check.get("on_track", True))
             next_step = (check.get("next_step") or "").strip()
             reason = check.get("abandon_reason")
@@ -1168,22 +1100,22 @@ def run_task(
     if state.current_task_id:
         state.publish_outbound(
             {
-                "type": "task_complete",
+                "type": "task_error",
                 "task_id": state.current_task_id,
-                "answer": final_answer,
-                "iterations": iterations,
-                "tokens_used": 0,
-                "cost_usd": round(total_cost_usd, 6),
+                "error": f"max_iters reached ({max_iters})",
             }
         )
     return final_answer
 
 
-def _normalize_task_entry(entry: Any) -> tuple[str, str]:
-    """Accept legacy str entries or new (id, task) tuples uniformly."""
-    if isinstance(entry, tuple) and len(entry) == 2:
-        return str(entry[0]), str(entry[1])
-    return f"local-{int(time.time() * 1000)}", str(entry)
+def _normalize_task_entry(entry: Any) -> tuple[str, str, dict[str, Any] | None]:
+    """Accept legacy str entries and newer queue tuples uniformly."""
+    if isinstance(entry, tuple):
+        if len(entry) == 3:
+            return str(entry[0]), str(entry[1]), entry[2] if isinstance(entry[2], dict) else None
+        if len(entry) == 2:
+            return str(entry[0]), str(entry[1]), None
+    return f"local-{int(time.time() * 1000)}", str(entry), None
 
 
 def task_worker(
@@ -1196,19 +1128,37 @@ def task_worker(
 ) -> None:
     """Blocking loop: pull tasks off the queue, run them sequentially."""
     update_live(state, "idle", "ожидаю задачу из чат-инпута")
-    while True:
+    while not state.shutdown_flag.is_set():
         try:
             raw = state.task_queue.get(timeout=1)
         except Exception:  # noqa: BLE001 — queue.Empty
             if not state.busy and (int(time.time()) % 60 == 0):
                 update_live(state, "idle", "ожидаю задачу")
             continue
-        task_id, task = _normalize_task_entry(raw)
+        task_id, task, task_scope = _normalize_task_entry(raw)
         state.busy = True
         state.current_task = task
         state.current_task_id = task_id
         try:
-            run_task(task, state, executor, api_key, llm_url=llm_url, model=model)
+            executor.apply_task_scope(task_scope)
+            # Precedence: per-task scope.budget_usd > base scope (computer-scope.toml)
+            # > LOOP_MAX_USD env default. The base scope value is the owner's
+            # global ceiling — if it's higher than the env default, trust it.
+            base_budget = float(getattr(executor.base_scope, "budget_usd", 0) or 0)
+            max_usd = max(LOOP_MAX_USD, base_budget) if base_budget > 0 else LOOP_MAX_USD
+            if isinstance(task_scope, dict):
+                raw_budget = task_scope.get("budget_usd")
+                if isinstance(raw_budget, (int, float)) and raw_budget > 0:
+                    max_usd = float(raw_budget)
+            run_task(
+                task,
+                state,
+                executor,
+                api_key,
+                llm_url=llm_url,
+                model=model,
+                max_usd=max_usd,
+            )
         except Exception as exc:  # noqa: BLE001
             update_live(state, "error", f"{type(exc).__name__}: {exc}")
             print(f"task error: {exc}", flush=True)
@@ -1221,7 +1171,9 @@ def task_worker(
                     }
                 )
         finally:
+            executor.reset_task_scope()
             state.busy = False
             state.current_task = ""
             state.current_task_id = ""
             state.task_count += 1
+    update_live(state, "shutdown", "daemon worker stopped")

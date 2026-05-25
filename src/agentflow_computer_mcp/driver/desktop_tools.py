@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import io
 import json
 import platform
@@ -19,7 +20,7 @@ from typing import Any
 
 from PIL import Image
 
-from ..config import Scope, load_scope
+from ..config import Scope, load_scope, scope_from_mapping
 from ..confirm import confirm, confirm_summary
 from ..platform import PLATFORM, backend
 from ..scope import requires_confirm
@@ -355,7 +356,10 @@ class PlaywrightHost:
 
     def __init__(self) -> None:
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._pw: Any = None
         self._browser: Any = None
+        self._context: Any = None
         self._page: Any = None
         self._lock = threading.Lock()
 
@@ -364,7 +368,15 @@ class PlaywrightHost:
             with self._lock:
                 if self._loop is None:
                     self._loop = asyncio.new_event_loop()
-                    threading.Thread(target=self._loop.run_forever, daemon=True).start()
+                    loop = self._loop
+
+                    def _run() -> None:
+                        asyncio.set_event_loop(loop)
+                        loop.run_forever()
+                        loop.close()
+
+                    self._thread = threading.Thread(target=_run, daemon=True)
+                    self._thread.start()
         return self._loop
 
     def _submit(self, coro: Any, timeout: int = 60) -> Any:
@@ -378,6 +390,7 @@ class PlaywrightHost:
         from playwright.async_api import async_playwright
 
         pw = await async_playwright().start()
+        self._pw = pw
         browser = await pw.chromium.launch(
             headless=False,
             args=["--disable-blink-features=AutomationControlled"],
@@ -385,6 +398,43 @@ class PlaywrightHost:
         ctx = await browser.new_context(viewport={"width": 1280, "height": 800})
         self._page = await ctx.new_page()
         self._browser = browser
+        self._context = ctx
+
+    async def _close(self) -> None:
+        page = self._page
+        context = self._context
+        browser = self._browser
+        pw = self._pw
+        self._page = None
+        self._context = None
+        self._browser = None
+        self._pw = None
+        if page is not None:
+            with contextlib.suppress(Exception):
+                await page.close()
+        if context is not None:
+            with contextlib.suppress(Exception):
+                await context.close()
+        if browser is not None:
+            with contextlib.suppress(Exception):
+                await browser.close()
+        if pw is not None:
+            with contextlib.suppress(Exception):
+                await pw.stop()
+
+    def close(self, timeout: int = 15) -> None:
+        loop = self._loop
+        thread = self._thread
+        if loop is None:
+            return
+        with contextlib.suppress(Exception):
+            asyncio.run_coroutine_threadsafe(self._close(), loop).result(timeout=timeout)
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(loop.stop)
+        if thread is not None:
+            thread.join(timeout=1.0)
+        self._loop = None
+        self._thread = None
 
     def ensure(self) -> str:
         self._submit(self._start())
@@ -914,11 +964,28 @@ class ToolExecutor:
         # (kwork, TG Web, mail) just work without re-auth. Lazy-init via
         # firefox_open so a missing profile doesn't crash the daemon.
         self._firefox = firefox or FirefoxHost()
-        self._scope = scope if scope is not None else load_scope()
+        self._base_scope = scope if scope is not None else load_scope()
+        self._scope = self._base_scope
         # Optional DriverState reference for emitting "task_action" frames
         # BEFORE long-running code tool dispatch so the cabinet timeline
         # shows the action while it's in flight, not only after completion.
         self._state = state
+
+    def apply_task_scope(self, raw_scope: dict[str, Any] | None) -> None:
+        self._scope = scope_from_mapping(raw_scope, base=self._base_scope)
+
+    def reset_task_scope(self) -> None:
+        self._scope = self._base_scope
+
+    @property
+    def base_scope(self):
+        return self._base_scope
+
+    def close(self) -> None:
+        with contextlib.suppress(Exception):
+            self._pw.close()
+        with contextlib.suppress(Exception):
+            self._firefox.close()
 
     def _announce(self, action: str, detail: str = "") -> None:
         if self._state is None:
