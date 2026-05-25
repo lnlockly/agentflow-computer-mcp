@@ -197,6 +197,152 @@ elif [[ -z "${AF_API_KEY:-}" ]]; then
   exec agentflow-desktop selftest
 fi
 
+# ─── Preinstall wizard ──────────────────────────────────────────────
+#
+# AF_PREINSTALL is a comma-separated list of tool slugs the user picked
+# at hosted-device create-time ("opencode,nodejs,python_ds"). For each
+# slug we run the install block and POST a status event back to the
+# backend so the cabinet can render per-tool progress.
+#
+# Idempotent on a restarted pod: each tool's own command is a no-op if
+# already installed (curl install scripts re-write the same binary, apt
+# is a no-op for already-installed packages). Failures are non-fatal —
+# the daemon still boots; the failed step is just visible in the cabinet.
+preinstall_event() {
+  local tool="$1"
+  local status="$2"
+  local detail="${3:-}"
+  if [[ -z "${AF_HOSTED_DEVICE_ID:-}" || -z "${AF_INTERNAL_SECRET:-}" ]]; then
+    return 0
+  fi
+  local api_url="${AF_API_URL:-https://agentflow.website}"
+  # Use python3 to JSON-encode the body so embedded quotes / newlines in
+  # `detail` don't blow up the request. Falls back to a stripped string
+  # if python3 isn't on PATH (shouldn't happen — image has it).
+  local payload
+  if command -v python3 >/dev/null 2>&1; then
+    payload=$(TOOL="$tool" STATUS="$status" DETAIL="$detail" python3 -c '
+import json, os
+print(json.dumps({
+    "tool": os.environ["TOOL"],
+    "status": os.environ["STATUS"],
+    "detail": os.environ.get("DETAIL", "")[:2000],
+}))
+')
+  else
+    local safe_detail="${detail//\"/\'}"
+    payload=$(printf '{"tool":"%s","status":"%s","detail":"%s"}' "$tool" "$status" "${safe_detail:0:2000}")
+  fi
+  curl -fsS --max-time 10 \
+    -H 'content-type: application/json' \
+    -H "x-agentflow-secret: ${AF_INTERNAL_SECRET}" \
+    -X POST \
+    --data "$payload" \
+    "${api_url}/_agents/internal/hosted-devices/${AF_HOSTED_DEVICE_ID}/preinstall-event" \
+    >/dev/null 2>&1 || true
+}
+
+run_preinstall_step() {
+  local tool="$1"
+  echo "[preinstall] $tool starting" >&2
+  preinstall_event "$tool" "installing"
+  local log_file
+  log_file=$(mktemp)
+  local rc=0
+  case "$tool" in
+    opencode)
+      # AI coding CLI. The install script drops a binary into ~/.opencode/bin.
+      # We then write a minimal config pointing at AgentFlow's hosted LLM
+      # router so the user doesn't have to wire an api key by hand.
+      (
+        set -e
+        curl -fsSL https://opencode.ai/install | bash
+        mkdir -p "$HOME/.config/opencode"
+        AUTH_FILE="$HOME/.agentflow/auth.json" python3 - <<'PY' > "$HOME/.config/opencode/opencode.json"
+import json, os, sys
+auth_path = os.environ.get("AUTH_FILE", "")
+api_key = ""
+if auth_path and os.path.exists(auth_path):
+    try:
+        with open(auth_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        api_key = data.get("api_key") or ""
+    except Exception:
+        api_key = ""
+config = {
+    "$schema": "https://opencode.ai/config.json",
+    "provider": {
+        "agentflow": {
+            "name": "AgentFlow",
+            "npm": "@ai-sdk/openai-compatible",
+            "options": {
+                "baseURL": "https://agentflow.website/_agents/llm/v1",
+                "apiKey": api_key,
+            },
+            "models": {
+                "claude-sonnet-4-6": {"name": "Claude Sonnet 4.6"},
+                "claude-opus-4-7":   {"name": "Claude Opus 4.7"},
+            },
+        },
+    },
+}
+sys.stdout.write(json.dumps(config, indent=2))
+PY
+      ) >"$log_file" 2>&1 || rc=$?
+      ;;
+    codex)
+      npm install -g @openai/codex >"$log_file" 2>&1 || rc=$?
+      ;;
+    nodejs)
+      # Daemon image already has node 20 baked in. We install npm + npx
+      # via apt for users who want the classic dev tooling on PATH and
+      # bump yarn while we're here.
+      (
+        set -e
+        sudo -n apt-get update -y
+        sudo -n apt-get install -y --no-install-recommends nodejs npm
+        sudo -n npm install -g yarn
+      ) >"$log_file" 2>&1 || rc=$?
+      ;;
+    python_ds)
+      pip install --no-cache-dir --quiet jupyter pandas numpy >"$log_file" 2>&1 || rc=$?
+      ;;
+    ffmpeg)
+      (
+        set -e
+        sudo -n apt-get update -y
+        sudo -n apt-get install -y --no-install-recommends ffmpeg
+      ) >"$log_file" 2>&1 || rc=$?
+      ;;
+    *)
+      echo "[preinstall] unknown tool '$tool' — skipping" >&2
+      rm -f "$log_file"
+      preinstall_event "$tool" "failed" "unknown tool slug"
+      return 0
+      ;;
+  esac
+  if [[ $rc -eq 0 ]]; then
+    echo "[preinstall] $tool ok" >&2
+    preinstall_event "$tool" "installed"
+  else
+    # Tail of the install log gives the cabinet a debuggable hint.
+    local tail_out
+    tail_out=$(tail -c 1800 "$log_file" 2>/dev/null || true)
+    echo "[preinstall] $tool failed (rc=$rc) — see cabinet for log tail" >&2
+    preinstall_event "$tool" "failed" "$tail_out"
+  fi
+  rm -f "$log_file"
+}
+
+if [[ -n "${AF_PREINSTALL:-}" ]]; then
+  IFS=',' read -ra _PREINSTALL_TOOLS <<< "$AF_PREINSTALL"
+  for _tool in "${_PREINSTALL_TOOLS[@]}"; do
+    _tool="${_tool// /}"
+    [[ -z "$_tool" ]] && continue
+    run_preinstall_step "$_tool"
+  done
+fi
+
 # Hand off. `exec` so signals (SIGTERM from kubectl delete) reach the
 # Python process directly. No `--headless` flag — `agentflow-desktop run`
 # is headless by default (Xvfb provides the display via env DISPLAY=:99).
