@@ -169,7 +169,12 @@ jobs:
             sha256 (agentflow-tray.exe):          ${{ steps.sha.outputs.sha256_tray }}
 
       - name: Publish to "latest" rolling release
-        if: startsWith(github.ref, 'refs/tags/v')
+        # Always fire — on tag push (full release) AND on workflow_dispatch
+        # (operator-triggered re-build of latest). Previously gated behind
+        # `refs/tags/v`, which meant manual dispatches built the .exe but
+        # never uploaded it, leaving `latest` stuck on the most recent
+        # tagged build. Owner hit this when downloading a freshly-fixed
+        # installer right after a feature merge.
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
