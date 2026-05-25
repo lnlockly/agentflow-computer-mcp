@@ -34,7 +34,6 @@ from agentflow_computer_mcp.config import (
 )
 from agentflow_computer_mcp.scope import ScopeDenied, check_shell
 
-
 # ─────────── parse_shell_whitelist_env ───────────
 
 
