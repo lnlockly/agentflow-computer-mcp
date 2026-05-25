@@ -1,72 +1,87 @@
-"""Integrations block — teaches the model how to harvest a logged-in
-Chrome session (Kwork, Telegram Web, etc.) and POST it to the AgentFlow
-owner's integrations endpoint.
+"""Integrations block — обучает модель пользоваться generic-тулом
+``connect_integration(provider)`` для подключения внешних аккаунтов
+(Kwork, VK, lolzteam, Instagram, LinkedIn, Telegram-app, …).
 
-The flow is intentionally probe-first: never run ``chrome_export_cookies``
-blind. If the user is not signed in, the export still succeeds (returns
-expired or anonymous cookies) and the downstream MCP wastes a round-trip.
-A 2-line ``chrome_eval`` probe catches that before any keychain access.
+Архитектура (см. spec ``docs/specs/2026-05-25-generic-integrations.md``):
+бэкенд держит provider-registry, daemon знает один тул, который сам
+открывает ``login_url`` нужного провайдера, гоняет probe-JS и экспортит
+storage_state в платформенный integrations endpoint. Хардкод probe-JS,
+cookie-domain'ов и трёх ручных шагов (open → eval → export) из prompt
+ушёл вместе с PR Track 4 — теперь это инкапсулировано в driver/tools.
 
-Russian commentary in the prompt body matches the daemon's existing voice
-(see lolzteam.py); the technical anchors (tool names, error codes, URLs)
-stay in English for grep-ability.
+Russian commentary в теле блока сохранён в стиле остальных driver-
+prompt'ов (см. lolzteam.py); технические якоря (имя тула, slug'и,
+коды ошибок) на английском для grep-ability.
 """
 from __future__ import annotations
 
+# Короткий snapshot реестра — служит подсказкой модели какие slug'и
+# валидны. Полный live-registry тул дёргает сам через backend; этот
+# список лишь чтобы модель не выдумывала slug'и из воздуха.
+_PROVIDERS = (
+    ("kwork",        "💼", "Kwork",        "биржа фриланса, отклики и заказы"),
+    ("vk",           "👥", "ВКонтакте",    "соцсеть, посты и личка от имени юзера"),
+    ("lolzteam",     "🎮", "Lolzteam",     "форум, маркет аккаунтов и услуг"),
+    ("instagram",    "📸", "Instagram",    "ленты, сторис, директ"),
+    ("linkedin",     "💼", "LinkedIn",     "B2B outreach, вакансии, нетворк"),
+    ("telegram_app", "✈️", "Telegram",     "MTProto через приложение, не cookies"),
+)
+
+
+def _provider_lines() -> str:
+    rows = []
+    for slug, emoji, name, use_case in _PROVIDERS:
+        rows.append(f"    {emoji} {slug:<14} — {name}: {use_case}")
+    return "\n".join(rows)
+
+
 INTEGRATIONS_BLOCK = (
-    "\nИнтеграции — экспорт сессии (kwork / telegram-web / прочие) для серверных MCP:\n"
-    "  Когда юзер просит «подключи мой kwork», «забери мою сессию kwork»,\n"
-    "  «вытащи cookies из kwork в платформу» (или аналогично для другого\n"
-    "  сайта) — стандартный 3-step flow, БЕЗ отклонений:\n"
+    "\nИнтеграции — подключение внешних аккаунтов юзера к платформе:\n"
+    "  Когда юзер просит «подключи мой kwork», «забери мой VK в платформу»,\n"
+    "  «привяжи lolzteam», «вытащи мою сессию X» — есть ОДИН generic тул:\n"
     "\n"
-    "  Step 1. Probe залогинен ли юзер (без probe'а cookies могут оказаться\n"
-    "  пустыми/expired, серверная сторона потратит запрос впустую):\n"
-    "    chrome_open_url('https://kwork.ru/manage_offers') + wait 2\n"
-    "    chrome_eval `({\n"
-    "      logged: !!document.querySelector('.header-userinfo, .js-user-menu, [data-name=\"user-menu\"]')\n"
-    "              && !location.pathname.includes('/login'),\n"
-    "      url: location.href\n"
-    "    })`\n"
-    "    logged=true означает что на странице виден user-menu И мы не\n"
-    "    оказались на /login (kwork редиректит туда неавторизованных).\n"
-    "    НЕ используй `document.cookie.match(/track=/)` — `track` это\n"
-    "    generic Yandex-Metrica cookie, она стоит у любого посетителя,\n"
-    "    включая анонимного, и даст false positive.\n"
-    "    Если logged=false → text-блок юзеру: «Не вижу залогиненную сессию\n"
-    "    Kwork в Chrome. Открой kwork.ru, войди, потом повтори запрос.».\n"
-    "    НЕ продолжать на step 2.\n"
+    "    connect_integration(provider=<slug>)\n"
     "\n"
-    "  Step 2. Экспорт куков (HttpOnly включены, document.cookie их не\n"
-    "  отдаёт — поэтому экспорт идёт через SQLite + Keychain, не через JS):\n"
-    "    chrome_export_cookies(domain='kwork.ru')\n"
-    "    Ответ — Playwright storage_state.cookies формат, готов к ingest.\n"
-    "    Возможные ошибки (отдавать юзеру дословно, не интерпретировать):\n"
-    "      profile_not_found            — нет ~/Library/.../Chrome/Default\n"
-    "      keychain_failed              — Keychain заблокирован / отказал в доступе\n"
-    "      db_locked                    — Chrome держит DB эксклюзивно\n"
-    "      domain_denied                — финансовый домен в deny-list\n"
-    "      encryption_v20_unsupported   — Chrome 127+ App-Bound Encryption,\n"
-    "                                     платформенный fallback ещё не\n"
-    "                                     написан (см. RAG runbook)\n"
-    "      unsupported_platform         — daemon не на macOS\n"
+    "  Он сам берёт login_url + probe + cookie_domain из registry,\n"
+    "  открывает Chrome на странице логина, проверяет залогинен ли юзер,\n"
+    "  экспортит storage_state и доставляет на платформу. Драйверу нужно\n"
+    "  только определить корректный slug и вызвать тул — никаких ручных\n"
+    "  3-step цепочек (open-url → eval-probe → export-session) больше нет.\n"
     "\n"
-    "  Step 3. Доставка на платформу (owner-key уже в env daemon'а, не\n"
-    "  надо просить юзера). Endpoint:\n"
-    "    POST https://agentflow.website/_agents/me/integrations/kwork\n"
-    "    body = { cookies: <массив из chrome_export_cookies.cookies>,\n"
-    "             profile: 'Default' }\n"
-    "    headers = { 'x-api-key': $AF_OWNER_API_KEY, 'content-type': 'application/json' }\n"
-    "    Для других сайтов хост тот же, путь меняется: /telegram, /linkedin, ...\n"
+    "  Поддерживаемые провайдеры (snapshot реестра — live версия в\n"
+    "  backend, тул сверяется с ней на каждом вызове):\n"
+    f"{_provider_lines()}\n"
+    "\n"
+    "  Slug, которого нет в registry → тул вернёт provider_not_found.\n"
+    "  Не придумывать slug'и (например, нет «twitter», «discord»,\n"
+    "  «sberbank»); если юзер просит неподдерживаемое — text-блок:\n"
+    "  «Этот провайдер ещё не подключён к платформе.».\n"
+    "\n"
+    "  Возможные ошибки (отдавать юзеру дословно, не интерпретировать):\n"
+    "    provider_not_found           — slug не в registry\n"
+    "    not_logged_in                — probe сказал logged=false,\n"
+    "                                   попроси юзера войти в Chrome и повторить\n"
+    "    profile_not_found            — нет ~/Library/.../Chrome/Default\n"
+    "    keychain_failed              — Keychain заблокирован / отказал в доступе\n"
+    "    db_locked                    — Chrome держит DB эксклюзивно\n"
+    "    domain_denied                — финансовый домен в deny-list\n"
+    "    encryption_v20_unsupported   — Chrome 127+ App-Bound Encryption,\n"
+    "                                   платформенный fallback ещё не написан\n"
+    "    unsupported_platform         — daemon не на macOS (для cookie-flow)\n"
+    "    registry_unreachable         — backend недоступен, повторить позже\n"
     "\n"
     "  Безопасность (нарушение = leak сессии в публичный лог):\n"
-    "    • Cookie values НЕ выводить в text-блок целиком. Никогда. Если\n"
-    "      надо подтвердить экспорт — пиши «получено N кук, имена: a,b,c»\n"
-    "      (только имена + count, без значений).\n"
-    "    • При ok=false ошибку отдавать ВЕРБАЛЬНО как есть («profile_not_found»),\n"
-    "      не догадываться, не «починить руками».\n"
+    "    • Cookie / session values НЕ выводить в text-блок ни целиком,\n"
+    "      ни кусками. Никогда. Если надо подтвердить экспорт — пиши\n"
+    "      «получено N кук, имена: a,b,c» (только имена + count).\n"
+    "    • При ok=false ошибку отдавать ВЕРБАЛЬНО как есть\n"
+    "      («not_logged_in», «keychain_failed»), не догадываться,\n"
+    "      не «починить руками» через ручной экспорт.\n"
     "    • Финансовые домены (sber/tinkoff/paypal/binance/coinbase/...)\n"
-    "      платформа отклонит сама (domain_denied). Не пытаться обойти.\n"
-    "    • Если юзер просит «вытащи cookies в файл / в clipboard / в чат» —\n"
-    "      отказ + text-блок: «Cookies уходят только в платформенный\n"
-    "      integrations endpoint. Локально светить их нельзя.».\n"
+    "      платформа отклонит сама (domain_denied). Не пытаться обойти\n"
+    "      через альтернативный slug или прямой вызов внутренних тулов.\n"
+    "    • Если юзер просит «вытащи cookies в файл / в clipboard / в чат /\n"
+    "      покажи storage_state» — отказ + text-блок: «Сессии уходят\n"
+    "      только в платформенный integrations endpoint. Локально светить\n"
+    "      их нельзя.».\n"
 )
