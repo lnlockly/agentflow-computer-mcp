@@ -19,17 +19,6 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__, auto_updater
-
-# Belt-and-braces socket fallback so any outbound TCP call that forgets to
-# pass an explicit timeout still gets one. Production hit: a Windows daemon
-# on a flaky NAT stalled for the full WinError 10060 default (~60-180 s)
-# while a single `urlopen` connect-phase waited for SYN-ACK; the AI loop
-# stops emitting frames during that window and the cabinet sees the task
-# stuck at "running". A 30 s ceiling at the socket layer caps that worst
-# case for every stdlib http client running inside the daemon.
-_DEFAULT_SOCKET_TIMEOUT_S = float(os.environ.get("AF_DEFAULT_SOCKET_TIMEOUT_S", "30") or 30)
-if _DEFAULT_SOCKET_TIMEOUT_S > 0 and socket.getdefaulttimeout() is None:
-    socket.setdefaulttimeout(_DEFAULT_SOCKET_TIMEOUT_S)
 from .config import load_auth, load_config
 from .driver import (
     AFClient,
@@ -47,6 +36,17 @@ from .driver.loop import DEFAULT_LLM_URL, DEFAULT_MODEL, run_task
 from .driver.selfmod_worker import SelfmodWorker
 from .logging_setup import init_logging
 from .ws_log_uploader import get_handler as get_ws_log_handler
+
+# Belt-and-braces socket fallback so any outbound TCP call that forgets to
+# pass an explicit timeout still gets one. Production hit: a Windows daemon
+# on a flaky NAT stalled for the full WinError 10060 default (~60-180 s)
+# while a single `urlopen` connect-phase waited for SYN-ACK; the AI loop
+# stops emitting frames during that window and the cabinet sees the task
+# stuck at "running". A 30 s ceiling at the socket layer caps that worst
+# case for every stdlib http client running inside the daemon.
+_DEFAULT_SOCKET_TIMEOUT_S = float(os.environ.get("AF_DEFAULT_SOCKET_TIMEOUT_S", "30") or 30)
+if _DEFAULT_SOCKET_TIMEOUT_S > 0 and socket.getdefaulttimeout() is None:
+    socket.setdefaulttimeout(_DEFAULT_SOCKET_TIMEOUT_S)
 
 log = logging.getLogger(__name__)
 
