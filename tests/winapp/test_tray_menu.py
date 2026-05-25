@@ -5,12 +5,87 @@ with `TrayState`.
 """
 from __future__ import annotations
 
+from agentflow_computer_mcp.winapp import actions
 from agentflow_computer_mcp.winapp.menu import build_menu
 from agentflow_computer_mcp.winapp.state import AgentRow, Budget, GoalRow, TrayState
 
 
 def _labels(items) -> list[str]:
     return [i.label for i in items]
+
+
+def _default_state() -> TrayState:
+    return TrayState(
+        daemon="up",
+        agents=(),
+        goals=(),
+        budget=Budget(spent=0.0, cap=0.0),
+        authenticated=True,
+    )
+
+
+def test_restore_connection_entry_present_when_callback_supplied() -> None:
+    """Windows tray wires the Defender exclusion entry via
+    `on_restore_connection`. When set, the menu shows «Восстановить связь»
+    above «Выйти»."""
+    items = build_menu(
+        _default_state(),
+        on_open_cabinet=lambda: None,
+        on_restart_daemon=lambda: None,
+        on_restore_connection=lambda: None,
+        on_quit=lambda: None,
+    )
+    labels = _labels(items)
+    assert "Восстановить связь" in labels
+    assert labels.index("Восстановить связь") < labels.index("Выйти")
+
+
+def test_restore_connection_entry_omitted_on_mac_linux() -> None:
+    """No callback means non-Windows host — the entry must not render
+    so mac / linux users don't see a Windows-only label."""
+    items = build_menu(
+        _default_state(),
+        on_open_cabinet=lambda: None,
+        on_restart_daemon=lambda: None,
+        on_quit=lambda: None,
+    )
+    assert "Восстановить связь" not in _labels(items)
+
+
+def test_restore_connection_action_calls_injected_add_exclusion() -> None:
+    """`actions.restore_connection` must invoke the injected helper and
+    notify the user. Lets the tray surface the outcome as a balloon."""
+    notes: list[str] = []
+    ok, reason = actions.restore_connection(
+        add_exclusion=lambda: (True, ""),
+        notifier=notes.append,
+    )
+    assert ok is True
+    assert reason == ""
+    assert notes == ["Исключение Defender добавлено"]
+
+
+def test_restore_connection_action_notifies_user_decline() -> None:
+    notes: list[str] = []
+    ok, reason = actions.restore_connection(
+        add_exclusion=lambda: (False, "user_declined"),
+        notifier=notes.append,
+    )
+    assert ok is False
+    assert reason == "user_declined"
+    assert notes == ["Вы отказались от запроса UAC"]
+
+
+def test_restore_connection_action_swallows_helper_exception() -> None:
+    notes: list[str] = []
+
+    def boom() -> tuple[bool, str]:
+        raise RuntimeError("ctypes")
+
+    ok, reason = actions.restore_connection(add_exclusion=boom, notifier=notes.append)
+    assert ok is False
+    assert "unexpected" in reason
+    assert notes and notes[0].startswith("Ошибка:")
 
 
 def test_daemon_down_with_three_cloud_goals_shows_correct_items() -> None:

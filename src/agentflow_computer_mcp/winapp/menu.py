@@ -77,27 +77,47 @@ def build_menu(
     *,
     on_open_cabinet: Callable[[], None] | None = None,
     on_restart_daemon: Callable[[], None] | None = None,
+    on_restore_connection: Callable[[], None] | None = None,
     on_quit: Callable[[], None] | None = None,
     on_kill_agent: Callable[[str], Callable[[], None]] | None = None,
 ) -> tuple[MenuItem, ...]:
-    """Return the full top-level menu as a tuple of `MenuItem`."""
+    """Return the full top-level menu as a tuple of `MenuItem`.
+
+    `on_restore_connection` is the Windows-only Defender exclusion path.
+    When `None` (mac / linux) the entry is omitted entirely instead of
+    rendered greyed-out — non-Windows users would be confused by an
+    inactive Windows-only label.
+    """
     header = MenuItem(label=state.header, enabled=False)
     agents = MenuItem(label="Агенты", children=build_agents_submenu(state, on_kill_agent))
     goals = MenuItem(label="Цели", children=build_goals_submenu(state))
     budget = MenuItem(label=_budget_label(state), enabled=False)
 
-    return (
+    items: list[MenuItem] = [
         header,
         _separator(),
         agents,
         goals,
         budget,
         _separator(),
-        MenuItem(label="Открыть кабинет", action=on_open_cabinet, enabled=on_open_cabinet is not None),
+        MenuItem(
+            label="Открыть кабинет",
+            action=on_open_cabinet,
+            enabled=on_open_cabinet is not None,
+        ),
         MenuItem(
             label="Перезапустить демон",
             action=on_restart_daemon,
             enabled=on_restart_daemon is not None and state.daemon != "unsupported",
         ),
-        MenuItem(label="Выйти", action=on_quit, enabled=on_quit is not None),
-    )
+    ]
+    if on_restore_connection is not None:
+        items.append(
+            MenuItem(
+                label="Восстановить связь",
+                action=on_restore_connection,
+                enabled=True,
+            )
+        )
+    items.append(MenuItem(label="Выйти", action=on_quit, enabled=on_quit is not None))
+    return tuple(items)

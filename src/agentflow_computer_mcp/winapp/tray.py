@@ -5,6 +5,8 @@ tests and `--version` don't need it. The rest of `winapp` is pystray-free.
 """
 from __future__ import annotations
 
+import contextlib
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -72,6 +74,23 @@ def run() -> int:
 
         return _do
 
+    def _notify(text: str) -> None:
+        ic = icon_holder.get("icon")
+        if ic is None:
+            return
+        with contextlib.suppress(Exception):
+            ic.notify(text, title="AgentFlow")  # type: ignore[attr-defined]
+
+    def _restore_connection() -> None:
+        # Runs on the pystray callback thread; the Defender helper itself
+        # is fire-and-forget (ShellExecuteW returns immediately after the
+        # user clicks the UAC prompt) so blocking the menu briefly is OK.
+        actions.restore_connection(notifier=_notify)
+
+    restore_cb: Callable[[], None] | None = (
+        _restore_connection if os.name == "nt" else None
+    )
+
     def rebuild_menu() -> object:
         with state_lock:
             state = current_state
@@ -79,6 +98,7 @@ def run() -> int:
             state,
             on_open_cabinet=actions.open_cabinet,
             on_restart_daemon=actions.restart_daemon,
+            on_restore_connection=restore_cb,
             on_quit=lambda: actions.quit_tray(icon_holder.get("icon")),
             on_kill_agent=kill_action_factory,
         )

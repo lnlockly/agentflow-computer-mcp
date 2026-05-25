@@ -56,6 +56,49 @@ def kill_agent(slot_id: str, caller: Callable[..., object] | None = None) -> boo
     return True
 
 
+def restore_connection(
+    add_exclusion: Callable[[], tuple[bool, str]] | None = None,
+    notifier: Callable[[str], None] | None = None,
+) -> tuple[bool, str]:
+    """Re-run the Defender exclusion step for an already-installed daemon.
+
+    Used by the «Восстановить связь» menu entry — covers users who
+    installed v0.4.x before the installer started doing this on its own.
+    Triggers a single UAC prompt and returns the outcome so the caller
+    (the tray) can show a balloon notification.
+
+    `add_exclusion` is injectable for tests; in production it's the
+    helper from `installer.setup_gui`. We do a late import there so the
+    tray .exe doesn't pull in Tk on every start.
+    """
+    if add_exclusion is None:
+        try:
+            from installer.setup_gui import (  # type: ignore[import-not-found]
+                add_defender_exclusion,
+            )
+            add_exclusion = add_defender_exclusion
+        except Exception as exc:  # noqa: BLE001
+            if notifier:
+                notifier(f"Не получилось загрузить установщик: {exc}")
+            return False, f"import_failed: {exc}"
+    try:
+        ok, reason = add_exclusion()
+    except Exception as exc:  # noqa: BLE001
+        if notifier:
+            notifier(f"Ошибка: {exc}")
+        return False, f"unexpected: {exc}"
+    if notifier:
+        if ok:
+            notifier("Исключение Defender добавлено")
+        elif reason == "user_declined":
+            notifier("Вы отказались от запроса UAC")
+        elif reason == "not_windows":
+            notifier("Доступно только на Windows")
+        else:
+            notifier(f"Не получилось: {reason}")
+    return ok, reason
+
+
 def quit_tray(icon) -> None:  # type: ignore[no-untyped-def]
     """Called by the "Выйти" entry. `icon` is a `pystray.Icon` (or a stub)."""
     with contextlib.suppress(Exception):
