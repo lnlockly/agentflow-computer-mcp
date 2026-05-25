@@ -15,7 +15,11 @@ from .desktop_tools import (
     get_window_list,
     jpeg_b64_full,
 )
-from .prompts import build_system_prompt
+from .prompts import (
+    HOST_OS,  # noqa: F401 — re-exported for installer-smoke + downstream
+    HOST_OS_RELEASE,  # noqa: F401 — re-exported, used by health probes
+    build_system_prompt,
+)
 from .state import DriverState
 from .streamer import compress_png_for_viewer
 
