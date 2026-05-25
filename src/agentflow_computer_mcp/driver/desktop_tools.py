@@ -633,6 +633,26 @@ DESKTOP_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "connect_integration",
+        "description": (
+            "Connect a third-party integration (kwork, vk, lolzteam, ...) using the "
+            "registry-driven flow. Opens the login URL, probes the logged-in state, "
+            "exports cookies, POSTs them to /me/integrations/<provider>. Returns "
+            "{ok, cookie_count, secret_created} or {ok:false, error:<code>}. Cookie "
+            "values are never echoed back."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "provider": {
+                    "type": "string",
+                    "description": "Provider slug from /integrations/registry (e.g. 'kwork', 'vk').",
+                }
+            },
+            "required": ["provider"],
+        },
+    },
+    {
         "name": "clipboard_write",
         "description": "Write text to clipboard.",
         "input_schema": {
@@ -1080,6 +1100,42 @@ class ToolExecutor:
                 result = export_cookies(args["domain"], args.get("profile", "Default"))
             except Exception as exc:  # noqa: BLE001 — surface as tool_result, never crash the loop
                 result = {"ok": False, "error": f"unexpected: {exc.__class__.__name__}"}
+            return json.dumps(result, ensure_ascii=False), None
+        if name == "connect_integration":
+            from .chrome_cookies import export_cookies
+            from .tools.integrations import connect_integration
+
+            if self._af is None:
+                return (
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "error": "no_api_key",
+                            "hint": "AF owner key missing on daemon.",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    None,
+                )
+            api_key = self._af._key  # noqa: SLF001 — daemon owns this private member
+            api_base = self._af._base  # noqa: SLF001
+            try:
+                result = connect_integration(
+                    provider=str(args.get("provider", "")),
+                    api_key=api_key,
+                    api_base=api_base,
+                    chrome_open_url=lambda url, new_tab=True: chrome_open_url(url, new_tab),
+                    chrome_eval=lambda js, tab=None: chrome_run_js(js, tab),
+                    chrome_export_cookies=lambda domain, profile="Default": export_cookies(
+                        domain, profile
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 — surface as tool_result, never crash the loop
+                result = {
+                    "ok": False,
+                    "error": f"unexpected: {exc.__class__.__name__}",
+                    "detail": str(exc),
+                }
             return json.dumps(result, ensure_ascii=False), None
         if name == "clipboard_write":
             asyncio.run(clipboard.write(args["text"]))
