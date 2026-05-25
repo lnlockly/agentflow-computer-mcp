@@ -41,6 +41,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from setup_gui import (  # noqa: E402  (sys.path manip)
     parse_invite,
+    parse_token,
     write_auth_file,
 )
 
@@ -73,6 +74,36 @@ def check_invite_roundtrip() -> None:
         except ValueError:
             continue
         fail(f"parse_invite should have rejected: {why}")
+
+
+def check_single_token_dispatch() -> None:
+    """`parse_token` routes `af_live_*` to the REST mint helper and falls
+    back to `parse_invite` for the legacy base64url blob."""
+    log("parse_token: single af_live_* dispatches to mint helper")
+    captured: dict = {}
+
+    def fake_mint(api_key: str) -> dict:
+        captured["api_key"] = api_key
+        return {
+            "api_key": api_key,
+            "device_id": "fake-device-id",
+            "device_token": "aft_fake_token",
+        }
+
+    creds = parse_token("af_live_singletoken", mint=fake_mint)
+    if creds["device_id"] != "fake-device-id":
+        fail(f"parse_token did not route to mint: {creds!r}")
+    if captured.get("api_key") != "af_live_singletoken":
+        fail(f"mint received wrong key: {captured!r}")
+
+    # Legacy blob still routes through parse_invite (no network needed).
+    legacy = parse_token(
+        "eyJrIjoiYWZfbGl2ZV9sZWdhY3kiLCJkIjoiZC0xIiwidCI6ImFmdF9sZWdhY3kifQ",
+        mint=lambda *a, **kw: fail("mint must NOT be called on legacy blob"),
+    )
+    if legacy["api_key"] != "af_live_legacy":
+        fail(f"legacy blob parse failed: {legacy!r}")
+    log("  ok — single token + legacy blob both wired")
 
 
 def check_auth_file_shape() -> None:
@@ -614,6 +645,7 @@ def main() -> None:
         sys.stderr.reconfigure(encoding="utf-8")
     log("starting smoke for installer/setup_gui.py")
     check_invite_roundtrip()
+    check_single_token_dispatch()
     check_auth_file_shape()
     check_daemon_entrypoint_imports()
     check_tray_entrypoint_imports()
