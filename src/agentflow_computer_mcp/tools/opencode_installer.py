@@ -272,10 +272,47 @@ def _read_existing_config(path: Path) -> dict[str, Any]:
         return {}
 
 
+# Alias-mode constants. The backend `/me/llm/aliases` POST registers a
+# user-defined alias name (e.g. "flow") that resolves to any enabled
+# upstream. OpenCode addresses providers as `<provider>/<model>`, so the
+# alias has to ride on one of the two AgentFlow provider entries below.
+# `openai` is the default mode because the codex CLI + OpenAI-compatible
+# tooling family is the common path the alias feature ships for.
+ALIAS_MODE_OPENAI = "openai"
+ALIAS_MODE_ANTHROPIC = "anthropic"
+_AF_PROVIDER_FOR_MODE = {
+    ALIAS_MODE_OPENAI: "agentflow-openai",
+    ALIAS_MODE_ANTHROPIC: "agentflow",
+}
+ALIAS_NAME_PATTERN = __import__("re").compile(r"^[a-z0-9][a-z0-9_-]{1,63}$")
+
+
+def _normalise_alias(raw: str | None) -> str | None:
+    """Lowercase + trim an alias name and enforce the backend regex.
+
+    Returns the cleaned string or ``None`` when ``raw`` is falsy. Raises
+    ``ValueError`` when ``raw`` is set but does not match the pattern —
+    the backend would reject it anyway and we want the failure to surface
+    on the daemon side before we touch ``opencode.json``.
+    """
+    if raw is None:
+        return None
+    cleaned = str(raw).strip().lower()
+    if not cleaned:
+        return None
+    if not ALIAS_NAME_PATTERN.match(cleaned):
+        raise ValueError(
+            f"invalid_alias: {raw!r} must match /^[a-z0-9][a-z0-9_-]{{1,63}}$/"
+        )
+    return cleaned
+
+
 def patch_opencode_config(
     api_key: str,
     base_url: str | None = None,
     model: str | None = None,
+    alias: str | None = None,
+    alias_mode: str = ALIAS_MODE_OPENAI,
 ) -> dict[str, Any]:
     """Write/merge ``opencode.json`` so OpenCode routes through AgentFlow.
 
@@ -293,6 +330,18 @@ def patch_opencode_config(
     is empty or already points at one of the AgentFlow provider slugs — we
     never clobber a deliberate user choice for openrouter, anthropic
     upstream, etc.
+
+    When ``alias`` is provided, the matching AgentFlow provider gets the
+    alias appended to its ``models`` map and the top-level ``model`` is
+    set to ``<provider>/<alias>``. The provider is chosen by
+    ``alias_mode``: ``openai`` (default) attaches the alias to
+    ``agentflow-openai`` (codex CLI, opencode tools that use the
+    chat/completions wire format), ``anthropic`` to ``agentflow`` (Claude
+    Code-style OpenCode clients that speak the Anthropic Messages API).
+
+    The alias name is validated against the backend regex
+    (``/^[a-z0-9][a-z0-9_-]{1,63}$/``) so a bad name fails locally before
+    we touch the config file.
     """
     if not api_key:
         raise ValueError("api_key is required")
@@ -305,6 +354,12 @@ def patch_opencode_config(
 
     chosen_base = base_url or DEFAULT_AF_BASE_URL
     chosen_model = model or DEFAULT_AF_MODEL
+    chosen_alias = _normalise_alias(alias)
+    if chosen_alias is not None and alias_mode not in _AF_PROVIDER_FOR_MODE:
+        raise ValueError(
+            f"invalid_alias_mode: {alias_mode!r}; expected one of "
+            f"{sorted(_AF_PROVIDER_FOR_MODE)}"
+        )
 
     provider["agentflow"] = {
         "npm": "@ai-sdk/anthropic",
@@ -331,13 +386,37 @@ def patch_opencode_config(
             "gpt-5.3-codex": {"name": "GPT-5.3 Codex (AgentFlow)"},
         },
     }
+
+    chosen_provider_slug = "agentflow"
+    if chosen_alias is not None:
+        chosen_provider_slug = _AF_PROVIDER_FOR_MODE[alias_mode]
+        # Append the alias to that provider's models map so OpenCode lists
+        # it in /models and accepts it as a target. We don't drop the
+        # canonical model ids — the user can still flip to them by hand.
+        provider_block = provider[chosen_provider_slug]
+        models_map = dict(provider_block.get("models") or {})
+        models_map[chosen_alias] = {
+            "name": f"AgentFlow alias «{chosen_alias}»",
+        }
+        provider_block["models"] = models_map
+        provider[chosen_provider_slug] = provider_block
+
     config["provider"] = provider
     config.setdefault("$schema", "https://opencode.ai/config.json")
 
-    existing_model = str(config.get("model") or "")
     af_slugs = ("agentflow/", "agentflow-openai/")
-    if not existing_model or existing_model.startswith(af_slugs):
-        config["model"] = f"agentflow/{chosen_model}"
+    existing_model = str(config.get("model") or "")
+    if chosen_alias is not None:
+        # Alias path: always pin the top-level model to the alias so the
+        # owner can swap upstream from the cabinet without re-running
+        # patch_opencode_config. Overrides existing user model only when
+        # it was already an AgentFlow entry (same guard as the non-alias
+        # branch).
+        if not existing_model or existing_model.startswith(af_slugs):
+            config["model"] = f"{chosen_provider_slug}/{chosen_alias}"
+    else:
+        if not existing_model or existing_model.startswith(af_slugs):
+            config["model"] = f"agentflow/{chosen_model}"
 
     tmp = target.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -350,13 +429,99 @@ def patch_opencode_config(
     return {
         "ok": True,
         "config_path": str(target),
-        "provider": "agentflow",
+        "provider": chosen_provider_slug,
         "model": config["model"],
         "base_url": chosen_base,
+        "alias": chosen_alias,
+        "alias_mode": alias_mode if chosen_alias is not None else None,
+    }
+
+
+def set_opencode_default_alias(
+    alias: str,
+    alias_mode: str = ALIAS_MODE_OPENAI,
+) -> dict[str, Any]:
+    """Repoint OpenCode's default ``model`` field at an AgentFlow alias.
+
+    Targeted edit: opens the existing ``opencode.json``, validates the
+    alias name + mode, swaps the ``model`` field to
+    ``<provider>/<alias>``, and writes it back atomically. Does not touch
+    ``provider`` entries — those have to be set up first via
+    ``patch_opencode_config`` (which knows the API key). If the config is
+    missing or has no AgentFlow provider entry yet the call returns
+    ``ok=False`` with a hint instead of silently writing a half-config.
+
+    Use this when the owner has already wired OpenCode through AgentFlow
+    once (provider + api key in place) and now wants to flip the default
+    model to a new alias name without re-supplying the key.
+    """
+    cleaned = _normalise_alias(alias)
+    if cleaned is None:
+        raise ValueError("alias is required")
+    if alias_mode not in _AF_PROVIDER_FOR_MODE:
+        raise ValueError(
+            f"invalid_alias_mode: {alias_mode!r}; expected one of "
+            f"{sorted(_AF_PROVIDER_FOR_MODE)}"
+        )
+
+    target = opencode_config_path()
+    if not target.exists():
+        return {
+            "ok": False,
+            "error": "config_missing",
+            "config_path": str(target),
+            "hint": "Run patch_opencode_config(api_key=...) first.",
+        }
+
+    config = _read_existing_config(target)
+    provider_slug = _AF_PROVIDER_FOR_MODE[alias_mode]
+    provider = dict(config.get("provider") or {})
+    if provider_slug not in provider:
+        return {
+            "ok": False,
+            "error": "provider_missing",
+            "provider": provider_slug,
+            "config_path": str(target),
+            "hint": (
+                "Run patch_opencode_config(api_key=...) first so the "
+                f"{provider_slug} provider block exists."
+            ),
+        }
+
+    # Register the alias on the provider's models map even if the backend
+    # is the source of truth — OpenCode needs at least an empty entry to
+    # accept the model id in `/models` and as a CLI target.
+    provider_block = dict(provider[provider_slug])
+    models_map = dict(provider_block.get("models") or {})
+    models_map.setdefault(cleaned, {"name": f"AgentFlow alias «{cleaned}»"})
+    provider_block["models"] = models_map
+    provider[provider_slug] = provider_block
+    config["provider"] = provider
+
+    new_model = f"{provider_slug}/{cleaned}"
+    previous_model = str(config.get("model") or "")
+    config["model"] = new_model
+
+    tmp = target.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    with contextlib.suppress(OSError):
+        os.chmod(tmp, 0o600)
+    tmp.replace(target)
+
+    return {
+        "ok": True,
+        "config_path": str(target),
+        "alias": cleaned,
+        "alias_mode": alias_mode,
+        "provider": provider_slug,
+        "model": new_model,
+        "previous_model": previous_model or None,
     }
 
 
 __all__ = [
+    "ALIAS_MODE_ANTHROPIC",
+    "ALIAS_MODE_OPENAI",
     "DEFAULT_AF_BASE_URL",
     "DEFAULT_AF_MODEL",
     "detect_platform",
@@ -365,4 +530,5 @@ __all__ = [
     "opencode_config_path",
     "opencode_install_dir",
     "patch_opencode_config",
+    "set_opencode_default_alias",
 ]
