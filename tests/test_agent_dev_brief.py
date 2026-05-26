@@ -85,6 +85,55 @@ def test_happy_path_clones_and_spawns_opencode(workspace):
     assert "build me a coffee landing" in spawner.calls[0]["brief"]
 
 
+def test_composed_prompt_keeps_dev_server_alive_after_opencode_exits(workspace):
+    # Regression: the brief MUST tell opencode to background+disown the
+    # dev server so it survives opencode's own exit. Previously the
+    # server was spawned as a foreground child of the single-shot
+    # `opencode run` and died ~2s later, leaving the project's public
+    # URL returning 502 forever.
+    runner = FakeRunner()
+    spawner = FakeOpencodeSpawner(pid=1)
+    ab.agent_dev_brief(
+        "owner/repo",
+        "demo",
+        42,
+        "static landing",
+        workspace_root=str(workspace),
+        run=runner,
+        spawn_opencode=spawner,
+    )
+    composed = spawner.calls[0]["brief"]
+    assert "nohup" in composed
+    assert "disown" in composed
+
+
+def test_composed_prompt_does_not_inject_listen_flag(workspace):
+    # Regression: the previous brief explicitly suggested `next dev -H
+    # 0.0.0.0 -p 3000` and opencode generalised that to `npm run dev
+    # -- --listen 0.0.0.0:3000` for our `serve`-based static-starter,
+    # which `serve` v14 rejects. The new brief must steer opencode to
+    # use the template's own dev script verbatim, no host/port flags.
+    runner = FakeRunner()
+    spawner = FakeOpencodeSpawner(pid=1)
+    ab.agent_dev_brief(
+        "owner/repo",
+        "demo",
+        42,
+        "static landing",
+        workspace_root=str(workspace),
+        run=runner,
+        spawn_opencode=spawner,
+    )
+    composed = spawner.calls[0]["brief"]
+    # The brief must explicitly steer opencode AWAY from adding these
+    # flags. We assert the negative instruction is present rather than
+    # the absence of the substring (the warning itself names the flags).
+    lc = composed.lower()
+    assert "do not add" in lc or "do NOT add" in composed
+    assert "--listen" in composed  # mentioned only inside the warning
+    assert "binds to port" in lc  # leans on template-provided binding
+
+
 def test_invalid_repo_full_rejected_before_side_effects(workspace):
     runner = FakeRunner()
     spawner = FakeOpencodeSpawner()
