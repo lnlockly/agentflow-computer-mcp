@@ -9,6 +9,7 @@ from mcp.server.fastmcp import FastMCP
 
 from .config import AppConfig, load_config
 from .confirm import confirm, confirm_summary
+from .driver.tools.agent_brief import agent_dev_brief
 from .driver.tools.project_setup import project_clone_and_setup
 from .scope import requires_confirm
 from .tools import clipboard as clipboard_tool
@@ -318,6 +319,19 @@ async def _dispatch_tool(name: str, args: dict[str, Any], config: AppConfig) -> 
             project_id=int(args.get("project_id", 0) or 0),
             api_base=api_base,
             internal_secret=internal_secret,
+            port=int(args.get("port", 3000) or 3000),
+        )
+    if name == "agent_dev_brief":
+        # Clone repo + hand brief to opencode (background process). Run
+        # the clone+spawn in a worker thread so the WS event loop keeps
+        # ticking heartbeats; the opencode child itself is detached and
+        # outlives this call.
+        return await asyncio.to_thread(
+            agent_dev_brief,
+            template_repo_full=str(args.get("template_repo_full", "")),
+            slug=str(args.get("slug", "")),
+            project_id=int(args.get("project_id", 0) or 0),
+            brief=str(args.get("brief", "")),
             port=int(args.get("port", 3000) or 3000),
         )
     raise LookupError(f"unknown tool: {name}")
