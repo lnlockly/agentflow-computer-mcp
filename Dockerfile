@@ -67,7 +67,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-websockify \
         nodejs \
         npm \
-    && npm install -g --no-audit --no-fund pnpm yarn \
+    # pnpm 10.x requires Node 22.13+; Debian bookworm ships Node 18.20.
+    # Pin to pnpm 9.x so the daemon image keeps working without a Node
+    # major bump. Drop the pin when we move to a Node 22 base image.
+    && npm install -g --no-audit --no-fund pnpm@9 yarn \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user. Pod's default uid is 0 in many vclusters but the daemon
