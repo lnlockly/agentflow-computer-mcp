@@ -125,13 +125,73 @@ def test_composed_prompt_does_not_inject_listen_flag(workspace):
         spawn_opencode=spawner,
     )
     composed = spawner.calls[0]["brief"]
-    # The brief must explicitly steer opencode AWAY from adding these
-    # flags. We assert the negative instruction is present rather than
-    # the absence of the substring (the warning itself names the flags).
+    # The brief must explicitly forbid the `--listen` flag for serve v14.
+    # We assert the negative warning, not absence of the substring (the
+    # warning itself spells the banned flag).
     lc = composed.lower()
     assert "do not add" in lc or "do NOT add" in composed
     assert "--listen" in composed  # mentioned only inside the warning
-    assert "binds to port" in lc  # leans on template-provided binding
+
+
+def test_composed_prompt_does_not_embed_literal_port_number(workspace):
+    # Deterministic-port policy: the daemon pre-patches package.json so
+    # `npm run dev` reads `$PORT`. The brief MUST NOT mention the literal
+    # port number — that would lead opencode to also try to bind it
+    # explicitly (wrong flag, wrong stack) and double-set, or to choose
+    # a port different from what the platform expects.
+    runner = FakeRunner()
+    spawner = FakeOpencodeSpawner(pid=1)
+    ab.agent_dev_brief(
+        "owner/repo",
+        "demo",
+        42,
+        "spa brief",
+        workspace_root=str(workspace),
+        port=3742,
+        run=runner,
+        spawn_opencode=spawner,
+    )
+    composed = spawner.calls[0]["brief"]
+    assert "3742" not in composed
+    assert "$PORT" in composed
+    # Reinforces the no-flag rule downstream.
+    assert "--listen" in composed  # warning text mentions the banned flag
+
+
+def test_package_json_dev_scripts_rewritten_to_use_port_env(tmp_path):
+    # Universal port injection: the daemon rewrites the template's
+    # `scripts.dev` so `${PORT:-N}` shell expansion picks up the env
+    # var, with the literal default preserved for local dev outside the
+    # pod. Each common dev-server shape must round-trip correctly.
+    cases = {
+        # serve v14 — explicit -l N
+        'serve -l 3000 -L .':
+            'serve -l ${PORT:-3000} -L .',
+        # serve without -l → append explicit listen
+        'serve .':
+            'serve . -l ${PORT:-4242}',
+        # next dev with no flags
+        'next dev':
+            'next dev -p ${PORT:-4242} -H 0.0.0.0',
+        # next dev with explicit -p already → re-normalised
+        'next dev -p 8080':
+            'next dev -p ${PORT:-4242} -H 0.0.0.0',
+        # next dev with -p and -H → both flags stripped + re-added
+        'next dev -p 4000 -H 127.0.0.1':
+            'next dev -p ${PORT:-4242} -H 0.0.0.0',
+        # vite with no flags
+        'vite':
+            'vite --port ${PORT:-4242} --host 0.0.0.0',
+        # python http.server with literal port
+        'python -m http.server 8000':
+            'python -m http.server ${PORT:-8000}',
+        # unrecognised command — left alone
+        'echo hello':
+            'echo hello',
+    }
+    for source, expected in cases.items():
+        got = ab.rewrite_dev_command_for_port(source, 4242)
+        assert got == expected, f'rewrite of {source!r} -> {got!r}, expected {expected!r}'
 
 
 def test_invalid_repo_full_rejected_before_side_effects(workspace):
