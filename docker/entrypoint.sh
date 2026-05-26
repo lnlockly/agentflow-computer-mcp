@@ -259,6 +259,17 @@ elif [[ -z "${AF_API_KEY:-}" ]]; then
   exec agentflow-desktop selftest
 fi
 
+# OpenCode CLI routes through the AgentFlow LLM gateway by default. The
+# gateway speaks the Anthropic Messages API at /llm/v1/messages, so
+# `opencode` just needs the standard ANTHROPIC_* env vars pointed at it.
+# AF_API_KEY (owner key, af_live_*) is accepted as the bearer.
+# Skip if the operator overrode ANTHROPIC_BASE_URL — they know better.
+if [[ -n "${AF_API_KEY:-}" && -z "${ANTHROPIC_BASE_URL:-}" ]]; then
+  export ANTHROPIC_BASE_URL="${AF_API_URL:-https://agentflow.website}/llm/v1"
+  export ANTHROPIC_API_KEY="${AF_API_KEY}"
+  echo "[entrypoint] opencode wired to ${ANTHROPIC_BASE_URL}" >&2
+fi
+
 # Hand off. `exec` so signals (SIGTERM from kubectl delete) reach the
 # Python process directly. No `--headless` flag — `agentflow-desktop run`
 # is headless by default (Xvfb provides the display via env DISPLAY=:99).
