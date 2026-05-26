@@ -125,12 +125,13 @@ def test_composed_prompt_does_not_inject_listen_flag(workspace):
         spawn_opencode=spawner,
     )
     composed = spawner.calls[0]["brief"]
-    # The brief must explicitly forbid the `--listen` flag for serve v14.
-    # We assert the negative warning, not absence of the substring (the
-    # warning itself spells the banned flag).
+    # The brief tells opencode to run the template's dev script
+    # verbatim and forbids extra flags. Phrased as "no flags added"
+    # rather than naming each banned flag — opencode followed the long
+    # list literally in earlier versions, the shorter rule is robust.
     lc = composed.lower()
-    assert "do not add" in lc or "do NOT add" in composed
-    assert "--listen" in composed  # mentioned only inside the warning
+    assert "no flags added" in lc
+    assert "do not modify package.json" in lc
 
 
 def test_composed_prompt_does_not_embed_literal_port_number(workspace):
@@ -154,8 +155,6 @@ def test_composed_prompt_does_not_embed_literal_port_number(workspace):
     composed = spawner.calls[0]["brief"]
     assert "3742" not in composed
     assert "$PORT" in composed
-    # Reinforces the no-flag rule downstream.
-    assert "--listen" in composed  # warning text mentions the banned flag
 
 
 def test_package_json_dev_scripts_rewritten_to_use_port_env(tmp_path):
