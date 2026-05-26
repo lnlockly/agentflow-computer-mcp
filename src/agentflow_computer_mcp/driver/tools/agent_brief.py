@@ -30,7 +30,12 @@ import json
 import logging
 import os
 import shutil
+import socket
 import subprocess
+import threading
+import time
+import urllib.error
+import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -296,28 +301,37 @@ def agent_dev_brief(
     # `PORT` env var is exported below. Telling opencode "bind to port
     # N" risks an LLM hallucination — wrong flag, wrong stack, wrong
     # number. The deterministic path is "trust the template + env".
+    # Brief is split into IMPERATIVE blocks — opencode treats these as
+    # commands, not questions. Earlier versions used quoted code blocks
+    # ("`curl …`") and opencode mistook the prompt for a citation,
+    # refused to run the server, and left the project stuck. Verified
+    # 2026-05-26 on pod hd-f86ecd7d-0 (project 1506): edit ran, dev
+    # server never started, opencode logged 'это оформлено как цитата'.
     composed = (
-        f"You are bootstrapping a project from a GitHub template clone in {project_dir}. "
-        f"Brief from the user: {brief.strip()}\n\n"
-        "Steps:\n"
-        "1. Inspect package.json / pyproject.toml / Cargo.toml to identify the stack.\n"
-        "2. Install dependencies using the project's package manager (pnpm if pnpm-lock.yaml, "
-        "yarn if yarn.lock, npm otherwise; uv/pip for Python).\n"
-        "3. Edit files to satisfy the brief — landing copy, page content, brand, sections, etc. "
-        "Do NOT edit `package.json` scripts — the platform has already patched them to honour "
-        "the `$PORT` environment variable.\n"
-        "4. Start the dev server in the background so it survives your exit. "
-        "Use the project's own dev script verbatim: "
-        "`nohup npm run dev > /tmp/dev.log 2>&1 & disown` "
-        "(swap `npm` for `pnpm`/`yarn` to match the lockfile). "
-        "The `PORT` env var is already set; the dev script reads it automatically. "
-        "Do not add `--listen`, `--host`, `-H`, `-p`, or `--port` flags.\n"
-        "5. Confirm the server is reachable: "
-        '`curl -sf "http://127.0.0.1:$PORT/" | head -c 200` '
-        "must return HTTP 200 with the edited content. Retry once if the first attempt is too early. "
-        "For Telegram bots and other non-HTTP runtimes: confirm the process is alive "
-        "(`pgrep -f <entry>`) and skip the curl.\n"
-        "Do not ask the user for anything; act autonomously."
+        f"You are bootstrapping a project at {project_dir}. "
+        f"User's brief: {brief.strip()}\n\n"
+        "You MUST complete every numbered step. Do not summarise. "
+        "Do not ask for confirmation. Treat each shell command below as "
+        "an instruction to execute, not text to quote back.\n\n"
+        "1. Identify the stack by reading package.json (or pyproject.toml / Cargo.toml).\n"
+        "2. Install dependencies with the project's package manager: "
+        "pnpm if pnpm-lock.yaml exists, yarn if yarn.lock exists, npm otherwise. "
+        "For Python use uv if available, else pip.\n"
+        "3. Edit project files to satisfy the user's brief. "
+        "Do NOT modify package.json scripts — they have been pre-patched "
+        "to read the PORT environment variable.\n"
+        "4. Start the dev server. Run exactly this command in a shell, "
+        "no flags added:\n"
+        "       nohup npm run dev > /tmp/dev.log 2>&1 & disown\n"
+        "   (Substitute pnpm or yarn for npm to match the lockfile.) "
+        "The PORT environment variable is already set; npm passes it to the script.\n"
+        "5. Verify the server replies. Run:\n"
+        "       sleep 3 && curl -sf http://127.0.0.1:$PORT/ | head -c 200\n"
+        "   The first attempt may be early — retry once after another `sleep 3` if it failed.\n"
+        "6. End your run after step 5 succeeds. Do not stop the dev server.\n\n"
+        "For Telegram bots or other non-HTTP runtimes: "
+        "in step 4 spawn the entrypoint via `nohup … & disown`; "
+        "in step 5 confirm the process is alive with `pgrep -f <entrypoint>` instead of curl."
     )
 
     # Pin opencode's provider to the AgentFlow gateway + a real model.
@@ -374,6 +388,24 @@ def agent_dev_brief(
             "project_dir": project_dir,
         }
 
+    # Fire-and-forget watcher that polls the dev port and POSTs
+    # clone-status back to the platform. Without this, the backend never
+    # learns the dev server is up and the auto-expose step never runs —
+    # the project sits in `provisioning` forever. Daemon-thread so it
+    # cannot block process shutdown.
+    threading.Thread(
+        target=_watch_and_report_clone_status,
+        name=f"clone-status-watcher-{project_id}",
+        kwargs={
+            "project_id": project_id,
+            "slug": slug,
+            "port": port,
+            "project_dir": project_dir,
+            "repo_url": repo_url,
+        },
+        daemon=True,
+    ).start()
+
     return {
         "ok": True,
         "project_id": project_id,
@@ -384,6 +416,125 @@ def agent_dev_brief(
         "log_file": log_file,
         "port": port,
     }
+
+
+def _watch_and_report_clone_status(
+    *,
+    project_id: int,
+    slug: str,
+    port: int,
+    project_dir: str,
+    repo_url: str,
+    timeout_sec: float = 900.0,
+    poll_interval_sec: float = 5.0,
+) -> None:
+    """Background watcher: poll the dev port + POST clone-status.
+
+    Polls `http://127.0.0.1:{port}/` once every ``poll_interval_sec``.
+    On the first 2xx/3xx response, POSTs a successful clone-status to
+    the backend with ``pod_ip`` so the auto-expose step can wire the
+    public ingress. If the port never opens within ``timeout_sec``
+    (~15 min — long enough for `pnpm install` + `next build`), reports
+    `ok=false, error=port_unreachable`. Idempotent on the backend side:
+    re-running clone-status repoints the existing Service/Endpoints.
+    """
+    api_base = os.environ.get("AF_API_URL", "https://agentflow.website").rstrip("/")
+    internal_secret = os.environ.get("AF_INTERNAL_API_SECRET", "")
+    if not internal_secret:
+        log.info(
+            "clone-status watcher skipping report for project %d — "
+            "AF_INTERNAL_API_SECRET unset",
+            project_id,
+        )
+        return
+    pod_ip = _resolve_pod_ip()
+    deadline = time.monotonic() + timeout_sec
+    port_reachable = False
+    while time.monotonic() < deadline:
+        if _http_probe(port):
+            port_reachable = True
+            break
+        time.sleep(poll_interval_sec)
+
+    body = {
+        "ok": port_reachable,
+        "port_reachable": port_reachable,
+        "port": port,
+        "project_dir": project_dir,
+        "repo_url": repo_url,
+        "pod_ip": pod_ip,
+    }
+    if not port_reachable:
+        body["error"] = "port_unreachable"
+        body["detail"] = (
+            f"dev port {port} did not respond within {int(timeout_sec)}s "
+            f"on slug={slug}"
+        )
+
+    url = f"{api_base}/internal/projects/{project_id}/clone-status"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+        headers={
+            "content-type": "application/json",
+            "x-agentflow-secret": internal_secret,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310 — internal URL only
+            resp.read()
+    except (urllib.error.URLError, OSError) as exc:
+        log.warning(
+            "clone-status report failed for project %d: %s", project_id, exc
+        )
+
+
+def _http_probe(port: int) -> bool:
+    """Return True iff GET http://127.0.0.1:{port}/ replies in <2s.
+
+    Treats any HTTP response (including 404 / 500) as "the server is
+    listening". A connection refused / DNS failure / timeout reads
+    as "not ready yet". Keeps the watcher cheap: a single TCP
+    round-trip per poll, no full body read.
+    """
+    try:
+        with urllib.request.urlopen(  # noqa: S310 — loopback only
+            f"http://127.0.0.1:{port}/", timeout=2
+        ) as resp:
+            return 100 <= resp.status < 600
+    except urllib.error.HTTPError as exc:
+        return 100 <= int(exc.code or 0) < 600
+    except (urllib.error.URLError, OSError, ConnectionError):
+        return False
+
+
+def _resolve_pod_ip() -> str | None:
+    """Best-effort lookup of the daemon pod's IP.
+
+    Order: ``POD_IP`` env (kubernetes downward API), else the
+    hostname-resolved IP, else None. The backend tolerates missing
+    pod_ip — it just skips the auto-expose step.
+    """
+    explicit = (os.environ.get("POD_IP") or "").strip()
+    if explicit:
+        return explicit
+    try:
+        # gethostbyname(gethostname()) — returns 127.0.1.1 on some
+        # distros; the connect-to-public trick reliably reports the
+        # routable IP. Failures fall through to the hostname path.
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(0.5)
+            sock.connect(("10.255.255.255", 1))
+            ip = sock.getsockname()[0]
+            if ip and ip != "127.0.0.1":
+                return ip
+    except OSError:
+        pass
+    try:
+        return socket.gethostbyname(socket.gethostname())
+    except OSError:
+        return None
 
 
 AGENT_DEV_BRIEF_DESCRIPTOR: dict[str, Any] = {
