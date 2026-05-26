@@ -70,6 +70,14 @@ class WSClient:
         self._stop = asyncio.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._handshake_completed: bool = False
+        # Strong refs to background tasks (tool calls + direct-tool dispatch).
+        # asyncio.create_task() returns a Task whose only strong ref is the
+        # loop's _ready / _scheduled lists — once a task awaits, the loop
+        # drops it from _ready and the only refcount left is the caller's.
+        # If we discard the result, GC may collect the Task mid-run and the
+        # coroutine never resumes after its first await. We hold strong refs
+        # here and drop them via done-callback.
+        self._bg_tasks: set[asyncio.Task[Any]] = set()
 
     async def run(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -199,7 +207,7 @@ class WSClient:
                 await self._handle_hello_ack(msg)
                 continue
             if mtype == "tool_call_request":
-                asyncio.create_task(self._handle_tool_call(msg))
+                self._spawn_bg(self._handle_tool_call(msg))
                 continue
             if mtype == "task_dispatch":
                 self._handle_task_dispatch(msg)
@@ -262,7 +270,7 @@ class WSClient:
         # zero LLM-call latency.
         direct_tool = str(msg.get("tool") or "").strip()
         if direct_tool and task_id:
-            asyncio.create_task(self._handle_direct_tool(task_id, direct_tool, scope or {}))
+            self._spawn_bg(self._handle_direct_tool(task_id, direct_tool, scope or {}))
             return
         if not task_id or not task:
             log.warning("task_dispatch missing id/task: %s", msg)
@@ -278,6 +286,17 @@ class WSClient:
                 self._on_task_dispatch(task_id, task, scope)  # type: ignore[call-arg]
         except Exception as exc:  # noqa: BLE001
             log.exception("task_dispatch handler failed: %s", exc)
+
+    def _spawn_bg(self, coro: Awaitable[Any]) -> asyncio.Task[Any]:
+        """Schedule a coroutine and hold a strong ref so the GC can't collect
+        the Task mid-run. The asyncio docs explicitly warn that callers must
+        retain references to tasks they create — losing the ref drops the
+        coroutine's only strong reference once the loop unschedules it.
+        """
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
 
     async def _handle_direct_tool(
         self, task_id: str, tool_name: str, args: dict[str, Any]
