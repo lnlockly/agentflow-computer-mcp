@@ -71,9 +71,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # only writes to /data and ~/.agentflow so we don't need root after the
 # image is built.
 RUN useradd -ms /bin/bash -u 1001 agentflow \
-    && mkdir -p /data /etc/agentflow /tmp/.X11-unix \
+    && mkdir -p /data /etc/agentflow /tmp/.X11-unix /workspace \
     && chmod 1777 /tmp/.X11-unix \
-    && chown -R agentflow:agentflow /data /etc/agentflow
+    && chown -R agentflow:agentflow /data /etc/agentflow /workspace
 
 WORKDIR /opt/agentflow
 
