@@ -26,6 +26,7 @@ Design rules mirror ``project_setup.py``:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -69,7 +70,14 @@ def _default_spawn_opencode(
     except OSError as exc:
         return {"ok": False, "error": "open_log_failed", "detail": str(exc)}
 
-    cmd = [opencode_bin, "run", brief]
+    # --dangerously-skip-permissions: opencode otherwise asks for
+    # permission on every file outside its strict cwd guess, including
+    # the project's own subdirectories — verified empirically in pod
+    # hd-f86ecd7d-0 on 2026-05-26: every spawn died with
+    # `permission requested: external_directory (/workspace/proj-*); auto-rejecting`
+    # and exited as a zombie. The flag unblocks the agent for the
+    # hosted sandbox we already enforce at the pod boundary.
+    cmd = [opencode_bin, "run", "--dangerously-skip-permissions", brief]
     try:
         proc = subprocess.Popen(  # noqa: S603 — opencode is on PATH from image
             cmd,
@@ -182,6 +190,43 @@ def agent_dev_brief(
         "5. Confirm the server is reachable and the brief is reflected on the page.\n"
         "Do not ask the user for anything; act autonomously."
     )
+
+    # Pin opencode's provider to the AgentFlow gateway + a real model.
+    # Without this opencode falls back to its built-in default
+    # (`gpt-5.3-chat-latest`) which our gateway does not list, and the
+    # subprocess dies on first turn with «Model not available».
+    # Project-local `opencode.json` wins over `~/.config/opencode/`.
+    # AF_API_KEY is the per-pod owner key already injected by
+    # renderDaemonManifest (agentflow-agents).
+    api_key = os.environ.get("AF_API_KEY", "")
+    if api_key:
+        opencode_cfg = {
+            "$schema": "https://opencode.ai/config.json",
+            "model": "openai/gpt-5.3-codex",
+            "permission": {
+                "edit": "allow",
+                "bash": "allow",
+                "webfetch": "allow",
+            },
+            "provider": {
+                "openai": {
+                    "options": {
+                        "baseURL": (
+                            os.environ.get("AF_API_URL", "https://agentflow.website").rstrip("/")
+                            + "/llm/v1"
+                        ),
+                        "apiKey": api_key,
+                    },
+                    "models": {"gpt-5.3-codex": {}},
+                }
+            },
+        }
+        try:
+            Path(project_dir, "opencode.json").write_text(
+                json.dumps(opencode_cfg, indent=2), encoding="utf-8"
+            )
+        except OSError as exc:
+            log.warning("could not write opencode.json: %s", exc)
 
     env = {**os.environ, "PORT": str(port), "BROWSER": "none", "CI": "1"}
     spawn_res = spawn_opencode(
