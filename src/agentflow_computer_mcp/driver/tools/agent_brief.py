@@ -49,6 +49,92 @@ OPENCODE_PID_FILE = "/tmp/agent-brief-opencode.pid"
 OPENCODE_LOG_FILE = "/tmp/agent-brief-opencode.log"
 
 
+def rewrite_dev_command_for_port(command: str, port: int) -> str:
+    """Rewrite a package.json `scripts.dev` value to honour ``$PORT``.
+
+    Pure function: no I/O, no exceptions outside ``re``. The four
+    rules below cover every dev-server we ship templates for. An
+    unrecognised command is returned untouched — opencode can still
+    edit it manually, but the deterministic path stops here.
+
+    `${PORT:-N}` is POSIX parameter expansion: it uses ``$PORT`` when
+    set, otherwise the original literal port. npm executes scripts
+    through ``sh -c`` on Linux + macOS, so this always works in our
+    hosted daemon pods.
+    """
+    import re
+
+    raw = (command or "").strip()
+    if not raw:
+        return command
+
+    # serve (v14): `serve -l 3000 -L .` → `serve -l ${PORT:-3000} -L .`
+    m = re.search(r"\bserve\b[^&|;]*?-l\s+(\d+)", raw)
+    if m:
+        return raw.replace(m.group(0), m.group(0).replace(m.group(1), f"${{PORT:-{m.group(1)}}}"), 1)
+    if re.search(r"\bserve\b", raw) and "-l" not in raw:
+        # `serve .` style — append explicit listen flag.
+        return raw + f" -l ${{PORT:-{port}}}"
+
+    # next dev: `next dev` (with or without -p N) → `next dev -p ${PORT:-N} -H 0.0.0.0`
+    if re.search(r"\bnext\s+dev\b", raw):
+        # Strip any existing -p / --port / -H flags, then re-add normalised.
+        cleaned = re.sub(r"\s+-p\s+\S+", "", raw)
+        cleaned = re.sub(r"\s+--port[=\s]\S+", "", cleaned)
+        cleaned = re.sub(r"\s+-H\s+\S+", "", cleaned)
+        cleaned = re.sub(r"\s+--hostname[=\s]\S+", "", cleaned)
+        return f"{cleaned} -p ${{PORT:-{port}}} -H 0.0.0.0"
+
+    # vite: `vite` (with or without --port N) → `vite --port ${PORT:-N} --host 0.0.0.0`
+    if re.search(r"\bvite\b", raw) and "preview" not in raw:
+        cleaned = re.sub(r"\s+--port[=\s]\S+", "", raw)
+        cleaned = re.sub(r"\s+--host[=\s]\S+", "", cleaned)
+        return f"{cleaned} --port ${{PORT:-{port}}} --host 0.0.0.0"
+
+    # python http.server: `python -m http.server 3000` → `… ${PORT:-3000}`
+    m = re.search(r"http\.server\s+(\d+)", raw)
+    if m:
+        return raw.replace(m.group(0), f"http.server ${{PORT:-{m.group(1)}}}", 1)
+
+    return raw
+
+
+def _patch_package_json_for_port(pkg_path: Path, port: int) -> None:
+    """Edit ``scripts.dev`` (and ``scripts.start`` when ``dev`` is missing)
+    so the dev server binds to ``$PORT``. Silent no-op if the file is
+    absent, malformed, or the scripts block does not exist — the brief
+    still asks opencode to act, and an exotic template will fail loudly
+    later in the cabinet log rather than corrupt the daemon state.
+    """
+    try:
+        raw = pkg_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(data, dict):
+        return
+    scripts = data.get("scripts")
+    if not isinstance(scripts, dict):
+        return
+    touched = False
+    for key in ("dev", "start"):
+        value = scripts.get(key)
+        if isinstance(value, str) and value.strip():
+            new_value = rewrite_dev_command_for_port(value, port)
+            if new_value != value:
+                scripts[key] = new_value
+                touched = True
+    if not touched:
+        return
+    try:
+        pkg_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        log.warning("could not rewrite %s: %s", pkg_path, exc)
+
+
 def _default_spawn_opencode(
     brief: str,
     cwd: str,
@@ -174,6 +260,16 @@ def agent_dev_brief(
     except OSError as exc:
         return {"ok": False, "error": "git_history_strip_failed", "detail": str(exc)}
 
+    # Pin the dev-server port deterministically — no LLM in the loop. The
+    # shared daemon pod hosts many projects from one user, and each one
+    # gets a unique port assigned by the backend (`projects.preview_port`)
+    # so previews stay independent. Patching the template's `package.json`
+    # to read `${PORT:-<default>}` lets the daemon hand the port via the
+    # PORT env (already injected below) without trusting opencode to
+    # follow an instruction. npm executes `scripts.dev` under `sh -c`, so
+    # POSIX-style parameter expansion always works.
+    _patch_package_json_for_port(Path(project_dir) / "package.json", port)
+
     # The composed prompt tells opencode what shape we expect: install
     # deps, satisfy the brief, start the dev server on the project's
     # canonical port. Opencode picks the package manager + dev command
@@ -195,6 +291,11 @@ def agent_dev_brief(
     # PID 1 (tini), so it keeps listening on $port after opencode is
     # gone. Without this, the dev server lived for ~2 seconds and the
     # public URL stayed 502.
+    # No port numbers in the brief on purpose: the daemon pre-patched
+    # `package.json` so `npm run dev` already binds to `$PORT`, and the
+    # `PORT` env var is exported below. Telling opencode "bind to port
+    # N" risks an LLM hallucination — wrong flag, wrong stack, wrong
+    # number. The deterministic path is "trust the template + env".
     composed = (
         f"You are bootstrapping a project from a GitHub template clone in {project_dir}. "
         f"Brief from the user: {brief.strip()}\n\n"
@@ -202,14 +303,20 @@ def agent_dev_brief(
         "1. Inspect package.json / pyproject.toml / Cargo.toml to identify the stack.\n"
         "2. Install dependencies using the project's package manager (pnpm if pnpm-lock.yaml, "
         "yarn if yarn.lock, npm otherwise; uv/pip for Python).\n"
-        "3. Edit files to satisfy the brief — landing copy, page content, brand, sections, etc.\n"
-        f"4. Start the dev server in the background so it survives your exit. "
-        "Use the project's own dev script verbatim — do NOT add `--listen`, "
-        f"`--host`, `-H`, or `-p` flags; the template already binds to port {port}. "
-        f"Run it like: `nohup npm run dev > /tmp/dev.log 2>&1 & disown` "
-        "(swap `npm` for `pnpm`/`yarn` to match the lockfile).\n"
-        f"5. Confirm the server is reachable: `curl -sf http://127.0.0.1:{port}/ | head -c 200` "
-        "must return HTTP 200 with the edited content. Retry once if the first attempt is too early.\n"
+        "3. Edit files to satisfy the brief — landing copy, page content, brand, sections, etc. "
+        "Do NOT edit `package.json` scripts — the platform has already patched them to honour "
+        "the `$PORT` environment variable.\n"
+        "4. Start the dev server in the background so it survives your exit. "
+        "Use the project's own dev script verbatim: "
+        "`nohup npm run dev > /tmp/dev.log 2>&1 & disown` "
+        "(swap `npm` for `pnpm`/`yarn` to match the lockfile). "
+        "The `PORT` env var is already set; the dev script reads it automatically. "
+        "Do not add `--listen`, `--host`, `-H`, `-p`, or `--port` flags.\n"
+        "5. Confirm the server is reachable: "
+        '`curl -sf "http://127.0.0.1:$PORT/" | head -c 200` '
+        "must return HTTP 200 with the edited content. Retry once if the first attempt is too early. "
+        "For Telegram bots and other non-HTTP runtimes: confirm the process is alive "
+        "(`pgrep -f <entry>`) and skip the curl.\n"
         "Do not ask the user for anything; act autonomously."
     )
 
