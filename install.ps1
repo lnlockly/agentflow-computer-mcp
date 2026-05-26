@@ -1,12 +1,25 @@
 # AgentFlow Desktop installer (Windows).
 #
 # One-liner from the cabinet:
+#   $env:AGENTFLOW_API_KEY = '<key>'
+#   iwr -useb https://agentflow.website/install/computer-mcp.ps1 | iex
+#
+# Legacy invocation (still supported):
 #   $env:AF_KEY="..."; $env:AF_DEVICE_ID="..."; $env:AF_DEVICE_TOKEN="..."
 #   iwr -useb https://agentflow.website/install/computer-mcp.ps1 | iex
+#
+# AGENTFLOW_API_KEY is the canonical env var; AF_KEY stays as alias.
+# Device id / token are optional now — daemon enrols on first launch.
 #
 # Requirements: PowerShell 5.1+, Python 3.11+ on PATH.
 
 $ErrorActionPreference = "Stop"
+
+# Bridge AGENTFLOW_API_KEY → AF_KEY so the rest of the script keeps the
+# existing semantics. AGENTFLOW_API_KEY wins when both are set.
+if ($env:AGENTFLOW_API_KEY -and -not $env:AF_KEY) {
+    $env:AF_KEY = $env:AGENTFLOW_API_KEY
+}
 
 function Read-IfMissing {
     param([string]$Name, [string]$Prompt)
@@ -25,8 +38,8 @@ function Read-IfMissing {
 }
 
 $AfKey         = Read-IfMissing "AF_KEY"          "AgentFlow API key (af_live_...)"
-$AfDeviceId    = Read-IfMissing "AF_DEVICE_ID"    "Device ID (uuid from cabinet)"
-$AfDeviceToken = Read-IfMissing "AF_DEVICE_TOKEN" "One-time device token"
+$AfDeviceId    = $env:AF_DEVICE_ID
+$AfDeviceToken = $env:AF_DEVICE_TOKEN
 
 $AfWsUrl = $env:AF_WS_URL
 if (-not $AfWsUrl) { $AfWsUrl = "wss://agentflow.website/_agents/_devices/connect" }

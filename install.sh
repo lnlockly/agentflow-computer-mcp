@@ -2,8 +2,20 @@
 # AgentFlow Desktop — cross-platform installer (macOS + Linux).
 #
 # One-liner usage from the cabinet:
+#   curl -fsSL https://agentflow.website/install/computer-mcp.sh | \
+#     AGENTFLOW_API_KEY=<key> bash
+#
+# Legacy invocation (still supported):
 #   curl -sSL https://agentflow.website/install/computer-mcp.sh | \
 #     AF_KEY=<key> AF_DEVICE_ID=<uuid> AF_DEVICE_TOKEN=<token> bash
+#
+# AGENTFLOW_API_KEY is the canonical env var — the cabinet inlines it
+# into the one-liner the user pastes. AF_KEY stays as an alias for the
+# old docs / cabinet builds that still emit it.
+#
+# AF_DEVICE_ID / AF_DEVICE_TOKEN are optional now. When absent, the
+# daemon enrols on first launch via the API key alone (the server side
+# mints a device row + secret on demand).
 #
 # For Windows use install.ps1 (or install.bat for cmd.exe shells).
 
@@ -12,6 +24,13 @@ set -euo pipefail
 AF_DIR="${HOME}/.agentflow"
 AF_CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/agentflow"
 AF_WS_URL="${AF_WS_URL:-wss://agentflow.website/_agents/_devices/connect}"
+
+# Canonical → legacy env-var bridge. AGENTFLOW_API_KEY wins if both are
+# set; that's the value the cabinet ships in the curl one-liner today.
+if [[ -n "${AGENTFLOW_API_KEY:-}" && -z "${AF_KEY:-}" ]]; then
+  AF_KEY="${AGENTFLOW_API_KEY}"
+  export AF_KEY
+fi
 
 log() { printf '[install] %s\n' "$*"; }
 fail() { printf '[install] error: %s\n' "$*" >&2; exit 1; }
@@ -36,8 +55,11 @@ prompt_if_missing() {
 }
 
 prompt_if_missing AF_KEY "AgentFlow API key (af_live_…)"
-prompt_if_missing AF_DEVICE_ID "Device ID (uuid from cabinet)"
-prompt_if_missing AF_DEVICE_TOKEN "One-time device token"
+# Device id + one-time token are optional. When absent, the daemon
+# auto-enrols on first launch using the API key alone. Cabinet flow
+# now only requires the key; legacy CI scripts can still pass both.
+AF_DEVICE_ID="${AF_DEVICE_ID:-}"
+AF_DEVICE_TOKEN="${AF_DEVICE_TOKEN:-}"
 
 mkdir -p "${AF_DIR}" "${AF_CONFIG_DIR}"
 
@@ -101,7 +123,10 @@ EOF
 }
 
 success_banner() {
-  local url="https://agentflow.website/cabinet/devices/${AF_DEVICE_ID}/live"
+  local url="https://agentflow.website/cabinet/devices"
+  if [[ -n "${AF_DEVICE_ID}" ]]; then
+    url="${url}/${AF_DEVICE_ID}/live"
+  fi
   cat <<EOF
 
 AgentFlow Desktop installed.
