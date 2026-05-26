@@ -30,6 +30,7 @@ import logging
 import os
 import shutil
 import subprocess
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -97,6 +98,17 @@ def _default_spawn_opencode(
     return {"ok": True, "pid": proc.pid}
 
 
+def _default_pid_alive(pid: int) -> bool:
+    """Return True iff the process is still running. signal 0 just probes."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+
+
 def agent_dev_brief(
     template_repo_full: str,
     slug: str,
@@ -110,6 +122,9 @@ def agent_dev_brief(
     run: Callable[..., dict[str, Any]] = _default_run,
     spawn_opencode: Callable[..., dict[str, Any]] = _default_spawn_opencode,
     opencode_bin: str = "opencode",
+    readback_seconds: float = 5.0,
+    pid_alive: Callable[[int], bool] = _default_pid_alive,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
     """Clone repo + hand the brief to opencode.
 
@@ -200,15 +215,61 @@ def agent_dev_brief(
             "project_dir": project_dir,
         }
 
+    pid = int(spawn_res.get("pid", 0))
+
+    # Diagnostic readback. The previous version returned ok immediately
+    # after Popen, which means a crash in the first millisecond (missing
+    # opencode binary, bad ANTHROPIC_BASE_URL, segfault, missing model
+    # config) showed up as a silent `task.complete` with no signal. Wait
+    # a few seconds, then surface either:
+    #   - the early-exit reason (process gone, log content),
+    #   - or the first chunk of the log so the cabinet can show "opencode
+    #     printed: <first 2 KB>" while the long-running install proceeds.
+    died_early = False
+    if pid > 0 and readback_seconds > 0:
+        # Probe every 100 ms up to the deadline. If the process is gone
+        # before the deadline, mark it as died.
+        steps = max(1, int(readback_seconds * 10))
+        for _ in range(steps):
+            sleep(0.1)
+            if not pid_alive(pid):
+                died_early = True
+                break
+
+    log_excerpt = ""
+    try:
+        with open(log_file, encoding="utf-8", errors="replace") as fh:
+            log_excerpt = fh.read(4096)
+    except OSError:
+        pass
+
+    if died_early:
+        # Process died inside the readback window — almost always a config
+        # problem (missing API key, bad URL, opencode crashed). Surface it
+        # as a hard failure so the platform stops at provisioning + the
+        # cabinet shows the reason instead of an infinite spinner.
+        return {
+            "ok": False,
+            "error": "opencode_died_at_startup",
+            "detail": (log_excerpt[-1500:] if log_excerpt else "no log captured")
+            or "no log",
+            "project_dir": project_dir,
+            "opencode_pid": pid,
+            "log_file": log_file,
+        }
+
+    # Still alive after 5 s — return the early log so the cabinet sees
+    # something useful while the install + edits proceed in the background.
     return {
         "ok": True,
         "project_id": project_id,
         "slug": slug,
         "project_dir": project_dir,
         "repo_url": repo_url,
-        "opencode_pid": int(spawn_res.get("pid", 0)),
+        "opencode_pid": pid,
         "log_file": log_file,
         "port": port,
+        "opencode_boot_log": log_excerpt[:2000],
     }
 
 
