@@ -73,6 +73,8 @@ def test_happy_path_clones_and_spawns_opencode(workspace):
         workspace_root=str(workspace),
         run=runner,
         spawn_opencode=spawner,
+        pid_alive=lambda _pid: True,
+        sleep=lambda _s: None,
     )
     assert result["ok"] is True
     assert result["opencode_pid"] == 9999
@@ -96,6 +98,8 @@ def test_invalid_repo_full_rejected_before_side_effects(workspace):
         workspace_root=str(workspace),
         run=runner,
         spawn_opencode=spawner,
+        pid_alive=lambda _pid: True,
+        sleep=lambda _s: None,
     )
     assert result == {"ok": False, "error": "invalid_template_repo_full"}
     assert runner.calls == []
@@ -113,6 +117,8 @@ def test_invalid_slug_rejected(workspace):
         workspace_root=str(workspace),
         run=runner,
         spawn_opencode=spawner,
+        pid_alive=lambda _pid: True,
+        sleep=lambda _s: None,
     )
     assert result["ok"] is False
     assert result["error"] == "invalid_slug"
@@ -129,6 +135,8 @@ def test_missing_brief_rejected(workspace):
         workspace_root=str(workspace),
         run=runner,
         spawn_opencode=spawner,
+        pid_alive=lambda _pid: True,
+        sleep=lambda _s: None,
     )
     assert result["ok"] is False
     assert result["error"] == "missing_brief"
@@ -147,6 +155,8 @@ def test_git_clone_failure_short_circuits(workspace):
         workspace_root=str(workspace),
         run=runner,
         spawn_opencode=spawner,
+        pid_alive=lambda _pid: True,
+        sleep=lambda _s: None,
     )
     assert result["ok"] is False
     assert result["error"] == "git_clone_failed"
@@ -164,6 +174,8 @@ def test_opencode_spawn_failure_surfaces_error(workspace):
         workspace_root=str(workspace),
         run=runner,
         spawn_opencode=spawner,
+        pid_alive=lambda _pid: True,
+        sleep=lambda _s: None,
     )
     assert result["ok"] is False
     assert result["error"] == "opencode_not_found"
@@ -180,6 +192,55 @@ def test_invalid_project_id_rejected(workspace):
         workspace_root=str(workspace),
         run=runner,
         spawn_opencode=spawner,
+        pid_alive=lambda _pid: True,
+        sleep=lambda _s: None,
     )
     assert result["ok"] is False
     assert result["error"] == "invalid_project_id"
+
+
+def test_opencode_died_at_startup_surfaces_log_excerpt(workspace, tmp_path):
+    """If opencode dies inside the readback window, surface the log."""
+    log_file = tmp_path / "opencode.log"
+    log_file.write_text("[opencode] panic: ANTHROPIC_API_KEY missing\nexit code 1\n")
+
+    runner = FakeRunner()
+    spawner = FakeOpencodeSpawner(pid=4242)
+    # pid_alive returns False immediately → simulate the process having died
+    result = ab.agent_dev_brief(
+        "owner/repo",
+        "demo",
+        42,
+        "brief",
+        workspace_root=str(workspace),
+        run=runner,
+        spawn_opencode=spawner,
+        log_file=str(log_file),
+        pid_alive=lambda _pid: False,
+        sleep=lambda _s: None,
+    )
+    assert result["ok"] is False
+    assert result["error"] == "opencode_died_at_startup"
+    assert "ANTHROPIC_API_KEY missing" in result["detail"]
+
+
+def test_opencode_alive_returns_boot_log_excerpt(workspace, tmp_path):
+    log_file = tmp_path / "opencode.log"
+    log_file.write_text("[opencode] starting...\n[opencode] reading repo...\n")
+
+    runner = FakeRunner()
+    spawner = FakeOpencodeSpawner(pid=7777)
+    result = ab.agent_dev_brief(
+        "owner/repo",
+        "demo",
+        42,
+        "brief",
+        workspace_root=str(workspace),
+        run=runner,
+        spawn_opencode=spawner,
+        log_file=str(log_file),
+        pid_alive=lambda _pid: True,
+        sleep=lambda _s: None,
+    )
+    assert result["ok"] is True
+    assert "starting" in result["opencode_boot_log"]
