@@ -559,6 +559,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Bring up GlitchTip / Sentry as early as possible so a crash inside
+    # build_parser or argparse still reports. Safe no-op when SENTRY_DSN
+    # is unset (selftest, local dev, CI).
+    try:
+        from .observability import init_sentry
+
+        init_sentry()
+    except Exception:  # noqa: BLE001 — observability must never block boot
+        pass
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.version:
