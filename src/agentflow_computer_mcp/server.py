@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
 from .config import AppConfig, load_config
 from .confirm import confirm, confirm_summary
+from .driver.tools.project_setup import project_clone_and_setup
 from .scope import requires_confirm
 from .tools import clipboard as clipboard_tool
 from .tools import code as code_tool
@@ -296,8 +298,6 @@ async def _dispatch_tool(name: str, args: dict[str, Any], config: AppConfig) -> 
     # `computer.*` LLM-visible surface to avoid prompting the model with
     # internal platform calls.
     if name == "project_clone_and_setup":
-        import os
-        from .driver.tools.project_setup import project_clone_and_setup
         api_base = os.environ.get("AF_API_URL", "https://agentflow.website").rstrip("/")
         if not api_base.endswith("/_agents"):
             api_base = api_base + "/_agents"
