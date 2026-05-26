@@ -267,5 +267,10 @@ fi
 # The daemon itself emits `STEP launch_daemon ok` after WS handshake and
 # `STEP verify_install <status>` after the hello-world task completes.
 emit_step launch_daemon running
-echo "[entrypoint] handing off to agentflow-desktop run" >&2
-exec agentflow-desktop run
+# Bind the HTTP viewer on all interfaces so the kubelet readiness probe
+# (httpGet on the pod IP:8765/api/health) can reach it. The CLI default
+# is 127.0.0.1 which works for local desktop installs but leaves the
+# kubelet hitting connection refused in hosted pods. Audit-line in
+# PERFECTION_MISSION.md → "Hosted pod readiness probe fails".
+echo "[entrypoint] handing off to agentflow-desktop run --host 0.0.0.0" >&2
+exec agentflow-desktop run --host 0.0.0.0
