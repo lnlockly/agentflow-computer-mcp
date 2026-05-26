@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
 from .config import AppConfig, load_config
 from .confirm import confirm, confirm_summary
+from .driver.tools.project_setup import project_clone_and_setup
 from .scope import requires_confirm
 from .tools import clipboard as clipboard_tool
 from .tools import code as code_tool
@@ -291,6 +293,25 @@ async def _dispatch_tool(name: str, args: dict[str, Any], config: AppConfig) -> 
         return screen_record_tool.get_recorder().stop()
     if name == "computer.screen_record.status":
         return screen_record_tool.get_recorder().status()
+    # Backend RPC-style tools — dispatched from the WS task_dispatch handler
+    # with `tool=…`, never invoked by the LLM agent. Kept separate from the
+    # `computer.*` LLM-visible surface to avoid prompting the model with
+    # internal platform calls.
+    if name == "project_clone_and_setup":
+        api_base = os.environ.get("AF_API_URL", "https://agentflow.website").rstrip("/")
+        if not api_base.endswith("/_agents"):
+            api_base = api_base + "/_agents"
+        internal_secret = os.environ.get("AF_INTERNAL_API_SECRET", "") or os.environ.get(
+            "AF_INTERNAL_SECRET", ""
+        )
+        return project_clone_and_setup(
+            template_repo_full=str(args.get("template_repo_full", "")),
+            slug=str(args.get("slug", "")),
+            project_id=int(args.get("project_id", 0) or 0),
+            api_base=api_base,
+            internal_secret=internal_secret,
+            port=int(args.get("port", 3000) or 3000),
+        )
     raise LookupError(f"unknown tool: {name}")
 
 
