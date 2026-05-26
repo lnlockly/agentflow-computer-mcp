@@ -254,6 +254,16 @@ class WSClient:
         task = str(msg.get("task") or "").strip()
         scope = msg.get("scope") if isinstance(msg.get("scope"), dict) else None
         agent_id = str(msg.get("agent_id") or "").strip()
+        # Direct-tool short-circuit: when the dispatch frame carries a `tool`
+        # field, run the named MCP tool with `scope` as args and emit
+        # task_complete/task_error WS frames straight away. Skips the LLM
+        # agent loop entirely so deterministic backend-driven jobs
+        # (project_clone_and_setup, integration cookie probes, …) run with
+        # zero LLM-call latency.
+        direct_tool = str(msg.get("tool") or "").strip()
+        if direct_tool and task_id:
+            asyncio.create_task(self._handle_direct_tool(task_id, direct_tool, scope or {}))
+            return
         if not task_id or not task:
             log.warning("task_dispatch missing id/task: %s", msg)
             return
@@ -268,6 +278,34 @@ class WSClient:
                 self._on_task_dispatch(task_id, task, scope)  # type: ignore[call-arg]
         except Exception as exc:  # noqa: BLE001
             log.exception("task_dispatch handler failed: %s", exc)
+
+    async def _handle_direct_tool(
+        self, task_id: str, tool_name: str, args: dict[str, Any]
+    ) -> None:
+        """Run an MCP tool synchronously for a task_dispatch with `tool=…`.
+
+        Emits task_complete on success, task_error on failure. No screenshots,
+        no thinking frames — this path is for backend-driven deterministic
+        work like project_clone_and_setup, not LLM-driven autonomy.
+        """
+        try:
+            result = await self._handler(tool_name, args)
+            await self._send({
+                "type": "task_complete",
+                "task_id": task_id,
+                "answer": (
+                    result if isinstance(result, str) else json.dumps(result)
+                ),
+                "iterations": 0,
+                "tokens_used": 0,
+                "cost_usd": 0,
+            })
+        except Exception as exc:  # noqa: BLE001
+            await self._send({
+                "type": "task_error",
+                "task_id": task_id,
+                "error": f"direct_tool_failed: {type(exc).__name__}: {exc}",
+            })
 
     def _handle_task_cancel(self, msg: dict[str, Any]) -> None:
         task_id: str | None = msg.get("task_id") or None
