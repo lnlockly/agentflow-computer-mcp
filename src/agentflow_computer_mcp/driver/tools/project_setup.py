@@ -88,27 +88,50 @@ def _default_run(
     timeout: int = 120,
     env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Run a foreground subprocess. Returns ``{exit_code, stdout, stderr}``."""
+    """Run a foreground subprocess. Returns ``{exit_code, stdout, stderr}``.
+
+    Uses Popen + manual communicate(timeout=) + process-group kill on timeout
+    so `pnpm install` (which forks several network workers) doesn't keep the
+    parent alive past the deadline. subprocess.run's capture_output=True path
+    can hang indefinitely when grandchild processes inherit and hold the
+    captured stdout pipe — caught on hosted daemon project 1488 stalling
+    30+ min inside pnpm install before the platform-side reaper noticed.
+    """
     try:
-        proc = subprocess.run(  # noqa: S603 — args are pre-validated
+        proc = subprocess.Popen(  # noqa: S603 — args are pre-validated
             list(cmd),
             cwd=cwd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
             text=True,
-            timeout=timeout,
             env=env,
-            check=False,
+            start_new_session=True,
         )
-    except subprocess.TimeoutExpired as exc:
+    except OSError as exc:
+        return {"exit_code": -1, "stdout": "", "stderr": f"spawn_failed: {exc}"}
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # Kill the whole process group so pnpm/npm forks die with the parent.
+        try:
+            os.killpg(os.getpgid(proc.pid), 15)  # SIGTERM
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(os.getpgid(proc.pid), 9)  # SIGKILL
+                stdout, stderr = proc.communicate(timeout=5)
+        except (ProcessLookupError, PermissionError, OSError):
+            stdout, stderr = "", ""
         return {
             "exit_code": -1,
-            "stdout": (exc.stdout or "") if isinstance(exc.stdout, str) else "",
+            "stdout": (stdout or "")[:8000],
             "stderr": f"timeout after {timeout}s",
         }
     return {
         "exit_code": proc.returncode,
-        "stdout": (proc.stdout or "")[:8000],
-        "stderr": (proc.stderr or "")[:4000],
+        "stdout": (stdout or "")[:8000],
+        "stderr": (stderr or "")[:4000],
     }
 
 
@@ -368,10 +391,24 @@ def project_clone_and_setup(
     # 6. Install dependencies.
     install_cmd = {
         "npm": ["npm", "install", "--no-audit", "--no-fund", "--loglevel=error"],
-        "pnpm": ["pnpm", "install", "--prefer-frozen-lockfile=false"],
+        # --reporter=append-only stops pnpm's TTY progress UI from holding
+        # the pipe past timeout. --network-concurrency=4 caps parallel
+        # fetches so we don't saturate the pod's egress and stall.
+        "pnpm": [
+            "pnpm",
+            "install",
+            "--prefer-frozen-lockfile=false",
+            "--reporter=append-only",
+            "--network-concurrency=4",
+        ],
         "yarn": ["yarn", "install", "--non-interactive"],
     }[pm]
-    install_res = run(install_cmd, cwd=project_dir, timeout=600)
+    # 5-minute cap on install. With network-concurrency=4 a typical small
+    # Next.js starter installs in under a minute; anything longer is more
+    # likely a hung subprocess than slow npm. Lowered from 10 min because
+    # daemons sitting at "thinking" for that long get reaped before the
+    # error frame goes out, so the cabinet shows no signal.
+    install_res = run(install_cmd, cwd=project_dir, timeout=300)
     if install_res.get("exit_code") != 0:
         return {
             "ok": False,
