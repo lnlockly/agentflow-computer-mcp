@@ -65,6 +65,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         novnc \
         websockify \
         python3-websockify \
+        nodejs \
+        npm \
+    && npm install -g --no-audit --no-fund pnpm yarn \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user. Pod's default uid is 0 in many vclusters but the daemon
