@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any
@@ -304,7 +305,14 @@ async def _dispatch_tool(name: str, args: dict[str, Any], config: AppConfig) -> 
         internal_secret = os.environ.get("AF_INTERNAL_API_SECRET", "") or os.environ.get(
             "AF_INTERNAL_SECRET", ""
         )
-        return project_clone_and_setup(
+        # project_clone_and_setup is fully synchronous (subprocess.run for git
+        # clone + pnpm install + dev server probe — up to 5 minutes). Run it
+        # in a worker thread so the WS event loop keeps emitting heartbeats
+        # and stays connected. Without to_thread the server's heartbeat
+        # timeout fires and the connection drops mid-install — caught live
+        # on task 99be40be where the daemon went silent for 7+ minutes.
+        return await asyncio.to_thread(
+            project_clone_and_setup,
             template_repo_full=str(args.get("template_repo_full", "")),
             slug=str(args.get("slug", "")),
             project_id=int(args.get("project_id", 0) or 0),
