@@ -116,20 +116,37 @@ fi
 # the agentflow user (the image gives agentflow NOPASSWD for chmod).
 sudo -n chmod 1777 /tmp/.X11-unix 2>/dev/null || chmod 1777 /tmp/.X11-unix 2>/dev/null || true
 
-echo "[entrypoint] starting Xvfb on $DISPLAY @ $XVFB_WHD" >&2
-Xvfb "$DISPLAY" -screen 0 "$XVFB_WHD" -ac +extension RANDR -nolisten tcp &
-XVFB_PID=$!
+# Xvfb is part of the optional `browser` addon. The slim base image
+# ships without it — opencode-driven project work doesn't need a
+# virtual display. Skip cleanly when the binary isn't there.
+if command -v Xvfb >/dev/null 2>&1; then
+  echo "[entrypoint] starting Xvfb on $DISPLAY @ $XVFB_WHD" >&2
+  Xvfb "$DISPLAY" -screen 0 "$XVFB_WHD" -ac +extension RANDR -nolisten tcp &
+  XVFB_PID=$!
 
-# Wait until Xvfb actually accepts connections (max 10s).
-for i in $(seq 1 50); do
-  if xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
-    echo "[entrypoint] Xvfb ready after ${i}*0.2s" >&2
-    break
+  # Wait until Xvfb actually accepts connections (max 10s).
+  for i in $(seq 1 50); do
+    if xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
+      echo "[entrypoint] Xvfb ready after ${i}*0.2s" >&2
+      break
+    fi
+    sleep 0.2
+  done
+  export DISPLAY
+else
+  echo "[entrypoint] Xvfb not installed (slim image); skipping virtual display" >&2
+  # Force AF_ENABLE_SCREEN off so the VNC block below is also a no-op.
+  AF_ENABLE_SCREEN=0
+fi
+
+if [[ "$AF_ENABLE_SCREEN" == "1" ]]; then
+  # All four programs come from the VNC addon. If any is missing, skip
+  # the whole block — better than crashing the pod with a half-screen.
+  if ! command -v fluxbox >/dev/null 2>&1 || ! command -v x11vnc >/dev/null 2>&1; then
+    echo "[entrypoint] AF_ENABLE_SCREEN=1 but VNC addon not installed; skipping" >&2
+    AF_ENABLE_SCREEN=0
   fi
-  sleep 0.2
-done
-
-export DISPLAY
+fi
 
 if [[ "$AF_ENABLE_SCREEN" == "1" ]]; then
   echo "[entrypoint] AF_ENABLE_SCREEN=1 — starting fluxbox + x11vnc + noVNC" >&2
