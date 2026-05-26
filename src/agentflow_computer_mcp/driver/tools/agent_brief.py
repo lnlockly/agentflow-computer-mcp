@@ -178,6 +178,23 @@ def agent_dev_brief(
     # deps, satisfy the brief, start the dev server on the project's
     # canonical port. Opencode picks the package manager + dev command
     # from the repo itself.
+    #
+    # Step 4 used to read `Start the dev server bound to 0.0.0.0:{port}
+    # (Next.js: next dev -H 0.0.0.0 -p {port})` and that wording caused a
+    # real bug for our default static-starter template: opencode
+    # interpreted the hint literally and ran `npm run dev -- --listen
+    # 0.0.0.0:3000`, but the template's `serve` script does not accept a
+    # `--listen` flag (serve v14 already binds to all interfaces with
+    # `-l 3000`). The dev server crashed on first turn and the pod
+    # served HTTP 502 forever. The new wording defers to the template's
+    # own dev script and never tries to override host/port flags.
+    #
+    # `nohup ... & disown`: opencode `run` is single-shot — when it
+    # exits, any child process inherits SIGHUP from the controlling tty
+    # and dies. `nohup` plus `disown` reparents the dev server under
+    # PID 1 (tini), so it keeps listening on $port after opencode is
+    # gone. Without this, the dev server lived for ~2 seconds and the
+    # public URL stayed 502.
     composed = (
         f"You are bootstrapping a project from a GitHub template clone in {project_dir}. "
         f"Brief from the user: {brief.strip()}\n\n"
@@ -186,8 +203,13 @@ def agent_dev_brief(
         "2. Install dependencies using the project's package manager (pnpm if pnpm-lock.yaml, "
         "yarn if yarn.lock, npm otherwise; uv/pip for Python).\n"
         "3. Edit files to satisfy the brief — landing copy, page content, brand, sections, etc.\n"
-        f"4. Start the dev server bound to 0.0.0.0:{port} (Next.js: `next dev -H 0.0.0.0 -p {port}`).\n"
-        "5. Confirm the server is reachable and the brief is reflected on the page.\n"
+        f"4. Start the dev server in the background so it survives your exit. "
+        "Use the project's own dev script verbatim — do NOT add `--listen`, "
+        f"`--host`, `-H`, or `-p` flags; the template already binds to port {port}. "
+        f"Run it like: `nohup npm run dev > /tmp/dev.log 2>&1 & disown` "
+        "(swap `npm` for `pnpm`/`yarn` to match the lockfile).\n"
+        f"5. Confirm the server is reachable: `curl -sf http://127.0.0.1:{port}/ | head -c 200` "
+        "must return HTTP 200 with the edited content. Retry once if the first attempt is too early.\n"
         "Do not ask the user for anything; act autonomously."
     )
 
