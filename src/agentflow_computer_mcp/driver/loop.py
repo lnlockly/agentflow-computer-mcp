@@ -1397,6 +1397,27 @@ def task_worker(
         state.busy = True
         state.current_task = task
         state.current_task_id = task_id
+        # Forward-visibility heartbeat: publish a task_action the moment the
+        # worker dequeues a task, before any LLM / tool work runs. Without
+        # this, the platform sees `task_dispatch` go out but has nothing on
+        # the wire back until the LLM produces its first turn. If the LLM
+        # call crashes silently or the daemon image lacks an api key, the
+        # platform's `device-task-reaper` flips the row to `failed` 15 min
+        # later with no diagnostic. Best-effort — never let a publish error
+        # block the worker.
+        if state.outbound_publisher is not None:
+            try:
+                state.publish_outbound(
+                    {
+                        "type": "task_action",
+                        "task_id": task_id,
+                        "ts": int(time.time() * 1000),
+                        "action": "task_dequeued",
+                        "detail": (task or "")[:160],
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[task_worker] task_dequeued publish failed: {exc}", flush=True)
         try:
             executor.apply_task_scope(task_scope)
             # Precedence: per-task scope.budget_usd > base scope (computer-scope.toml)
