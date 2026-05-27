@@ -1,7 +1,8 @@
 """Unit tests for ``_tail_and_stream_agent_log``.
 
 The real flow tails ``OPENCODE_LOG_FILE`` line by line and POSTs batches
-to ``/internal/projects/:id/agent-log``. We fake the file with a
+to ``/daemon-log/projects/:id/agent-log`` (CF-safe alias of the
+internal route — see PR #894). We fake the file with a
 temp directory + manual writes, fake the HTTP POST with a capturing
 callable, and assert the batching produces the expected shape.
 """
@@ -98,7 +99,7 @@ def test_tailer_url_uses_normalised_api_base(tmp_path, monkeypatch):
 
     assert poster.calls, "expected at least one POST"
     url = poster.calls[0][0]
-    assert url == "https://agentflow.website/_agents/internal/projects/7/agent-log", url
+    assert url == "https://agentflow.website/_agents/daemon-log/projects/7/agent-log", url
 
 
 def test_tailer_sends_secret_header(tmp_path):
