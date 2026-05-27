@@ -40,6 +40,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from ..resolve_runtimes import resolve_runtimes
 from .project_setup import (
     DEFAULT_PORT,
     DEFAULT_WORKSPACE_ROOT,
@@ -293,6 +294,25 @@ def agent_dev_brief(
             shutil.rmtree(dot_git)
     except OSError as exc:
         return {"ok": False, "error": "git_history_strip_failed", "detail": str(exc)}
+
+    # Resolve runtime toolchains BEFORE the dev-server / coder spawn. This
+    # reads the project's manifests (package.json engines.node, Cargo.toml,
+    # go.mod, requirements.txt) and installs whatever the baked image is
+    # missing. Failures here are non-fatal — opencode can still try to run
+    # `pip install` / `cargo build` from inside its own loop — but the
+    # log line gives us a single grep target when triage hits "wrong Node
+    # version" failures. Idempotent: a warm pod with the right runtime
+    # already in place is a sub-second no-op.
+    try:
+        runtime_result = resolve_runtimes(project_dir)
+        log.info(
+            "resolve_runtimes ok=%s actions=%s project_dir=%s",
+            runtime_result.get("ok"),
+            len(runtime_result.get("actions", [])),
+            project_dir,
+        )
+    except Exception as exc:  # noqa: BLE001 — never block the brief on resolver bugs
+        log.warning("resolve_runtimes raised, continuing: %s", exc)
 
     # Pin the dev-server port deterministically — no LLM in the loop. The
     # shared daemon pod hosts many projects from one user, and each one
