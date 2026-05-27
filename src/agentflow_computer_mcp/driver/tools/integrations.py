@@ -61,20 +61,27 @@ def _registry_cache_clear() -> None:
     _REGISTRY_CACHE.clear()
 
 
-def _http_get_json(url: str, timeout_s: int = 15) -> Any:
+def _http_get_json(
+    url: str, timeout_s: int = 15, *, api_key: str | None = None
+) -> Any:
     """GET ``url`` and decode JSON. Raises on non-2xx or bad JSON.
 
     Returned object is the parsed JSON (typically a list of provider
     dicts). HTTP errors propagate as ``urllib.error.HTTPError`` so the
     caller can map them to a tool result.
+
+    When ``api_key`` is provided, the request carries an ``x-api-key``
+    header so authenticated endpoints (``/integrations/registry``) accept
+    it. Default ``None`` preserves the prior unauthenticated behaviour
+    for callers that don't need it.
     """
-    req = urllib.request.Request(
-        url,
-        headers={
-            "accept": "application/json",
-            "user-agent": "agentflow-desktop/0.2 (integrations)",
-        },
-    )
+    headers = {
+        "accept": "application/json",
+        "user-agent": "agentflow-desktop/0.2 (integrations)",
+    }
+    if api_key:
+        headers["x-api-key"] = api_key
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout_s) as resp:
         raw = resp.read().decode("utf-8")
     return json.loads(raw) if raw else None
@@ -200,7 +207,7 @@ def connect_integration(
     chrome_eval: Callable[[str, int | None], str],
     chrome_export_cookies: Callable[[str, str], dict[str, Any]],
     sleep: Callable[[float], None] = time.sleep,
-    http_get: Callable[[str], Any] = _http_get_json,
+    http_get: Callable[[str], Any] | None = None,
     http_post: Callable[[str, dict[str, Any], str], tuple[int, Any]] = _http_post_json,
     now: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
@@ -217,6 +224,13 @@ def connect_integration(
     """
     if not provider or not isinstance(provider, str):
         return {"ok": False, "error": "provider_required"}
+
+    # Default http_get wraps _http_get_json with the owner ``api_key`` so
+    # the registry endpoint accepts the request. Tests override ``http_get``
+    # with a single-arg callable; in that case we never touch the override.
+    if http_get is None:
+        def http_get(url: str) -> Any:
+            return _http_get_json(url, api_key=api_key)
 
     try:
         registry = fetch_registry(

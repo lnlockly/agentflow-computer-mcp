@@ -218,6 +218,95 @@ def test_backend_error_propagates_verbatim():
     assert result["status"] == 403
 
 
+def test_http_get_json_sets_x_api_key_header_when_provided(monkeypatch):
+    """Default ``_http_get_json`` must forward ``x-api-key`` when set."""
+    captured: dict[str, Any] = {}
+
+    class FakeResp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b"[]"
+
+    def fake_urlopen(req, timeout=15):
+        captured["headers"] = dict(req.header_items())
+        captured["url"] = req.full_url
+        return FakeResp()
+
+    monkeypatch.setattr(ci.urllib.request, "urlopen", fake_urlopen)
+    result = ci._http_get_json(
+        "https://example.test/_agents/integrations/registry",
+        api_key="af_live_secret",
+    )
+    assert result == []
+    # urllib normalises header names to title case.
+    normalised = {k.lower(): v for k, v in captured["headers"].items()}
+    assert normalised.get("x-api-key") == "af_live_secret"
+
+
+def test_http_get_json_omits_x_api_key_when_none(monkeypatch):
+    """Without ``api_key`` the header must be absent (back-compat)."""
+    captured: dict[str, Any] = {}
+
+    class FakeResp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b"[]"
+
+    def fake_urlopen(req, timeout=15):
+        captured["headers"] = dict(req.header_items())
+        return FakeResp()
+
+    monkeypatch.setattr(ci.urllib.request, "urlopen", fake_urlopen)
+    ci._http_get_json("https://example.test/_agents/integrations/registry")
+    normalised = {k.lower(): v for k, v in captured["headers"].items()}
+    assert "x-api-key" not in normalised
+
+
+def test_connect_integration_default_http_get_forwards_api_key(monkeypatch):
+    """When tests don't override ``http_get``, the default wrapper must
+    inject ``x-api-key`` derived from the ``api_key`` arg."""
+    captured: dict[str, Any] = {}
+
+    def fake_http_get_json(url: str, timeout_s: int = 15, *, api_key=None):
+        captured["url"] = url
+        captured["api_key"] = api_key
+        return [KWORK_ENTRY]
+
+    monkeypatch.setattr(ci, "_http_get_json", fake_http_get_json)
+
+    def fake_post(_url, _body, _key):
+        return 200, {"ok": True, "secret_created": True}
+
+    result = ci.connect_integration(
+        "kwork",
+        api_key="af_live_token",
+        api_base="https://example.test/_agents",
+        chrome_open_url=_fake_chrome_open,
+        chrome_eval=_logged_in_eval,
+        chrome_export_cookies=_fake_export,
+        sleep=lambda _s: None,
+        http_post=fake_post,
+        # NOTE: no http_get override — exercise the default wrapper.
+    )
+    assert result["ok"] is True
+    assert captured["api_key"] == "af_live_token"
+    assert captured["url"].endswith("/integrations/registry")
+
+
 def test_registry_unavailable_when_http_fails():
     def broken_get(_url):
         raise RuntimeError("connection reset")
