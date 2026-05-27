@@ -424,6 +424,24 @@ def agent_dev_brief(
         daemon=True,
     ).start()
 
+    # Second fire-and-forget watcher that tails the opencode stdout log and
+    # POSTs batches of lines to the platform's /agent-log route. Without
+    # this, the Activity widget on the project page sits empty for 5-15
+    # minutes between `clone_dispatched` and `preview_exposed` — the owner
+    # has no signal that opencode is alive and working. Daemon-thread so
+    # process shutdown isn't blocked.
+    opencode_pid_int: int | None = int(spawn_res.get("pid", 0)) or None
+    threading.Thread(
+        target=_tail_and_stream_agent_log,
+        name=f"agent-log-tailer-{project_id}",
+        kwargs={
+            "project_id": project_id,
+            "log_path": log_file,
+            "opencode_pid": opencode_pid_int,
+        },
+        daemon=True,
+    ).start()
+
     return {
         "ok": True,
         "project_id": project_id,
@@ -561,6 +579,204 @@ def _resolve_pod_ip() -> str | None:
         return socket.gethostbyname(socket.gethostname())
     except OSError:
         return None
+
+
+HttpPoster = Callable[[str, bytes, dict[str, str]], tuple[int, bytes]]
+
+
+def _default_http_post(
+    url: str, data: bytes, headers: dict[str, str]
+) -> tuple[int, bytes]:
+    """Plain ``urllib`` POST used by the tail thread.
+
+    Returned as ``(status, body)`` so tests can swap a fake without
+    monkey-patching ``urllib``. Mirrors the helper shape used by
+    ``autonomous/budget.py``.
+    """
+    req = urllib.request.Request(url, data=data, method="POST", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310 — internal URL only
+            return int(resp.status), resp.read()
+    except urllib.error.HTTPError as exc:
+        return int(exc.code or 0), exc.read() if hasattr(exc, "read") else b""
+
+
+def _is_pid_alive(pid: int | None) -> bool:
+    """Return True when ``pid`` is still running on this host.
+
+    Tail thread uses this to know when opencode has exited so it can drain
+    the remaining bytes and stop. ``None`` reads as "no pid to track" → keep
+    going until the watcher timeout fires.
+    """
+    if pid is None or pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+    except OSError:
+        return False
+
+
+def _tail_and_stream_agent_log(
+    *,
+    project_id: int,
+    log_path: str,
+    opencode_pid: int | None,
+    batch_size: int = 10,
+    flush_interval_sec: float = 2.0,
+    timeout_sec: float = 1800.0,
+    poll_sleep_sec: float = 0.25,
+    http_post: HttpPoster = _default_http_post,
+    pid_alive: Callable[[int | None], bool] = _is_pid_alive,
+    now: Callable[[], float] = time.monotonic,
+) -> None:
+    """Tail opencode stdout + POST batches of lines to /agent-log.
+
+    The opencode CLI prints structured progress to ``log_path``. We open the
+    file, seek to EOF (it already contains the spawn's first writes by the
+    time this thread starts, but reading from the start would re-stream
+    everything to the platform on every retry), and pump new bytes through
+    a ``\n``-delimited splitter.
+
+    Batching rule: flush whenever the buffer reaches ``batch_size`` lines OR
+    ``flush_interval_sec`` elapsed since the previous flush, whichever comes
+    first. The 2-second window means a single typed-out sentence reaches the
+    Activity widget in roughly real time without spamming the route on a
+    chatty `pnpm install`.
+
+    Stop conditions (in priority order):
+    1. ``timeout_sec`` elapsed since start (30 min default).
+    2. opencode pid is no longer alive AND no new bytes arrived for ~3s
+       (final drain). Without the drain the closing lines of a fast run
+       would never reach the platform.
+
+    Errors are logged at warning level and do not propagate. Missing
+    ``AF_INTERNAL_API_SECRET`` short-circuits the whole thread — the same
+    safeguard the clone-status watcher uses.
+    """
+    internal_secret = os.environ.get("AF_INTERNAL_API_SECRET", "")
+    if not internal_secret:
+        log.info(
+            "agent-log tailer skipping project %d — AF_INTERNAL_API_SECRET unset",
+            project_id,
+        )
+        return
+
+    api_base = _normalise_api_base(os.environ.get("AF_API_URL", "https://agentflow.website"))
+    url = f"{api_base}/internal/projects/{project_id}/agent-log"
+
+    # Wait briefly for the log file to appear — spawn_opencode opens it
+    # before returning, but on a slow filesystem a follow-up open could
+    # still race. ~5s budget total before we give up.
+    file_wait_deadline = now() + 5.0
+    while now() < file_wait_deadline:
+        if Path(log_path).exists():
+            break
+        time.sleep(0.1)
+    if not Path(log_path).exists():
+        log.warning(
+            "agent-log tailer: %s never appeared for project %d", log_path, project_id
+        )
+        return
+
+    deadline = now() + timeout_sec
+    buffer: list[dict[str, Any]] = []
+    leftover = ""
+    last_flush = now()
+    last_byte_at = now()
+    drain_grace_sec = 3.0
+
+    def _flush() -> None:
+        nonlocal last_flush
+        if not buffer:
+            return
+        payload = json.dumps({"lines": buffer}).encode("utf-8")
+        try:
+            status, _body = http_post(
+                url,
+                payload,
+                {
+                    "content-type": "application/json",
+                    "x-agentflow-secret": internal_secret,
+                },
+            )
+            if status >= 400:
+                log.warning(
+                    "agent-log POST returned %d for project %d", status, project_id
+                )
+        except (urllib.error.URLError, OSError) as exc:
+            log.warning(
+                "agent-log POST failed for project %d: %s", project_id, exc
+            )
+        buffer.clear()
+        last_flush = now()
+
+    try:
+        # ``errors='replace'`` so a stray byte in pnpm's progress bar can't
+        # crash the reader. ``newline=''`` keeps universal-newlines off so
+        # we own the split exactly on ``\n``.
+        fh = open(log_path, encoding="utf-8", errors="replace", newline="")
+    except OSError as exc:
+        log.warning(
+            "agent-log tailer: open %s failed for project %d: %s",
+            log_path,
+            project_id,
+            exc,
+        )
+        return
+
+    try:
+        # Start at the head of the file — opencode is just-spawned, so the
+        # file contents from this point forward are the full run. We do NOT
+        # seek to EOF because the spawn typically writes its first bytes
+        # before this thread starts and we'd lose the install banner.
+        while True:
+            chunk = fh.read()
+            if chunk:
+                last_byte_at = now()
+                text = leftover + chunk
+                parts = text.split("\n")
+                # Last part is incomplete (no trailing newline) — keep for
+                # the next read.
+                leftover = parts.pop()
+                ts_ms = int(time.time() * 1000)
+                for raw_line in parts:
+                    # Drop bare empty lines client-side; the server also
+                    # drops them but skipping early saves an HTTP byte.
+                    stripped = raw_line.rstrip("\r")
+                    if not stripped.strip():
+                        continue
+                    buffer.append({"line": stripped, "ts": ts_ms})
+                    if len(buffer) >= batch_size:
+                        _flush()
+
+            if now() - last_flush >= flush_interval_sec:
+                _flush()
+
+            if now() >= deadline:
+                break
+
+            if not pid_alive(opencode_pid):
+                # opencode exited — drain any remaining bytes for up to
+                # ``drain_grace_sec`` then stop. The grace covers stdout
+                # buffer flushes that arrive after waitpid resolves.
+                if now() - last_byte_at >= drain_grace_sec:
+                    break
+
+            time.sleep(poll_sleep_sec)
+    finally:
+        # Flush trailing partial line + any pending buffer so the last
+        # opencode output reaches the platform.
+        if leftover.strip():
+            buffer.append({"line": leftover.rstrip("\r"), "ts": int(time.time() * 1000)})
+            leftover = ""
+        _flush()
+        try:
+            fh.close()
+        except OSError:
+            pass
 
 
 AGENT_DEV_BRIEF_DESCRIPTOR: dict[str, Any] = {
