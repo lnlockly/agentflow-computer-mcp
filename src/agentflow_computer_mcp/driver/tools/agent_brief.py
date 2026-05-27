@@ -465,25 +465,28 @@ def agent_dev_brief(
     # renderDaemonManifest (agentflow-agents).
     api_key = os.environ.get("AF_API_KEY", "")
     if api_key:
-        # opencode 1.15.x ships a "build" subagent whose hard-coded default
-        # model is claude-sonnet-4-6 — that override beats the root `model`
-        # key and Sonnet was the one refusing to write files on project
-        # 1550 («нет доступа к структуре файлов» despite tools being
-        # exposed). Pin `agent.build.model` to our gpt-5.3-codex so every
-        # session — including the implicit build agent — routes through
-        # the same gateway-hosted model.
+        # Use the logical "flow" model. The AgentFlow gateway picks the
+        # actual upstream (gpt-5.3-codex → gpt-5.5 → opus → sonnet → haiku)
+        # at request time, so swapping models never requires rebuilding
+        # this image. Companion change: PR agentflow-agents#901 adds the
+        # "flow" alias resolution in /llm/v1/{chat/completions,messages,
+        # responses}.
+        #
+        # opencode 1.15.x's `build` sub-agent has its own default model
+        # that overrides the root `model` key — pin every agent to
+        # openai/flow so the gateway stays in charge of selection.
         opencode_cfg = {
             "$schema": "https://opencode.ai/config.json",
-            "model": "openai/gpt-5.3-codex",
+            "model": "openai/flow",
             "permission": {
                 "edit": "allow",
                 "bash": "allow",
                 "webfetch": "allow",
             },
             "agent": {
-                "build": {"model": "openai/gpt-5.3-codex"},
-                "plan": {"model": "openai/gpt-5.3-codex"},
-                "general": {"model": "openai/gpt-5.3-codex"},
+                "build": {"model": "openai/flow"},
+                "plan": {"model": "openai/flow"},
+                "general": {"model": "openai/flow"},
             },
             "provider": {
                 "openai": {
@@ -496,7 +499,7 @@ def agent_dev_brief(
                         ),
                         "apiKey": api_key,
                     },
-                    "models": {"gpt-5.3-codex": {}},
+                    "models": {"flow": {}},
                 }
             },
         }
