@@ -1,4 +1,4 @@
-"""chrome_cookies exporter tests.
+"""chrome_cookies exporter — macOS tests.
 
 The real macOS Keychain + real Chrome data are out of scope for CI. We
 build a fixture SQLite DB matching Chrome's schema, then exercise:
@@ -8,10 +8,12 @@ build a fixture SQLite DB matching Chrome's schema, then exercise:
   - profile_not_found / unsupported_platform / encryption_v20_unsupported
   - dedupe of (name, domain, path) across host_key variants
   - 50-cookie cap
+  - keychain query-order — falls back when first attempt returns empty
 """
 from __future__ import annotations
 
 import sqlite3
+import subprocess
 from pathlib import Path
 
 from agentflow_computer_mcp.driver import chrome_cookies as cc
@@ -203,3 +205,100 @@ def test_descriptor_registered() -> None:
 
     names = {t["name"] for t in DESKTOP_TOOLS}
     assert "chrome_export_cookies" in names
+
+
+def _fake_completed(stdout: str, returncode: int = 0) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
+
+
+def test_keychain_query_prefers_service_account_pair(monkeypatch) -> None:
+    """The correct keychain lookup is ``-s 'Chrome Safe Storage' -a Chrome``.
+    The helper must call that form first and use its stdout."""
+    monkeypatch.setattr(cc.sys, "platform", "darwin")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):  # noqa: ANN001, ANN003
+        calls.append(list(cmd))
+        if "-s" in cmd and "-a" in cmd:
+            return _fake_completed("correct-password\n")
+        return _fake_completed("", returncode=44)
+
+    monkeypatch.setattr(cc.subprocess, "run", fake_run)
+    pw = cc._keychain_password()
+    assert pw == "correct-password"
+    # First attempt must be the service+account pair.
+    assert calls[0] == [
+        "security",
+        "find-generic-password",
+        "-w",
+        "-s",
+        "Chrome Safe Storage",
+        "-a",
+        "Chrome",
+    ]
+
+
+def test_keychain_query_falls_back_when_first_returns_empty(monkeypatch) -> None:
+    """If the first attempt succeeds-but-empty (rc=0, blank stdout — the
+    pre-fix bug shape), the helper must continue down the attempt list
+    until something non-empty comes back."""
+    monkeypatch.setattr(cc.sys, "platform", "darwin")
+    call_order: list[tuple[str, ...]] = []
+
+    def fake_run(cmd, **_kwargs):  # noqa: ANN001, ANN003
+        call_order.append(tuple(cmd))
+        # First two attempts come back empty; the third (the bare ``-a Chrome``)
+        # is the one with the real password.
+        if cmd[-2:] == ["-a", "Chrome"] and "-s" not in cmd:
+            return _fake_completed("late-attempt-pw\n")
+        return _fake_completed("")
+
+    monkeypatch.setattr(cc.subprocess, "run", fake_run)
+    pw = cc._keychain_password()
+    assert pw == "late-attempt-pw"
+    assert len(call_order) == 3
+
+
+def test_keychain_returns_none_when_all_attempts_fail(monkeypatch) -> None:
+    monkeypatch.setattr(cc.sys, "platform", "darwin")
+
+    def fake_run(cmd, **_kwargs):  # noqa: ANN001, ANN003
+        return _fake_completed("", returncode=44)
+
+    monkeypatch.setattr(cc.subprocess, "run", fake_run)
+    assert cc._keychain_password() is None
+
+
+def test_keychain_short_circuits_on_first_success(monkeypatch) -> None:
+    """When the first attempt returns a non-empty password the helper must
+    not invoke the fallbacks (avoids spurious keychain prompts)."""
+    monkeypatch.setattr(cc.sys, "platform", "darwin")
+    call_count = {"n": 0}
+
+    def fake_run(cmd, **_kwargs):  # noqa: ANN001, ANN003
+        call_count["n"] += 1
+        return _fake_completed("first-try-pw\n")
+
+    monkeypatch.setattr(cc.subprocess, "run", fake_run)
+    pw = cc._keychain_password()
+    assert pw == "first-try-pw"
+    assert call_count["n"] == 1
+
+
+def test_resolve_cookie_db_prefers_network_subdir(tmp_path) -> None:
+    """Chrome >=96 moved Cookies under ``Network/``. The resolver should
+    pick that path first, falling back to legacy ``Cookies`` only when
+    the Network/ variant is absent."""
+    profile = tmp_path / "Default"
+    (profile / "Network").mkdir(parents=True)
+    network_db = profile / "Network" / "Cookies"
+    legacy_db = profile / "Cookies"
+    network_db.write_bytes(b"sqlite-fixture-modern")
+    legacy_db.write_bytes(b"sqlite-fixture-legacy")
+    assert cc._resolve_cookie_db(profile) == network_db
+
+    network_db.unlink()
+    assert cc._resolve_cookie_db(profile) == legacy_db
+
+    legacy_db.unlink()
+    assert cc._resolve_cookie_db(profile) is None
