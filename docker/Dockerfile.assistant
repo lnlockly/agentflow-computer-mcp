@@ -1,0 +1,19 @@
+# AgentFlow daemon — assistant variant.
+#
+# Picked when the cabinet user selects "Облачное · Помощник для не-кодеров".
+# The UI hides terminal + editor; the assistant only needs the daemon + curl
+# to render preview + chat. Nothing dev-specific is installed here, so the
+# image size stays at ≈ base + a few MB.
+#
+# Target size: ~120 MB (same as base — this variant exists for clarity in the
+# template matrix and to give us a place to layer in non-coder helpers later
+# without re-tagging the base).
+
+ARG BASE_IMAGE=ghcr.io/lnlockly/agentflow-daemon-base:latest
+FROM ${BASE_IMAGE}
+
+ENV AF_HOSTED_VARIANT=assistant
+
+# Nothing else — intentional. Base image already has the daemon, entrypoint,
+# healthcheck and EXPOSE 8765. Children that need more (Node, browser, VNC)
+# go to coder / universal.

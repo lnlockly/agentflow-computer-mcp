@@ -1,0 +1,43 @@
+# AgentFlow daemon — coder variant.
+#
+# Picked when the cabinet user selects "Облачное · Разработка для кода".
+# Project workspaces (landing/spa/api/tg_bot) need:
+#   - Node 22 (NodeSource — Debian bookworm ships 18, opencode + vite 7 need 22)
+#   - pnpm 10, yarn (lockfile compatibility per project)
+#   - opencode-ai CLI (LLM-driven code editing routed via the AF gateway)
+#   - git, jq (project setup + brief shaping)
+#   - ttyd (web terminal at :7681 — surfaced as iframe in the cabinet)
+#
+# No xvfb / chromium / playwright / fluxbox / novnc — coder pods don't open a
+# browser inside the pod. They get preview via *.proj.agentflow.website which
+# the host serves through the per-project ingress.
+#
+# Target size: ~350 MB compressed (Node + opencode dominate).
+
+ARG BASE_IMAGE=ghcr.io/lnlockly/agentflow-daemon-base:latest
+FROM ${BASE_IMAGE}
+
+ENV AF_HOSTED_VARIANT=coder
+
+USER root
+
+# Node 22 from NodeSource (matches PR #112 fix/daemon-node22-vite7 — Debian's
+# 18.20 breaks pnpm 10 and vite 7 toolchains). Install ttyd from apt (bookworm
+# carries 1.7) so the cabinet can iframe a real terminal at /me/devices/:id/term.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gnupg \
+        git \
+        jq \
+        ttyd \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm install -g --no-audit --no-fund pnpm@10 yarn opencode-ai \
+    && apt-get purge -y --auto-remove gnupg \
+    && rm -rf /var/lib/apt/lists/* /root/.npm
+
+USER agentflow
+
+# Coder pods expose the daemon (8765) + ttyd web terminal (7681). The cabinet
+# decides which to surface; ttyd is started on-demand by the daemon, not by
+# this image — keep it dormant to avoid an open shell when not requested.
+EXPOSE 8765 7681

@@ -1,0 +1,68 @@
+# AgentFlow daemon — base image (shared across coder / assistant / universal).
+#
+# What's here:
+#   - python 3.12-slim
+#   - tini, curl, ca-certificates, sudo, procps (minimal runtime)
+#   - the AgentFlow daemon installed editable from /opt/agentflow
+#   - non-root `agentflow` user (uid 1001) with /data, /workspace, /etc/agentflow
+#   - /usr/local/bin/agentflow-entrypoint copied from docker/entrypoint.sh
+#
+# What's NOT here (lives in child images):
+#   - xvfb / chromium / fluxbox / novnc / playwright   → universal
+#   - Node 22 / pnpm / opencode-ai / ttyd              → coder
+#   - nothing extra                                    → assistant
+#
+# Children extend via:
+#   ARG BASE_IMAGE=ghcr.io/lnlockly/agentflow-daemon-base:latest
+#   FROM ${BASE_IMAGE}
+#
+# Target size: ~120 MB compressed.
+
+FROM python:3.12-slim-bookworm
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    AF_HOSTED=1 \
+    AF_HOSTED_KIND=daemon
+
+# Minimum runtime: tini for PID 1, curl for healthcheck + enrollment HTTP,
+# sudo so entrypoint can re-chmod /tmp/.X11-unix without being root.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        tini \
+        curl \
+        ca-certificates \
+        sudo \
+        procps \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -ms /bin/bash -u 1001 agentflow \
+    && mkdir -p /data /etc/agentflow /workspace \
+    && chown -R agentflow:agentflow /data /etc/agentflow /workspace \
+    && echo 'agentflow ALL=(root) NOPASSWD: /bin/chmod 1777 /tmp/.X11-unix, /bin/mkdir -p /tmp/.X11-unix' \
+        > /etc/sudoers.d/agentflow-x11 \
+    && chmod 0440 /etc/sudoers.d/agentflow-x11
+
+WORKDIR /opt/agentflow
+
+# Install Python deps first for layer caching.
+COPY pyproject.toml ./
+COPY src ./src
+
+RUN pip install --upgrade pip \
+    && pip install -e ".[linux]"
+
+# Entrypoint comes last so editing it doesn't bust the deps layer.
+COPY docker/entrypoint.sh /usr/local/bin/agentflow-entrypoint
+RUN chmod +x /usr/local/bin/agentflow-entrypoint
+
+USER agentflow
+WORKDIR /data
+
+EXPOSE 8765
+
+HEALTHCHECK --interval=20s --timeout=5s --start-period=15s --retries=3 \
+  CMD curl -fsS http://localhost:8765/health || exit 1
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/agentflow-entrypoint"]
