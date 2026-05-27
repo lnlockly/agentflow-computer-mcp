@@ -50,6 +50,22 @@ from .project_setup import (
 
 log = logging.getLogger(__name__)
 
+
+def _normalise_api_base(raw: str) -> str:
+    """Strip trailing slash and append ``/_agents`` when missing.
+
+    The public ingress mounts agentflow-agents under ``/_agents/*``. Daemon
+    code paths that hit ``${AF_API_URL}/internal/...`` or
+    ``${AF_API_URL}/llm/...`` directly will 404 against the bare host. The
+    sibling ``server.py`` + ``desktop_tools.py`` already do this — keeping
+    one local helper avoids re-importing across modules.
+    """
+    base = (raw or "https://agentflow.website").rstrip("/")
+    if not base.endswith("/_agents"):
+        base = base + "/_agents"
+    return base
+
+
 OPENCODE_PID_FILE = "/tmp/agent-brief-opencode.pid"
 OPENCODE_LOG_FILE = "/tmp/agent-brief-opencode.log"
 
@@ -355,7 +371,9 @@ def agent_dev_brief(
                 "openai": {
                     "options": {
                         "baseURL": (
-                            os.environ.get("AF_API_URL", "https://agentflow.website").rstrip("/")
+                            _normalise_api_base(
+                                os.environ.get("AF_API_URL", "https://agentflow.website")
+                            )
                             + "/llm/v1"
                         ),
                         "apiKey": api_key,
@@ -438,7 +456,15 @@ def _watch_and_report_clone_status(
     `ok=false, error=port_unreachable`. Idempotent on the backend side:
     re-running clone-status repoints the existing Service/Endpoints.
     """
-    api_base = os.environ.get("AF_API_URL", "https://agentflow.website").rstrip("/")
+    # The public ingress mounts agentflow-agents under /_agents/* — paths
+    # at root (e.g. https://agentflow.website/internal/...) return 404
+    # because nothing in the host's ingress map points there. server.py
+    # and desktop_tools.py already normalise the suffix; this watcher
+    # missed it, so every clone report came back as
+    # "clone-status report failed: HTTP Error 403 Forbidden" and the
+    # backend never saw the project's port open → status stuck at
+    # `provisioning` forever (owner repro 2026-05-27, project 1525/1526).
+    api_base = _normalise_api_base(os.environ.get("AF_API_URL", "https://agentflow.website"))
     internal_secret = os.environ.get("AF_INTERNAL_API_SECRET", "")
     if not internal_secret:
         log.info(
