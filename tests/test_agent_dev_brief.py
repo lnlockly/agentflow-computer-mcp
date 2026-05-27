@@ -13,6 +13,7 @@ Covered:
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -291,3 +292,241 @@ def test_invalid_project_id_rejected(workspace):
     )
     assert result["ok"] is False
     assert result["error"] == "invalid_project_id"
+
+
+# ---------------------------------------------------------------------------
+# tg_bot branch — kind='tg_bot' takes a Python-shaped prompt + writes BOT_TOKEN
+# to .env before opencode runs. The HTTP port watcher is not started; a
+# separate launcher thread handles `python bot.py` + getMe verification (those
+# threads are not invoked in unit tests — they reach the network).
+# ---------------------------------------------------------------------------
+
+
+def test_tg_bot_brief_targets_python_stack(workspace):
+    runner = FakeRunner()
+    spawner = FakeOpencodeSpawner(pid=1)
+    ab.agent_dev_brief(
+        "wakaree/aiogram_bot_template",
+        "demo",
+        99,
+        "simple echo bot",
+        workspace_root=str(workspace),
+        run=runner,
+        spawn_opencode=spawner,
+        kind="tg_bot",
+        bot_token="123456:fake-token",
+        bot_username="demo_bot",
+    )
+    composed = spawner.calls[0]["brief"]
+    lc = composed.lower()
+    # The tg_bot prompt must talk about Python + aiogram, not npm/Next.
+    assert "python" in lc
+    assert "aiogram" in lc or "requirements.txt" in lc or "pyproject.toml" in lc
+    assert "npm run dev" not in lc
+    # Daemon owns the launch — opencode must NOT spawn the bot itself.
+    assert "do not run the bot" in lc or "do not spawn" in lc
+
+
+def test_tg_bot_writes_bot_token_to_env(workspace):
+    # Fake `git clone` by materialising the target directory. The real
+    # subprocess `git clone` would do this; the FakeRunner here only
+    # records the call.
+    target = workspace / "proj-demo"
+
+    def _fake_clone(cmd, cwd=None, *, timeout=120, env=None):
+        if cmd[0] == "git" and cmd[1] == "clone":
+            target.mkdir(exist_ok=True)
+        return {"exit_code": 0, "stdout": "", "stderr": ""}
+
+    runner = _fake_clone
+    spawner = FakeOpencodeSpawner(pid=1)
+    ab.agent_dev_brief(
+        "wakaree/aiogram_bot_template",
+        "demo",
+        77,
+        "simple echo bot",
+        workspace_root=str(workspace),
+        run=runner,
+        spawn_opencode=spawner,
+        kind="tg_bot",
+        bot_token="123456:fake-token",
+        bot_username="demo_bot",
+    )
+    env_path = workspace / "proj-demo" / ".env"
+    assert env_path.exists()
+    content = env_path.read_text(encoding="utf-8")
+    assert "BOT_TOKEN=123456:fake-token" in content
+
+
+def test_tg_bot_does_not_patch_package_json(workspace, monkeypatch):
+    # _patch_package_json_for_port is for landing/spa templates only.
+    # Calling it on a Python project's stray package.json (eg dev tooling)
+    # would silently rewrite scripts. The tg_bot branch must skip it.
+    calls: list[Any] = []
+    monkeypatch.setattr(ab, "_patch_package_json_for_port", lambda *a, **kw: calls.append(a))
+    runner = FakeRunner()
+    spawner = FakeOpencodeSpawner(pid=1)
+    ab.agent_dev_brief(
+        "wakaree/aiogram_bot_template",
+        "demo",
+        88,
+        "echo bot",
+        workspace_root=str(workspace),
+        run=runner,
+        spawn_opencode=spawner,
+        kind="tg_bot",
+        bot_token="t",
+        bot_username="b",
+    )
+    assert calls == []
+
+
+def test_landing_path_still_patches_package_json(workspace, monkeypatch):
+    # Defence-in-depth: the kind=landing path must keep calling the
+    # package.json patcher — no accidental regression from the tg_bot branch.
+    seen: list[Any] = []
+    real = ab._patch_package_json_for_port
+    monkeypatch.setattr(
+        ab, "_patch_package_json_for_port", lambda *a, **kw: seen.append(a) or real(*a, **kw)
+    )
+    runner = FakeRunner()
+    spawner = FakeOpencodeSpawner(pid=1)
+    ab.agent_dev_brief(
+        "owner/repo",
+        "demo",
+        88,
+        "static landing",
+        workspace_root=str(workspace),
+        run=runner,
+        spawn_opencode=spawner,
+        kind="landing",
+    )
+    assert len(seen) == 1
+
+
+def test_tg_get_me_rejects_empty_token():
+    assert ab._tg_get_me("") == {"ok": False, "error": "invalid_token"}
+    assert ab._tg_get_me("no-colon") == {"ok": False, "error": "invalid_token"}
+
+
+def test_spawn_python_bot_rejects_when_no_entrypoint(tmp_path):
+    proj = tmp_path / "proj-x"
+    proj.mkdir()
+    res = ab._spawn_python_bot(str(proj), bot_token="t:t")
+    assert res == {"ok": False, "error": "no_python_entrypoint"}
+
+
+def test_watch_and_launch_tg_bot_reports_bot_username_on_getme_ok(
+    tmp_path, monkeypatch
+):
+    # End-to-end of the launcher thread with all I/O stubbed. The contract
+    # we lock in: when getMe returns ok, the clone-status POST carries
+    # port=0, ok=true, bot_username derived from Telegram's reply.
+    monkeypatch.setenv("AF_INTERNAL_API_SECRET", "shh")
+    monkeypatch.setenv("AF_API_URL", "https://example.test")
+    posts: list[dict[str, Any]] = []
+
+    class FakeReq:
+        def __init__(self, url, data, method, headers):
+            posts.append({"url": url, "body": json.loads(data.decode()), "headers": headers})
+
+    class FakeResp:
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def read(self):
+            return b""
+
+    monkeypatch.setattr(ab.urllib.request, "Request", FakeReq)
+    monkeypatch.setattr(ab.urllib.request, "urlopen", lambda *a, **kw: FakeResp())
+    monkeypatch.setattr(ab, "_resolve_pod_ip", lambda: "10.0.0.5")
+
+    ab._watch_and_launch_tg_bot(
+        project_id=42,
+        slug="demo",
+        project_dir=str(tmp_path),
+        repo_url="https://github.com/x/y.git",
+        bot_token="t:t",
+        bot_username="orig_bot",
+        opencode_pid=None,
+        timeout_sec=1.0,
+        poll_interval_sec=0.01,
+        spawn_bot=lambda *a, **kw: {"ok": True, "pid": 555, "entrypoint": "/x/bot.py"},
+        tg_get_me=lambda token: {"ok": True, "result": {"username": "verified_bot"}},
+        pid_alive=lambda pid: False,
+    )
+
+    assert len(posts) == 1
+    body = posts[0]["body"]
+    assert body["ok"] is True
+    assert body["port"] == 0
+    assert body["port_reachable"] is False
+    assert body["bot_username"] == "verified_bot"
+    assert body["kind"] == "tg_bot"
+    assert body["dev_pid"] == 555
+
+
+def test_watch_and_launch_tg_bot_reports_failure_when_spawn_dies(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("AF_INTERNAL_API_SECRET", "shh")
+    monkeypatch.setenv("AF_API_URL", "https://example.test")
+    posts: list[dict[str, Any]] = []
+
+    class FakeReq:
+        def __init__(self, url, data, method, headers):
+            posts.append({"url": url, "body": json.loads(data.decode())})
+    class FakeResp:
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def read(self):
+            return b""
+    monkeypatch.setattr(ab.urllib.request, "Request", FakeReq)
+    monkeypatch.setattr(ab.urllib.request, "urlopen", lambda *a, **kw: FakeResp())
+    monkeypatch.setattr(ab, "_resolve_pod_ip", lambda: None)
+
+    ab._watch_and_launch_tg_bot(
+        project_id=99,
+        slug="demo",
+        project_dir=str(tmp_path),
+        repo_url="https://github.com/x/y.git",
+        bot_token="t:t",
+        bot_username="b",
+        opencode_pid=None,
+        timeout_sec=1.0,
+        poll_interval_sec=0.01,
+        spawn_bot=lambda *a, **kw: {"ok": False, "error": "no_python_entrypoint"},
+        tg_get_me=lambda token: {"ok": True},  # never reached
+        pid_alive=lambda pid: False,
+    )
+
+    assert len(posts) == 1
+    body = posts[0]["body"]
+    assert body["ok"] is False
+    assert body["error"] == "no_python_entrypoint"
+    assert body["port"] == 0
+
+
+def test_watch_and_launch_tg_bot_skips_when_secret_missing(tmp_path, monkeypatch):
+    monkeypatch.delenv("AF_INTERNAL_API_SECRET", raising=False)
+    posts: list[Any] = []
+    monkeypatch.setattr(
+        ab.urllib.request, "Request", lambda *a, **kw: posts.append(1)
+    )
+    ab._watch_and_launch_tg_bot(
+        project_id=1,
+        slug="s",
+        project_dir=str(tmp_path),
+        repo_url="r",
+        bot_token="t:t",
+        bot_username="b",
+        opencode_pid=None,
+        timeout_sec=0.1,
+        spawn_bot=lambda *a, **kw: {"ok": True, "pid": 1},
+        tg_get_me=lambda t: {"ok": True, "result": {"username": "b"}},
+        pid_alive=lambda pid: False,
+    )
+    assert posts == []  # never POSTed

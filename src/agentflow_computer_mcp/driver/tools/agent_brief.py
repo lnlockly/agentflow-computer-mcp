@@ -225,12 +225,23 @@ def agent_dev_brief(
     run: Callable[..., dict[str, Any]] = _default_run,
     spawn_opencode: Callable[..., dict[str, Any]] = _default_spawn_opencode,
     opencode_bin: str = "opencode",
+    kind: str | None = None,
+    bot_token: str | None = None,
+    bot_username: str | None = None,
 ) -> dict[str, Any]:
     """Clone repo + hand the brief to opencode.
 
     Returns immediately after opencode is spawned. The dev-server port
     is *not* probed here — opencode owns the lifecycle and the cabinet's
     live screen tile + action log are the user's source of truth.
+
+    Telegram-bot projects (``kind="tg_bot"``) take a different shape:
+    the brief tells opencode to install Python deps + edit ``bot.py`` per
+    the user's brief, but NOT to run anything. The daemon spawns
+    ``python bot.py`` itself after opencode exits (see
+    :func:`_watch_and_launch_tg_bot`) and uses Telegram's ``getMe`` API
+    as the alive signal instead of an HTTP port probe — Python bots
+    don't bind a listening port.
     """
     if not _looks_like_repo_full(template_repo_full):
         return {"ok": False, "error": "invalid_template_repo_full"}
@@ -240,6 +251,8 @@ def agent_dev_brief(
         return {"ok": False, "error": "invalid_project_id"}
     if not brief or not brief.strip():
         return {"ok": False, "error": "missing_brief"}
+
+    is_tg_bot = (kind or "").strip().lower() == "tg_bot"
 
     project_dir_name = f"proj-{slug}"
     project_dir = str(Path(workspace_root) / project_dir_name)
@@ -289,7 +302,36 @@ def agent_dev_brief(
     # PORT env (already injected below) without trusting opencode to
     # follow an instruction. npm executes `scripts.dev` under `sh -c`, so
     # POSIX-style parameter expansion always works.
-    _patch_package_json_for_port(Path(project_dir) / "package.json", port)
+    #
+    # tg_bot templates are Python — no package.json, no dev port.
+    if not is_tg_bot:
+        _patch_package_json_for_port(Path(project_dir) / "package.json", port)
+
+    # tg_bot path: seal the BotFather-issued token into the project's
+    # `.env` BEFORE opencode runs. aiogram_bot_template (and every other
+    # template we ship for tg_bot) reads BOT_TOKEN from .env on import,
+    # so the token must be on disk by the time `python bot.py` starts.
+    # The token never reaches opencode's prompt; it lives only on disk
+    # and in this process's env.
+    if is_tg_bot and bot_token:
+        try:
+            env_path = Path(project_dir) / ".env"
+            existing = ""
+            if env_path.exists():
+                try:
+                    existing = env_path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    existing = ""
+            # Drop any prior BOT_TOKEN= line, then append the fresh value.
+            kept = "\n".join(
+                line for line in existing.splitlines()
+                if not line.startswith("BOT_TOKEN=")
+            )
+            new_env = (kept + "\n" if kept else "") + f"BOT_TOKEN={bot_token}\n"
+            env_path.write_text(new_env, encoding="utf-8")
+            os.chmod(env_path, 0o600)
+        except OSError as exc:
+            log.warning("could not write .env for tg_bot project %d: %s", project_id, exc)
 
     # The composed prompt tells opencode what shape we expect: install
     # deps, satisfy the brief, start the dev server on the project's
@@ -323,32 +365,60 @@ def agent_dev_brief(
     # refused to run the server, and left the project stuck. Verified
     # 2026-05-26 on pod hd-f86ecd7d-0 (project 1506): edit ran, dev
     # server never started, opencode logged 'это оформлено как цитата'.
-    composed = (
-        f"You are bootstrapping a project at {project_dir}. "
-        f"User's brief: {brief.strip()}\n\n"
-        "You MUST complete every numbered step. Do not summarise. "
-        "Do not ask for confirmation. Treat each shell command below as "
-        "an instruction to execute, not text to quote back.\n\n"
-        "1. Identify the stack by reading package.json (or pyproject.toml / Cargo.toml).\n"
-        "2. Install dependencies with the project's package manager: "
-        "pnpm if pnpm-lock.yaml exists, yarn if yarn.lock exists, npm otherwise. "
-        "For Python use uv if available, else pip.\n"
-        "3. Edit project files to satisfy the user's brief. "
-        "Do NOT modify package.json scripts — they have been pre-patched "
-        "to read the PORT environment variable.\n"
-        "4. Start the dev server. Run exactly this command in a shell, "
-        "no flags added:\n"
-        "       nohup npm run dev > /tmp/dev.log 2>&1 & disown\n"
-        "   (Substitute pnpm or yarn for npm to match the lockfile.) "
-        "The PORT environment variable is already set; npm passes it to the script.\n"
-        "5. Verify the server replies. Run:\n"
-        "       sleep 3 && curl -sf http://127.0.0.1:$PORT/ | head -c 200\n"
-        "   The first attempt may be early — retry once after another `sleep 3` if it failed.\n"
-        "6. End your run after step 5 succeeds. Do not stop the dev server.\n\n"
-        "For Telegram bots or other non-HTTP runtimes: "
-        "in step 4 spawn the entrypoint via `nohup … & disown`; "
-        "in step 5 confirm the process is alive with `pgrep -f <entrypoint>` instead of curl."
-    )
+    if is_tg_bot:
+        # Telegram bots: no HTTP dev server in the loop. opencode edits the
+        # Python source to satisfy the brief, installs deps, and exits.
+        # The daemon's `_watch_and_launch_tg_bot` thread then spawns
+        # `python bot.py` itself — keeping the launch + alive-check off the
+        # LLM's plate. Earlier landing-only wording ("npm run dev", "no
+        # flags added", "do not modify package.json") was actively
+        # misleading for Python projects: opencode would either invent
+        # node commands or refuse to install Python deps.
+        composed = (
+            f"You are editing a Telegram bot at {project_dir}. "
+            f"User's brief: {brief.strip()}\n\n"
+            "You MUST complete every numbered step. Do not summarise. "
+            "Do not ask for confirmation. Treat each shell command below as "
+            "an instruction to execute, not text to quote back.\n\n"
+            "1. Read pyproject.toml (or requirements.txt) to identify Python deps.\n"
+            "2. Install dependencies. Use uv if `uv` is on PATH, else pip:\n"
+            "       uv pip install --system -r requirements.txt  # preferred\n"
+            "       pip install -r requirements.txt              # fallback\n"
+            "   If neither file lists aiogram, run: pip install aiogram aiosqlite python-dotenv.\n"
+            "3. Edit the bot's source code (typically `bot.py` and `handlers/` if present) "
+            "so /start, /help, and the rest of the bot's behavior match the user's brief above. "
+            "Use brief-derived copy in the bot's replies — never leave generic template strings.\n"
+            "4. Do NOT run the bot yourself. Do NOT spawn `python bot.py`. "
+            "The hosting daemon launches the bot process after you exit.\n"
+            "5. End your run after step 3. Print a one-line summary of files you changed."
+        )
+    else:
+        composed = (
+            f"You are bootstrapping a project at {project_dir}. "
+            f"User's brief: {brief.strip()}\n\n"
+            "You MUST complete every numbered step. Do not summarise. "
+            "Do not ask for confirmation. Treat each shell command below as "
+            "an instruction to execute, not text to quote back.\n\n"
+            "1. Identify the stack by reading package.json (or pyproject.toml / Cargo.toml).\n"
+            "2. Install dependencies with the project's package manager: "
+            "pnpm if pnpm-lock.yaml exists, yarn if yarn.lock exists, npm otherwise. "
+            "For Python use uv if available, else pip.\n"
+            "3. Edit project files to satisfy the user's brief. "
+            "Do NOT modify package.json scripts — they have been pre-patched "
+            "to read the PORT environment variable.\n"
+            "4. Start the dev server. Run exactly this command in a shell, "
+            "no flags added:\n"
+            "       nohup npm run dev > /tmp/dev.log 2>&1 & disown\n"
+            "   (Substitute pnpm or yarn for npm to match the lockfile.) "
+            "The PORT environment variable is already set; npm passes it to the script.\n"
+            "5. Verify the server replies. Run:\n"
+            "       sleep 3 && curl -sf http://127.0.0.1:$PORT/ | head -c 200\n"
+            "   The first attempt may be early — retry once after another `sleep 3` if it failed.\n"
+            "6. End your run after step 5 succeeds. Do not stop the dev server.\n\n"
+            "For Telegram bots or other non-HTTP runtimes: "
+            "in step 4 spawn the entrypoint via `nohup … & disown`; "
+            "in step 5 confirm the process is alive with `pgrep -f <entrypoint>` instead of curl."
+        )
 
     # Pin opencode's provider to the AgentFlow gateway + a real model.
     # Without this opencode falls back to its built-in default
@@ -411,18 +481,39 @@ def agent_dev_brief(
     # learns the dev server is up and the auto-expose step never runs —
     # the project sits in `provisioning` forever. Daemon-thread so it
     # cannot block process shutdown.
-    threading.Thread(
-        target=_watch_and_report_clone_status,
-        name=f"clone-status-watcher-{project_id}",
-        kwargs={
-            "project_id": project_id,
-            "slug": slug,
-            "port": port,
-            "project_dir": project_dir,
-            "repo_url": repo_url,
-        },
-        daemon=True,
-    ).start()
+    #
+    # tg_bot takes a different path: a separate watcher waits for opencode
+    # to exit, then spawns `python bot.py` and uses Telegram's `getMe`
+    # API as the alive signal. No HTTP port is ever bound by a Python bot.
+    opencode_pid_for_watch: int | None = int(spawn_res.get("pid", 0)) or None
+    if is_tg_bot:
+        threading.Thread(
+            target=_watch_and_launch_tg_bot,
+            name=f"tg-bot-launcher-{project_id}",
+            kwargs={
+                "project_id": project_id,
+                "slug": slug,
+                "project_dir": project_dir,
+                "repo_url": repo_url,
+                "bot_token": bot_token or "",
+                "bot_username": bot_username or "",
+                "opencode_pid": opencode_pid_for_watch,
+            },
+            daemon=True,
+        ).start()
+    else:
+        threading.Thread(
+            target=_watch_and_report_clone_status,
+            name=f"clone-status-watcher-{project_id}",
+            kwargs={
+                "project_id": project_id,
+                "slug": slug,
+                "port": port,
+                "project_dir": project_dir,
+                "repo_url": repo_url,
+            },
+            daemon=True,
+        ).start()
 
     # Second fire-and-forget watcher that tails the opencode stdout log and
     # POSTs batches of lines to the platform's /agent-log route. Without
@@ -430,7 +521,7 @@ def agent_dev_brief(
     # minutes between `clone_dispatched` and `preview_exposed` — the owner
     # has no signal that opencode is alive and working. Daemon-thread so
     # process shutdown isn't blocked.
-    opencode_pid_int: int | None = int(spawn_res.get("pid", 0)) or None
+    opencode_pid_int: int | None = opencode_pid_for_watch
     threading.Thread(
         target=_tail_and_stream_agent_log,
         name=f"agent-log-tailer-{project_id}",
@@ -531,6 +622,221 @@ def _watch_and_report_clone_status(
     except (urllib.error.URLError, OSError) as exc:
         log.warning(
             "clone-status report failed for project %d: %s", project_id, exc
+        )
+
+
+TG_BOT_LOG_FILE = "/tmp/agent-brief-tg-bot.log"
+
+
+def _tg_get_me(bot_token: str, *, timeout_sec: float = 5.0) -> dict[str, Any]:
+    """Call Telegram's ``getMe`` for the given token.
+
+    Returns the decoded response on HTTP 200 with ``ok:true``, otherwise
+    a sentinel ``{"ok": False, "error": "<reason>"}`` dict. Used as the
+    alive-check for tg_bot projects — getMe returns success iff the bot
+    token is valid AND the bot process can reach api.telegram.org (which
+    the daemon pod can, since it already calls the platform via the same
+    egress route).
+    """
+    if not bot_token or ":" not in bot_token:
+        return {"ok": False, "error": "invalid_token"}
+    url = f"https://api.telegram.org/bot{bot_token}/getMe"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout_sec) as resp:  # noqa: S310 — Telegram API
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        return {"ok": False, "error": f"http_{exc.code}"}
+    except (urllib.error.URLError, OSError) as exc:
+        return {"ok": False, "error": "network", "detail": str(exc)[:200]}
+    try:
+        data = json.loads(raw.decode("utf-8", errors="replace"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return {"ok": False, "error": "decode_failed"}
+    if isinstance(data, dict) and data.get("ok"):
+        return data
+    return {"ok": False, "error": "telegram_not_ok", "detail": json.dumps(data)[:300]}
+
+
+def _spawn_python_bot(
+    project_dir: str,
+    *,
+    bot_token: str,
+    log_file: str = TG_BOT_LOG_FILE,
+) -> dict[str, Any]:
+    """Detached `nohup python bot.py & disown` so the bot outlives the call.
+
+    The daemon's WS dispatcher does not stick around — when this thread
+    returns, the bot must keep polling Telegram on its own. ``nohup`` +
+    ``start_new_session=True`` reparent the child under PID 1 (tini),
+    matching the dev-server spawn pattern.
+
+    Picks the entrypoint in this order: ``bot.py`` at the repo root,
+    then ``main.py``, then ``app.py``. Anything else and we return an
+    error — the templates we ship for tg_bot all use one of these names.
+    """
+    entrypoint: Path | None = None
+    for candidate in ("bot.py", "main.py", "app.py"):
+        path = Path(project_dir) / candidate
+        if path.exists():
+            entrypoint = path
+            break
+    if entrypoint is None:
+        return {"ok": False, "error": "no_python_entrypoint"}
+
+    try:
+        log_fh = open(log_file, "ab", buffering=0)  # noqa: SIM115 — fd handed to child
+    except OSError as exc:
+        return {"ok": False, "error": "open_log_failed", "detail": str(exc)}
+
+    env = {**os.environ, "BOT_TOKEN": bot_token, "PYTHONUNBUFFERED": "1"}
+    try:
+        proc = subprocess.Popen(  # noqa: S603 — python interpreter from PATH
+            ["python", str(entrypoint)],
+            cwd=project_dir,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            env=env,
+        )
+    except OSError as exc:
+        log_fh.close()
+        return {"ok": False, "error": "spawn_failed", "detail": str(exc)}
+    finally:
+        import contextlib
+
+        with contextlib.suppress(OSError):
+            log_fh.close()
+    return {"ok": True, "pid": proc.pid, "entrypoint": str(entrypoint)}
+
+
+def _watch_and_launch_tg_bot(
+    *,
+    project_id: int,
+    slug: str,
+    project_dir: str,
+    repo_url: str,
+    bot_token: str,
+    bot_username: str,
+    opencode_pid: int | None,
+    timeout_sec: float = 900.0,
+    poll_interval_sec: float = 3.0,
+    spawn_bot: Callable[..., dict[str, Any]] | None = None,
+    tg_get_me: Callable[[str], dict[str, Any]] | None = None,
+    pid_alive: Callable[[int | None], bool] | None = None,
+) -> None:
+    """Background watcher for tg_bot projects.
+
+    Sequence:
+      1. Wait for opencode to exit (it's single-shot — installs deps,
+         edits the Python source, then returns).
+      2. ``nohup python bot.py`` so the bot polls Telegram in the
+         background, surviving daemon WS reconnects.
+      3. Hit ``getMe`` up to ~30s. The first successful response means
+         the bot is live AND the token is valid AND Telegram sees the
+         long-poll session.
+      4. POST clone-status with ``port=0`` and the verified
+         ``bot_username``. Backend treats port=0 + bot_username as the
+         tg_bot success signal — no Service / Ingress wiring needed.
+
+    On any failure (no opencode binary, no python entrypoint, getMe
+    never returns ok), report ``ok=false`` with a stable error code so
+    the platform can surface it in the project timeline.
+    """
+    spawn_bot = spawn_bot or _spawn_python_bot
+    tg_get_me = tg_get_me or _tg_get_me
+    pid_alive = pid_alive or _is_pid_alive
+
+    internal_secret = os.environ.get("AF_INTERNAL_API_SECRET", "")
+    if not internal_secret:
+        log.info(
+            "tg-bot launcher skipping project %d — AF_INTERNAL_API_SECRET unset",
+            project_id,
+        )
+        return
+
+    api_base = _normalise_api_base(os.environ.get("AF_API_URL", "https://agentflow.website"))
+    pod_ip = _resolve_pod_ip()
+
+    # 1. Wait for opencode to exit. Bounded by ``timeout_sec`` so a stuck
+    #    opencode does not block the launcher forever.
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        if not pid_alive(opencode_pid):
+            break
+        time.sleep(poll_interval_sec)
+
+    bot_pid: int | None = None
+    final_ok = False
+    final_error: str | None = None
+    final_detail: str | None = None
+    verified_username: str | None = None
+
+    if not bot_token:
+        final_error = "missing_bot_token"
+        final_detail = "scope.bot_token was not provided by backend"
+    else:
+        spawn_res = spawn_bot(project_dir, bot_token=bot_token)
+        if not spawn_res.get("ok"):
+            final_error = spawn_res.get("error") or "bot_spawn_failed"
+            final_detail = spawn_res.get("detail")
+        else:
+            bot_pid = spawn_res.get("pid")
+
+            # 3. Verify via getMe. The bot needs ~1-2s to start aiogram's
+            #    long-poll session; the loop gives it up to 30s with a
+            #    3-second poll cadence.
+            getme_deadline = time.monotonic() + 30.0
+            while time.monotonic() < getme_deadline:
+                gm = tg_get_me(bot_token)
+                if gm.get("ok"):
+                    result = gm.get("result") or {}
+                    verified_username = (result.get("username") or bot_username or "").lstrip("@")
+                    final_ok = True
+                    break
+                final_error = gm.get("error") or "getme_failed"
+                final_detail = gm.get("detail")
+                time.sleep(3.0)
+
+    body: dict[str, Any] = {
+        "ok": final_ok,
+        # port=0 is the signal to backend that this is a non-HTTP project.
+        # The clone-status route looks at port + bot_username together to
+        # decide whether to wire ingress.
+        "port": 0,
+        "port_reachable": False,
+        "project_dir": project_dir,
+        "repo_url": repo_url,
+        "pod_ip": pod_ip,
+        "kind": "tg_bot",
+    }
+    if verified_username:
+        body["bot_username"] = verified_username
+    elif bot_username:
+        body["bot_username"] = bot_username.lstrip("@")
+    if bot_pid:
+        body["dev_pid"] = bot_pid
+    if not final_ok:
+        body["error"] = final_error or "tg_bot_alive_failed"
+        if final_detail:
+            body["detail"] = final_detail[:1000]
+
+    url = f"{api_base}/internal/projects/{project_id}/clone-status"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+        headers={
+            "content-type": "application/json",
+            "x-agentflow-secret": internal_secret,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310 — internal URL only
+            resp.read()
+    except (urllib.error.URLError, OSError) as exc:
+        log.warning(
+            "tg-bot clone-status report failed for project %d: %s", project_id, exc
         )
 
 
@@ -818,6 +1124,31 @@ AGENT_DEV_BRIEF_DESCRIPTOR: dict[str, Any] = {
                 "type": "integer",
                 "default": 3000,
                 "description": "Dev-server port the daemon expects to expose. Default 3000.",
+            },
+            "kind": {
+                "type": "string",
+                "description": (
+                    "Project kind from backend (eg 'tg_bot', 'landing', 'spa'). "
+                    "For tg_bot, daemon skips package.json patching, tells "
+                    "opencode it's a Python project, and uses Telegram getMe "
+                    "instead of an HTTP port probe as the alive signal."
+                ),
+            },
+            "bot_token": {
+                "type": "string",
+                "description": (
+                    "Telegram BotFather token. Only sent for kind='tg_bot'. "
+                    "Daemon writes it to <project_dir>/.env as BOT_TOKEN=… "
+                    "before spawning the bot process."
+                ),
+            },
+            "bot_username": {
+                "type": "string",
+                "description": (
+                    "Telegram @username for the bot. Only sent for kind='tg_bot'. "
+                    "Daemon includes it in the clone-status callback so backend "
+                    "can stamp projects.bot_username confidently."
+                ),
             },
         },
         "required": ["template_repo_full", "slug", "project_id", "brief"],
