@@ -110,7 +110,7 @@ curl -sSL https://agentflow.website/install/computer-mcp.bat -o install.bat && i
 
 Both pipe through PowerShell with `ExecutionPolicy Bypass`, pip-install the package, and register a Task Scheduler entry named `AgentFlowDesktop` that runs at logon.
 
-The canonical scripts are `install.sh` / `install.ps1` / `install.bat` at the repo root (and mirrored in `scripts/` for backward compat). Matching `scripts/uninstall.sh` / `scripts/uninstall.ps1` remove the autostart unit and `~/.agentflow/auth.json`.
+The canonical scripts are `install.sh` / `install.ps1` / `install.bat` at the repo root. Matching `scripts/uninstall.sh` / `scripts/uninstall.ps1` remove the autostart unit and `~/.agentflow/auth.json`.
 
 ## Run
 

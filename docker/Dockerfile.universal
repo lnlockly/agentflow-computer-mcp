@@ -5,10 +5,10 @@
 # Playwright so the daemon can drive headed browsers, record screen, and the
 # cabinet can iframe the noVNC viewer at :6080.
 #
-# Replaces the original root-level Dockerfile. The legacy
-# ghcr.io/lnlockly/agentflow-daemon:<sha> tag is kept as an alias for this
-# image in .github/workflows/docker-image.yml so existing manifests in
-# agentflow-agents/src/routes/me-hosted-devices.ts keep pulling correctly.
+# The legacy ghcr.io/lnlockly/agentflow-daemon:<sha> tag is kept as an
+# alias for this image in .github/workflows/docker-image.yml so existing
+# manifests in agentflow-agents/src/routes/me-hosted-devices.ts keep
+# pulling correctly.
 #
 # Target size: ~1.4 GB compressed (Chromium + Playwright deps dominate).
 
