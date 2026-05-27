@@ -416,14 +416,30 @@ def agent_dev_brief(
         composed = (
             f"You are bootstrapping a project at {project_dir}. "
             f"User's brief: {brief.strip()}\n\n"
-            "You MUST complete every numbered step. Do not summarise. "
-            "Do not ask for confirmation. Treat each shell command below as "
-            "an instruction to execute, not text to quote back.\n\n"
+            "You have FULL access to the workspace via your built-in tools "
+            "(Read, Write, Edit, Glob, Grep, Bash). You are NOT in a "
+            "read-only mode. You are NOT asking for context. The user has "
+            "already approved this run.\n\n"
+            "Hard rules — break any of these and the run is a failure:\n"
+            "  • You MUST write or edit at least one file under "
+            f"{project_dir}/ before terminating.\n"
+            "  • Reading files alone is NOT progress. After every Read/Glob, "
+            "ask yourself: \"Have I edited anything yet?\" If no, keep going.\n"
+            "  • Never reply with phrases like «нет доступа к структуре», "
+            "«не выполнено в этом сообщении», \"I'd need more context\". If "
+            "you feel you lack context, READ MORE FILES — never stop.\n"
+            "  • Never ask the user a clarifying question. The brief above "
+            "is final. Make reasonable assumptions where the brief is silent "
+            "and proceed.\n\n"
+            "Execute every numbered step below. Treat each shell command as "
+            "an instruction to RUN, not text to quote.\n\n"
             "1. Identify the stack by reading package.json (or pyproject.toml / Cargo.toml).\n"
             "2. Install dependencies with the project's package manager: "
             "pnpm if pnpm-lock.yaml exists, yarn if yarn.lock exists, npm otherwise. "
             "For Python use uv if available, else pip.\n"
             "3. Edit project files to satisfy the user's brief. "
+            "At minimum, change visible UI copy / routes / handlers to match "
+            "the brief — never leave the template's default text in place. "
             "Do NOT modify package.json scripts — they have been pre-patched "
             "to read the PORT environment variable.\n"
             "4. Start the dev server. Run exactly this command in a shell, "
@@ -449,6 +465,13 @@ def agent_dev_brief(
     # renderDaemonManifest (agentflow-agents).
     api_key = os.environ.get("AF_API_KEY", "")
     if api_key:
+        # opencode 1.15.x ships a "build" subagent whose hard-coded default
+        # model is claude-sonnet-4-6 — that override beats the root `model`
+        # key and Sonnet was the one refusing to write files on project
+        # 1550 («нет доступа к структуре файлов» despite tools being
+        # exposed). Pin `agent.build.model` to our gpt-5.3-codex so every
+        # session — including the implicit build agent — routes through
+        # the same gateway-hosted model.
         opencode_cfg = {
             "$schema": "https://opencode.ai/config.json",
             "model": "openai/gpt-5.3-codex",
@@ -456,6 +479,11 @@ def agent_dev_brief(
                 "edit": "allow",
                 "bash": "allow",
                 "webfetch": "allow",
+            },
+            "agent": {
+                "build": {"model": "openai/gpt-5.3-codex"},
+                "plan": {"model": "openai/gpt-5.3-codex"},
+                "general": {"model": "openai/gpt-5.3-codex"},
             },
             "provider": {
                 "openai": {
@@ -562,6 +590,132 @@ def agent_dev_brief(
         "opencode_pid": int(spawn_res.get("pid", 0)),
         "log_file": log_file,
         "port": port,
+    }
+
+
+OPENCODE_EDIT_PID_FILE = "/tmp/agent-brief-opencode-edit.pid"
+OPENCODE_EDIT_LOG_FILE = "/tmp/agent-brief-opencode-edit.log"
+
+
+def agent_dev_brief_edit(
+    slug: str,
+    project_id: int,
+    edit_prompt: str,
+    *,
+    workspace_root: str = DEFAULT_WORKSPACE_ROOT,
+    pid_file: str = OPENCODE_EDIT_PID_FILE,
+    log_file: str = OPENCODE_EDIT_LOG_FILE,
+    spawn_opencode: Callable[..., dict[str, Any]] = _default_spawn_opencode,
+    opencode_bin: str = "opencode",
+    kind: str | None = None,
+) -> dict[str, Any]:
+    """Re-spawn opencode against an existing project workspace.
+
+    Unlike :func:`agent_dev_brief` this does NOT clone, NOT install deps,
+    NOT touch ``opencode.json`` or ``package.json``. The workspace is
+    expected to already exist from a prior ``agent_dev_brief`` run. The
+    edit prompt is handed to opencode verbatim with a thin instruction
+    wrapper so the model stays grounded in the brief shape (no
+    early-termination, write files, then verify).
+
+    Used by the AgentFlow chat → running-project edit flow: the user
+    sends a message like «сделай кнопку красной», the platform routes
+    it here, opencode edits the source, the running dev server reloads
+    automatically (vite / next watch mode). Caller is expected to watch
+    ``log_file`` for stdout via ``/internal/projects/:id/agent-log`` —
+    the daemon's log tailer streams it the same way as initial runs.
+    """
+    if not _looks_like_slug(slug):
+        return {"ok": False, "error": "invalid_slug"}
+    if not isinstance(project_id, int) or project_id <= 0:
+        return {"ok": False, "error": "invalid_project_id"}
+    if not edit_prompt or not edit_prompt.strip():
+        return {"ok": False, "error": "missing_edit_prompt"}
+
+    project_dir = str(Path(workspace_root) / f"proj-{slug}")
+    if not Path(project_dir).is_dir():
+        return {
+            "ok": False,
+            "error": "workspace_missing",
+            "project_dir": project_dir,
+            "detail": (
+                f"Expected workspace at {project_dir}, found none. The "
+                "project was likely never bootstrapped or its pod was "
+                "recreated without a PVC. Run agent_dev_brief first."
+            ),
+        }
+
+    is_tg_bot = (kind or "").strip().lower() == "tg_bot"
+    runtime_kind_note = (
+        "This is a Telegram bot. After editing, do NOT spawn `python "
+        "bot.py` — the hosting daemon owns the bot process lifecycle. "
+        "Just edit + exit."
+        if is_tg_bot
+        else "The dev server is already running and watches the filesystem. "
+        "After editing, do NOT restart it. The change reloads automatically."
+    )
+
+    composed = (
+        f"You are editing an existing project at {project_dir}. "
+        f"User's edit request: {edit_prompt.strip()}\n\n"
+        "You have FULL access to the workspace via your built-in tools "
+        "(Read, Write, Edit, Glob, Grep, Bash). You are NOT in read-only "
+        "mode. The user has already approved this run.\n\n"
+        "Hard rules — break any and the run is a failure:\n"
+        "  • You MUST write or edit at least one file under "
+        f"{project_dir}/ before terminating.\n"
+        "  • Never reply with «нет доступа», «не выполнено», "
+        "\"I'd need more context\". If you lack context, READ MORE FILES.\n"
+        "  • Never ask the user a clarifying question. Make reasonable "
+        "assumptions and proceed.\n\n"
+        "Execute:\n"
+        "1. Use Glob/Grep to locate the files this request touches.\n"
+        "2. Read the relevant files end-to-end.\n"
+        "3. Edit them so the user's request is satisfied. Keep changes "
+        "minimal and scoped — do not refactor unrelated code.\n"
+        "4. Print a one-line summary of files you changed and exit.\n\n"
+        f"{runtime_kind_note}"
+    )
+
+    env = {**os.environ, "BROWSER": "none", "CI": "1"}
+    spawn_res = spawn_opencode(
+        composed,
+        cwd=project_dir,
+        pid_file=pid_file,
+        log_file=log_file,
+        env=env,
+        opencode_bin=opencode_bin,
+    )
+    if not spawn_res.get("ok"):
+        return {
+            "ok": False,
+            "error": spawn_res.get("error", "opencode_spawn_failed"),
+            "detail": spawn_res.get("detail"),
+            "project_dir": project_dir,
+        }
+
+    # Stream the edit-session log back to the platform — same channel the
+    # initial agent_dev_brief uses so the cabinet Activity widget shows
+    # progress without a separate UI surface.
+    opencode_pid_int: int | None = int(spawn_res.get("pid", 0)) or None
+    threading.Thread(
+        target=_tail_and_stream_agent_log,
+        name=f"agent-log-tailer-edit-{project_id}",
+        kwargs={
+            "project_id": project_id,
+            "log_path": log_file,
+            "opencode_pid": opencode_pid_int,
+        },
+        daemon=True,
+    ).start()
+
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "slug": slug,
+        "project_dir": project_dir,
+        "opencode_pid": int(spawn_res.get("pid", 0)),
+        "log_file": log_file,
     }
 
 
@@ -1218,5 +1372,49 @@ AGENT_DEV_BRIEF_DESCRIPTOR: dict[str, Any] = {
             },
         },
         "required": ["template_repo_full", "slug", "project_id", "brief"],
+    },
+}
+
+
+AGENT_DEV_BRIEF_EDIT_DESCRIPTOR: dict[str, Any] = {
+    "name": "agent_dev_brief_edit",
+    "description": (
+        "Re-spawn opencode against an existing project workspace to apply "
+        "an incremental edit. Does NOT clone, NOT install deps, NOT "
+        "rewrite opencode.json. Used by the AgentFlow chat → running "
+        "project flow: the user sends a follow-up message, the platform "
+        "routes it here, opencode edits the source in place. The running "
+        "dev server reloads automatically (vite/next watch). Returns "
+        "immediately; progress streams to /agent-log."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "slug": {
+                "type": "string",
+                "description": "Project slug (workspace at /workspace/proj-<slug>).",
+            },
+            "project_id": {
+                "type": "integer",
+                "description": "Backend projects.id — used in log cross-references.",
+            },
+            "edit_prompt": {
+                "type": "string",
+                "description": (
+                    "Free-form edit instruction in natural language. "
+                    "Handed to opencode with a thin wrapper that forbids "
+                    "early-termination and demands at least one file edit."
+                ),
+            },
+            "kind": {
+                "type": "string",
+                "description": (
+                    "Project kind. For 'tg_bot' the wrapper tells opencode "
+                    "not to spawn `python bot.py` itself — the daemon owns "
+                    "the bot lifecycle."
+                ),
+            },
+        },
+        "required": ["slug", "project_id", "edit_prompt"],
     },
 }

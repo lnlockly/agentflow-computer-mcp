@@ -9,7 +9,7 @@ from mcp.server.fastmcp import FastMCP
 
 from .config import AppConfig, load_config
 from .confirm import confirm, confirm_summary
-from .driver.tools.agent_brief import agent_dev_brief
+from .driver.tools.agent_brief import agent_dev_brief, agent_dev_brief_edit
 from .driver.tools.project_setup import project_clone_and_setup
 from .scope import requires_confirm
 from .tools import clipboard as clipboard_tool
@@ -346,6 +346,19 @@ async def _dispatch_tool(name: str, args: dict[str, Any], config: AppConfig) -> 
             kind=str(kind_val) if kind_val else None,
             bot_token=str(bot_token_val) if bot_token_val else None,
             bot_username=str(bot_username_val) if bot_username_val else None,
+        )
+    if name == "agent_dev_brief_edit":
+        # Incremental edit against an existing workspace — no clone, no
+        # deps install. Used by the AgentFlow chat → running-project edit
+        # flow so the user's follow-up messages reach opencode without
+        # blowing away the workspace.
+        kind_val = args.get("kind")
+        return await asyncio.to_thread(
+            agent_dev_brief_edit,
+            slug=str(args.get("slug", "")),
+            project_id=int(args.get("project_id", 0) or 0),
+            edit_prompt=str(args.get("edit_prompt", "")),
+            kind=str(kind_val) if kind_val else None,
         )
     raise LookupError(f"unknown tool: {name}")
 
