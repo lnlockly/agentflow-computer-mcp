@@ -311,6 +311,15 @@ def project_clone_and_setup(
         return {"ok": False, "error": "invalid_slug"}
     if not isinstance(project_id, int) or project_id <= 0:
         return {"ok": False, "error": "invalid_project_id"}
+    # Defensive: normalise the api_base prefix here too. desktop_tools.py
+    # already does this when it calls us, but the helper is reachable
+    # from contexts that pass a bare https://agentflow.website — that
+    # 404s against the ingress that mounts agentflow-agents under
+    # /_agents/*. PR #105 patched agent_brief but missed this second
+    # URL builder; new user 258, project 1532 hit the same 403 again
+    # 2026-05-27.
+    if api_base and not api_base.rstrip("/").endswith("/_agents"):
+        api_base = api_base.rstrip("/") + "/_agents"
     if not api_base or not internal_secret:
         return {"ok": False, "error": "missing_backend_config"}
 
