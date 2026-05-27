@@ -1,0 +1,73 @@
+# AgentFlow daemon — universal variant (full desktop).
+#
+# Picked when the cabinet user selects "Облачное · Универсал". This pod gets a
+# real (virtual) screen, a window manager, Chromium, file manager, noVNC, and
+# Playwright so the daemon can drive headed browsers, record screen, and the
+# cabinet can iframe the noVNC viewer at :6080.
+#
+# Replaces the original root-level Dockerfile. The legacy
+# ghcr.io/lnlockly/agentflow-daemon:<sha> tag is kept as an alias for this
+# image in .github/workflows/docker-image.yml so existing manifests in
+# agentflow-agents/src/routes/me-hosted-devices.ts keep pulling correctly.
+#
+# Target size: ~1.4 GB compressed (Chromium + Playwright deps dominate).
+
+ARG BASE_IMAGE=ghcr.io/lnlockly/agentflow-daemon-base:latest
+FROM ${BASE_IMAGE}
+
+ENV AF_HOSTED_VARIANT=universal \
+    DISPLAY=:99
+
+USER root
+
+# System packages for a usable headed desktop:
+#   - xvfb / xauth / x11-utils — virtual display surface for headed Chromium
+#   - chromium + driver — Playwright fallback, also `app_open chromium`
+#   - fluxbox — minimum window manager so opened windows aren't all at (0,0)
+#   - xdotool / wmctrl — window control for activate_app on Linux
+#   - x11vnc + novnc + websockify — browser-iframable screen at :6080
+#   - fonts-noto-* + dejavu — Cyrillic / CJK / emoji rendering in screenshots
+#   - ffmpeg — fallback for screen_record_* when Playwright recordVideo is off
+#   - git, jq, gnupg — runtime tooling the universal flavor also exposes
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        xvfb \
+        xauth \
+        x11-utils \
+        x11-xserver-utils \
+        xdotool \
+        wmctrl \
+        chromium \
+        chromium-driver \
+        fluxbox \
+        fonts-dejavu \
+        fonts-noto \
+        fonts-noto-color-emoji \
+        fonts-noto-cjk \
+        x11vnc \
+        novnc \
+        websockify \
+        python3-websockify \
+        ffmpeg \
+        git \
+        jq \
+        gnupg \
+    && mkdir -p /tmp/.X11-unix \
+    && chmod 1777 /tmp/.X11-unix \
+    && rm -rf /var/lib/apt/lists/*
+
+# Playwright Chromium runtime — installs into /root/.cache then we move it to
+# the agentflow home so the non-root user can read it. Keep the system
+# chromium as a fallback for `app_open` calls that don't go through Playwright.
+RUN pip install --no-cache-dir "playwright>=1.40" \
+    && python -m playwright install chromium \
+    && mkdir -p /home/agentflow/.cache \
+    && cp -r /root/.cache/ms-playwright /home/agentflow/.cache/ \
+    && chown -R agentflow:agentflow /home/agentflow/.cache \
+    && rm -rf /root/.cache
+
+USER agentflow
+
+# 8765 — daemon HTTP (cabinet reconciler readiness)
+# 6080 — noVNC web client (cabinet iframes via wss://<pod>/websockify)
+# 5900 — raw VNC for direct clients (port-forward only, not in public ingress)
+EXPOSE 8765 6080 5900
