@@ -10,6 +10,7 @@ drive ``connect_integration`` to assert:
 """
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -178,24 +179,176 @@ def test_registry_cache_skips_repeat_http_within_ttl():
     assert len(calls) == 2, "stale cache must refetch"
 
 
-def test_telegram_app_flow_returns_not_implemented():
+def test_telegram_app_flow_happy_path_posts_session_blob():
+    """v1 flow: cookies + localStorage MTProto keys POSTed to /me/integrations/telegram."""
     tg_entry = {
         "slug": "telegram_app",
         "display_name": "Telegram",
         "flow_kind": "telegram_app",
+        "login_url": "https://web.telegram.org/k/",
+        "cookie_domain": "web.telegram.org",
     }
+
+    def tg_probe(_js: str, _tab: Any = None) -> str:
+        return '{"logged": true, "url": "https://web.telegram.org/k/"}'
+
+    def tg_dump(_js: str, _tab: Any = None) -> str:
+        return json.dumps(
+            {
+                "dc1_auth_key": "redacted_key_bytes",
+                "user_auth": '{"id":123,"_":"userAuth"}',
+                "server_time_offset": "0",
+            }
+        )
+
+    # chrome_eval is called twice: once for the probe, once for the dump.
+    # We dispatch on call order — probe first, then dump.
+    eval_calls = {"n": 0}
+
+    def stub_eval(js: str, tab: Any = None) -> str:
+        eval_calls["n"] += 1
+        if eval_calls["n"] == 1:
+            return tg_probe(js, tab)
+        return tg_dump(js, tab)
+
+    def tg_export(_domain: str, _profile: str = "Default") -> dict[str, Any]:
+        return {
+            "ok": True,
+            "domain": "web.telegram.org",
+            "cookies": [
+                {"name": "stel_ssid", "value": "redacted", "domain": ".web.telegram.org"},
+                {"name": "stel_token", "value": "redacted", "domain": ".web.telegram.org"},
+            ],
+            "profile": "Default",
+        }
+
+    posts: list[tuple[str, dict[str, Any], str]] = []
+
+    def fake_post(url: str, body: dict[str, Any], api_key: str):
+        posts.append((url, body, api_key))
+        return 200, {"ok": True, "secret_created": True}
+
     result = ci.connect_integration(
         "telegram_app",
         api_key="af_live_test",
         api_base="https://example.test/_agents",
         chrome_open_url=_fake_chrome_open,
-        chrome_eval=_logged_in_eval,
-        chrome_export_cookies=_fake_export,
+        chrome_eval=stub_eval,
+        chrome_export_cookies=tg_export,
         sleep=lambda _s: None,
         http_get=lambda _u: [tg_entry],
+        http_post=fake_post,
     )
+
+    assert result["ok"] is True
+    assert result["provider"] == "telegram_app"
+    assert result["cookie_count"] == 2
+    assert "dc1_auth_key" in result["local_storage_keys"]
+    assert result["secret_created"] is True
+
+    # POST must hit /me/integrations/telegram with the expected body shape.
+    assert posts, "POST must fire on happy path"
+    posted_url, posted_body, posted_key = posts[0]
+    assert posted_url == "https://example.test/_agents/me/integrations/telegram"
+    assert posted_key == "af_live_test"
+    assert posted_body["provider"] == "telegram"
+    assert "session_blob" in posted_body
+    assert len(posted_body["session_blob"]["cookies"]) == 2
+    assert "dc1_auth_key" in posted_body["session_blob"]["local_storage"]
+
+    # Sensitive material must NOT appear in the tool_result.
+    flat = repr(result)
+    assert "redacted" not in flat
+    assert "redacted_key_bytes" not in flat
+
+
+def test_telegram_app_flow_not_logged_in_skips_post():
+    tg_entry = {
+        "slug": "telegram_app",
+        "display_name": "Telegram",
+        "flow_kind": "telegram_app",
+    }
+
+    def tg_probe_out(_js: str, _tab: Any = None) -> str:
+        return '{"logged": false, "url": "https://web.telegram.org/k/"}'
+
+    posts: list[Any] = []
+    exports: list[Any] = []
+
+    def fake_post(*a):
+        posts.append(a)
+        return 200, {"ok": True}
+
+    def fake_export(*a, **kw):
+        exports.append((a, kw))
+        return _fake_export(*a, **kw)
+
+    result = ci.connect_integration(
+        "telegram_app",
+        api_key="af_live_test",
+        api_base="https://example.test/_agents",
+        chrome_open_url=_fake_chrome_open,
+        chrome_eval=tg_probe_out,
+        chrome_export_cookies=fake_export,
+        sleep=lambda _s: None,
+        http_get=lambda _u: [tg_entry],
+        http_post=fake_post,
+    )
+
     assert result["ok"] is False
-    assert result["error"] == "not_implemented"
+    assert result["error"] == "not_logged_in"
+    assert posts == []
+    assert exports == [], "must not export cookies when logged-out"
+
+
+def test_telegram_app_flow_no_mtproto_key_reports_error():
+    """Cookies present but localStorage missing dc*_auth_key → no_mtproto_key."""
+    tg_entry = {
+        "slug": "telegram_app",
+        "display_name": "Telegram",
+        "flow_kind": "telegram_app",
+    }
+
+    eval_calls = {"n": 0}
+
+    def stub_eval(_js: str, _tab: Any = None) -> str:
+        eval_calls["n"] += 1
+        if eval_calls["n"] == 1:
+            return '{"logged": true, "url": "https://web.telegram.org/k/"}'
+        # Dump returns empty (no dc* keys).
+        return "{}"
+
+    def tg_export(_domain: str, _profile: str = "Default") -> dict[str, Any]:
+        return {
+            "ok": True,
+            "domain": "web.telegram.org",
+            "cookies": [
+                {"name": "stel_ssid", "value": "x", "domain": ".web.telegram.org"},
+            ],
+            "profile": "Default",
+        }
+
+    posts: list[Any] = []
+
+    def fake_post(*a):
+        posts.append(a)
+        return 200, {"ok": True}
+
+    result = ci.connect_integration(
+        "telegram_app",
+        api_key="af_live_test",
+        api_base="https://example.test/_agents",
+        chrome_open_url=_fake_chrome_open,
+        chrome_eval=stub_eval,
+        chrome_export_cookies=tg_export,
+        sleep=lambda _s: None,
+        http_get=lambda _u: [tg_entry],
+        http_post=fake_post,
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "no_mtproto_key"
+    assert posts == [], "POST must not fire without an MTProto key"
 
 
 def test_backend_error_propagates_verbatim():

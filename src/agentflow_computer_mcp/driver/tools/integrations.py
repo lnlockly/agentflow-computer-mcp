@@ -24,8 +24,27 @@ Flow for ``flow_kind == 'cookie_export'``:
     8. Return a small summary: ``{ok, provider, cookie_count,
        secret_created}``.
 
-``flow_kind == 'telegram_app'`` returns ``not_implemented`` here. Track 2
-ships only the cookie path; the app-driver flow is a separate PR.
+Flow for ``flow_kind == 'telegram_app'`` (web.telegram.org session handoff):
+    1. ``chrome_open_url(login_url)`` — defaults to ``https://web.telegram.org/k/``
+       if the registry entry omits it. Wait 2 s for the SPA to settle.
+    2. ``chrome_eval(logged_probe_js)`` — registry-defined probe that
+       inspects ``localStorage`` for ``dc1_auth_key`` / ``user_auth``.
+       Defaults to a built-in probe if the registry doesn't ship one.
+    3. If ``logged`` is False: return ``not_logged_in`` with a hint
+       asking the user to sign in via QR / phone, then retry.
+    4. ``chrome_export_cookies(web.telegram.org)`` — exports the cookies
+       Telegram Web sets (``stel_ssid``, ``stel_token``, …).
+    5. Optionally ``chrome_eval(local_storage_dump_js)`` to capture the
+       MTProto auth keys (``dc*_auth_key``, ``user_auth``) that Telegram
+       Web actually authenticates with — cookies alone are insufficient.
+    6. POST ``/me/integrations/telegram`` with body
+       ``{provider:'telegram', session_blob:{cookies, local_storage}}``.
+
+This is a v1 hand-off — sufficient for owner E2E. v2 (native MTProto
+``tdata`` decryption) is a separate effort tracked in the spec.
+
+Hard rules carry over: cookie values + auth keys never appear in the
+returned summary; only ``cookie_count`` and ``local_storage_keys``.
 
 Hard rules:
     - Cookie values never appear in the returned summary. Only the
@@ -198,6 +217,217 @@ def _parse_probe_result(raw: str) -> dict[str, Any]:
     return {"logged": "true" in lowered and "logged:true" in lowered.replace(" ", "")}
 
 
+# Default probe + localStorage dump used when registry entry omits them.
+# Telegram Web (k/ client) stores the MTProto auth key under
+# `localStorage["dc1_auth_key"]` and user state under `localStorage["user_auth"]`.
+# Both must be present for the session to be usable.
+_DEFAULT_TELEGRAM_PROBE_JS = (
+    "JSON.stringify({"
+    "logged: !!(localStorage.getItem('dc1_auth_key') "
+    "&& localStorage.getItem('user_auth')), "
+    "url: location.href"
+    "})"
+)
+
+_DEFAULT_TELEGRAM_DUMP_JS = (
+    "JSON.stringify((function(){"
+    "var out={};"
+    "for (var i=0;i<localStorage.length;i++){"
+    "var k=localStorage.key(i);"
+    "if (k && (k.indexOf('dc')===0 || k==='user_auth' || k==='auth_key_id'"
+    " || k==='server_time_offset' || k==='xt_instance')) {"
+    "out[k]=localStorage.getItem(k);"
+    "}"
+    "}"
+    "return out;"
+    "})())"
+)
+
+
+def _parse_localstorage_dump(raw: str) -> dict[str, str]:
+    """Coerce ``chrome_eval`` dump output into ``{key: value}`` dict.
+
+    Returns an empty dict on parse failure rather than crashing — the
+    cookies alone may still be useful for the backend to triage.
+    """
+    if not raw:
+        return {}
+    text = raw.strip()
+    if not text or text.startswith("error:"):
+        return {}
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {str(k): str(v) for k, v in parsed.items() if v is not None}
+
+
+def _run_telegram_app_flow(
+    *,
+    entry: dict[str, Any],
+    slug: str,
+    api_key: str,
+    api_base: str,
+    chrome_open_url: Callable[[str, bool], str],
+    chrome_eval: Callable[[str, int | None], str],
+    chrome_export_cookies: Callable[[str, str], dict[str, Any]],
+    sleep: Callable[[float], None],
+    http_post: Callable[[str, dict[str, Any], str], tuple[int, Any]],
+) -> dict[str, Any]:
+    """Drive the Telegram Web (web.telegram.org/k/) session hand-off.
+
+    Isolated from the cookie_export flow so changes here can't regress
+    the existing kwork/vk/lolzteam path. v1 = cookies + localStorage
+    MTProto keys POSTed to ``/me/integrations/telegram``. v2 (native
+    ``tdata`` decryption) is a separate effort.
+    """
+    login_url = (
+        str(entry.get("login_url", "")).strip() or "https://web.telegram.org/k/"
+    )
+    cookie_domain = (
+        str(entry.get("cookie_domain", "")).strip() or "web.telegram.org"
+    )
+    probe_js = (
+        str(entry.get("logged_probe_js", "")).strip() or _DEFAULT_TELEGRAM_PROBE_JS
+    )
+    dump_js = (
+        str(entry.get("local_storage_dump_js", "")).strip()
+        or _DEFAULT_TELEGRAM_DUMP_JS
+    )
+
+    # Step 1: open Telegram Web.
+    try:
+        open_result = chrome_open_url(login_url, True)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "error": "chrome_open_failed",
+            "provider": slug,
+            "detail": str(exc),
+        }
+    if isinstance(open_result, str) and open_result.startswith("error:"):
+        return {
+            "ok": False,
+            "error": "chrome_open_failed",
+            "provider": slug,
+            "detail": open_result,
+        }
+    sleep(2)
+
+    # Step 2: probe whether the user is logged in (localStorage check).
+    try:
+        probe_raw = chrome_eval(probe_js, None)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "error": "chrome_eval_failed",
+            "provider": slug,
+            "detail": str(exc),
+        }
+    probe = _parse_probe_result(probe_raw)
+    if not probe.get("logged"):
+        return {
+            "ok": False,
+            "error": "not_logged_in",
+            "provider": slug,
+            "hint": (
+                f"Не вижу залогиненную сессию {entry.get('display_name', 'Telegram')} "
+                "в Chrome. Открой web.telegram.org/k, войди по QR или номеру, "
+                "потом повтори запрос."
+            ),
+            "probe_url": probe.get("url"),
+        }
+
+    # Step 3: export cookies (stel_ssid, stel_token, …).
+    try:
+        export = chrome_export_cookies(cookie_domain, "Default")
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "error": "export_failed",
+            "provider": slug,
+            "detail": str(exc),
+        }
+    if not export or not export.get("ok"):
+        return {
+            "ok": False,
+            "error": str(export.get("error") if export else "export_failed"),
+            "provider": slug,
+        }
+    cookies = export.get("cookies") or []
+
+    # Step 4: dump MTProto auth keys from localStorage. Cookies alone do
+    # NOT authenticate against Telegram Web — dc*_auth_key is mandatory.
+    try:
+        dump_raw = chrome_eval(dump_js, None)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "error": "chrome_eval_failed",
+            "provider": slug,
+            "detail": str(exc),
+        }
+    local_storage = _parse_localstorage_dump(dump_raw)
+    if not any(k.startswith("dc") and k.endswith("_auth_key") for k in local_storage):
+        return {
+            "ok": False,
+            "error": "no_mtproto_key",
+            "provider": slug,
+            "hint": (
+                "В localStorage нет dc*_auth_key — Telegram Web ещё не "
+                "сохранил сессию. Подожди завершения логина и повтори."
+            ),
+        }
+
+    # Step 5: ship to the platform. Backend writes session_blob into the
+    # user's integration_hub project under TELEGRAM_SESSION_JSON.
+    post_url = f"{api_base.rstrip('/')}/me/integrations/telegram"
+    session_blob = {"cookies": cookies, "local_storage": local_storage}
+    try:
+        status, body = http_post(
+            post_url,
+            {"provider": "telegram", "session_blob": session_blob},
+            api_key,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "error": "post_failed",
+            "provider": slug,
+            "detail": str(exc),
+        }
+
+    if status >= 400:
+        backend_err = (
+            body.get("error") if isinstance(body, dict) else None
+        ) or f"http_{status}"
+        return {
+            "ok": False,
+            "error": str(backend_err),
+            "provider": slug,
+            "status": status,
+        }
+
+    secret_created = False
+    if isinstance(body, dict):
+        secret_created = bool(
+            body.get("secret_created")
+            or body.get("created")
+            or body.get("ok")
+        )
+
+    return {
+        "ok": True,
+        "provider": slug,
+        "cookie_count": len(cookies),
+        "local_storage_keys": sorted(local_storage.keys()),
+        "secret_created": secret_created,
+        "display_name": entry.get("display_name", "Telegram"),
+    }
+
+
 def connect_integration(
     provider: str,
     *,
@@ -259,12 +489,17 @@ def connect_integration(
     slug = str(entry.get("slug", provider)).strip()
 
     if flow_kind == "telegram_app":
-        return {
-            "ok": False,
-            "error": "not_implemented",
-            "provider": slug,
-            "detail": "telegram_app flow lands in a follow-up PR (Track 2b)",
-        }
+        return _run_telegram_app_flow(
+            entry=entry,
+            slug=slug,
+            api_key=api_key,
+            api_base=api_base,
+            chrome_open_url=chrome_open_url,
+            chrome_eval=chrome_eval,
+            chrome_export_cookies=chrome_export_cookies,
+            sleep=sleep,
+            http_post=http_post,
+        )
 
     if flow_kind != "cookie_export":
         return {
