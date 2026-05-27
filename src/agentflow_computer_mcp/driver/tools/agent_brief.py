@@ -671,12 +671,12 @@ def _spawn_python_bot(
     matching the dev-server spawn pattern.
 
     Entrypoint discovery covers the two common shapes:
-    * Script at repo root: ``bot.py`` → ``main.py`` → ``app.py`` →
-      ``backend/bot.py`` → ``src/bot.py`` (in priority order). Runs as
-      ``python <path>``.
-    * Package with ``__main__.py``: ``app/__main__.py`` → ``bot/__main__.py``
-      → ``src/__main__.py`` (in priority order). Runs as ``python -m <pkg>``.
-      The aiogram_bot_template we ship for tg_bot uses this layout.
+    * Script at repo root or one subdir deep: ``bot.py`` → ``main.py`` →
+      ``app.py`` → ``backend/bot.py`` → ``src/bot.py`` (priority order).
+      Runs as ``python <path>``.
+    * Runnable package (``<pkg>/__main__.py``): ``app`` → ``bot`` → ``src``
+      (priority order). Runs as ``python -m <pkg>``. The
+      ``aiogram_bot_template`` we ship for tg_bot uses this layout.
 
     Anything else returns ``no_python_entrypoint`` so the launcher can
     POST clone-status ok=false with a stable error code.
@@ -686,9 +686,9 @@ def _spawn_python_bot(
     cmd: list[str] | None = None
     entrypoint_repr: str | None = None
 
-    # 1. Script files at the repo root or one level down. Order matters —
-    # `bot.py` wins over `app.py` when both exist (some templates ship
-    # `app.py` as a leftover example).
+    # 1. Script files at root or one level down. Order matters — `bot.py`
+    # wins over `app.py` when both exist (some templates ship `app.py`
+    # as a leftover example).
     for candidate in (
         "bot.py",
         "main.py",
