@@ -530,6 +530,189 @@ def install_go(
 # --- top-level orchestrator -----------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# .env.example → .env.local with dev-safe dummies
+# ---------------------------------------------------------------------------
+# Why: templates from the wider ecosystem (Clerk-based Next.js, Supabase
+# starters, NextAuth examples) crash on first render when their required
+# env vars are missing. opencode could in principle copy `.env.example`
+# itself, but historically refuses to invent secrets (security guardrail),
+# leaving the dev server to 500 on first request. We pre-seed safe dev
+# defaults BEFORE opencode runs so the template boots; the brief tells the
+# user (and opencode) that real values can be set in
+# /cabinet/devices/<id>/secrets later.
+
+# Heuristics: longest-match key suffix wins.
+_ENV_DEFAULTS: tuple[tuple[str, str], ...] = (
+    # Clerk / Stripe-style publishable keys — start with `pk_` and are
+    # safe to ship as literals in the browser bundle.
+    ("PUBLISHABLE_KEY", "pk_test_dummy_dev_value_replace_in_cabinet"),
+    # Generic API/secret keys → 32 hex chars (deterministic dummy so
+    # the same workspace boots the same on repeat clones).
+    ("SECRET_KEY", "dummydummydummydummydummydummy00"),
+    ("SECRET", "dummydummydummydummydummydummy00"),
+    ("API_KEY", "dummydummydummydummydummydummy00"),
+    ("ACCESS_KEY", "dummydummydummydummydummydummy00"),
+    # Auth/session bits.
+    ("NEXTAUTH_SECRET", "dummydummydummydummydummydummy00"),
+    ("NEXTAUTH_URL", "http://localhost:3000"),
+    ("AUTH_SECRET", "dummydummydummydummydummydummy00"),
+    ("JWT_SECRET", "dummydummydummydummydummydummy00"),
+    # Database URLs — sqlite is the universal happy-path: works with
+    # prisma, drizzle, sqlalchemy, sequelize out of the box when the
+    # driver is installed.
+    ("DATABASE_URL", "file:./dev.db"),
+    ("DIRECT_URL", "file:./dev.db"),
+    ("POSTGRES_URL", "postgresql://postgres:postgres@localhost:5432/postgres"),
+    ("REDIS_URL", "redis://localhost:6379"),
+    ("MONGODB_URI", "mongodb://localhost:27017/dev"),
+    # Common URL bases.
+    ("BASE_URL", "http://localhost:3000"),
+    ("APP_URL", "http://localhost:3000"),
+    ("PUBLIC_URL", "http://localhost:3000"),
+    ("FRONTEND_URL", "http://localhost:3000"),
+    ("API_URL", "http://localhost:3000"),
+    ("URL", "http://localhost:3000"),
+    # Storage / S3 — `minio` defaults match most local-S3 starters.
+    ("S3_ACCESS_KEY_ID", "minioadmin"),
+    ("S3_SECRET_ACCESS_KEY", "minioadmin"),
+    ("S3_BUCKET", "dev-bucket"),
+    ("S3_REGION", "us-east-1"),
+    # Email — disable so dev doesn't try to send.
+    ("SMTP_HOST", "localhost"),
+    ("SMTP_PORT", "1025"),
+    ("EMAIL_FROM", "dev@localhost"),
+    # OAuth — empty client IDs trigger most templates' "auth disabled"
+    # fallback path rather than crashing on undefined.
+    ("CLIENT_ID", ""),
+    ("CLIENT_SECRET", ""),
+    # NEXT_PUBLIC_* generic — public values, safe dummies.
+    ("ENABLE", "false"),
+)
+
+
+def _pick_env_default(key: str) -> str:
+    """Pick a dev-safe default for an env var by longest-matching suffix."""
+    upper = key.upper()
+    for suffix, value in _ENV_DEFAULTS:
+        if upper == suffix or upper.endswith("_" + suffix) or upper.endswith(suffix):
+            return value
+    # Fallback: empty string. Templates that crash on empty are rare and
+    # we cannot guess intent without a spec — better to keep the crash
+    # visible than to silently shove a junk value.
+    return ""
+
+
+def _parse_env_example(text: str) -> list[tuple[str, str]]:
+    """Parse a dotenv-shaped file into `[(key, sample_value), ...]`.
+
+    Comments and blanks are skipped. Right-hand side preserved verbatim
+    so the caller can decide whether to overwrite (we only fill keys
+    whose existing value is empty / sample-looking).
+    """
+    out: list[tuple[str, str]] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export ") :].strip()
+        if not key:
+            continue
+        out.append((key, value.strip()))
+    return out
+
+
+_ENV_TARGET_NAMES: tuple[str, ...] = (".env.local", ".env")
+
+
+def ensure_env_defaults(project_dir: str) -> dict[str, Any]:
+    """Seed dev-safe dummies into ``.env.local`` (or ``.env``) for any
+    key listed in ``.env.example`` that isn't already populated.
+
+    Idempotent: re-running never overwrites a key that already has a
+    non-empty, non-sample value. The output dict reports which keys
+    were filled so the daemon log shows it for grep.
+    """
+    if not project_dir or not Path(project_dir).is_dir():
+        return {"action": "skip", "reason": "workspace_missing"}
+
+    example_path: Path | None = None
+    for name in (".env.example", ".env.sample", ".env.template"):
+        p = Path(project_dir) / name
+        if p.is_file():
+            example_path = p
+            break
+    if example_path is None:
+        _log("env: no .env.example / .env.sample, skipping")
+        return {"action": "skip", "reason": "no_env_example"}
+
+    try:
+        example_text = example_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        _log(f"env: could not read {example_path}: {exc}")
+        return {"action": "skip", "reason": "read_failed"}
+
+    wanted = _parse_env_example(example_text)
+    if not wanted:
+        _log("env: .env.example parsed empty, skipping")
+        return {"action": "skip", "reason": "empty"}
+
+    # Prefer .env.local (Next.js convention; never committed); fall back
+    # to .env (Prisma / fastify / nest).
+    target = Path(project_dir) / _ENV_TARGET_NAMES[0]
+    existing: dict[str, str] = {}
+    if target.exists():
+        try:
+            for k, v in _parse_env_example(target.read_text(encoding="utf-8")):
+                existing[k] = v
+        except (OSError, UnicodeDecodeError):
+            existing = {}
+
+    filled: list[str] = []
+    lines = [
+        "# Auto-generated by AgentFlow daemon. Replace in /cabinet/devices/<id>/secrets",
+        "# to plug real provider keys. Safe to commit nothing — this file should be",
+        "# gitignored by every template that uses .env.example.",
+        "",
+    ]
+    for key, sample in wanted:
+        if existing.get(key, "").strip():
+            lines.append(f"{key}={existing[key]}")
+            continue
+        # Sample values that look real (e.g. "https://example.com/v1") are
+        # often documentation, not dummies — pick our own default and
+        # ignore the sample.
+        chosen = _pick_env_default(key)
+        if not chosen and sample and not sample.startswith(("<", "your-", "your_", "xxx")):
+            # The .env.example author left a sane default — keep it.
+            chosen = sample.strip().strip("\"'")
+        if not chosen:
+            # Leave as empty; some templates branch on falsy.
+            lines.append(f"{key}=")
+            continue
+        lines.append(f"{key}={chosen}")
+        filled.append(key)
+
+    try:
+        target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError as exc:
+        _log(f"env: write failed {target}: {exc}")
+        return {"action": "fail", "reason": "write_failed", "detail": str(exc)}
+
+    _log(f"env: wrote {target.name} ({len(filled)} dummies, {len(wanted)} total)")
+    return {
+        "action": "wrote",
+        "path": str(target),
+        "filled_keys": filled,
+        "total_keys": len(wanted),
+    }
+
+
 def resolve_runtimes(
     project_dir: str,
     *,
@@ -555,6 +738,14 @@ def resolve_runtimes(
 
     _log(f"start workspace={project_dir}")
     actions: list[dict[str, Any]] = []
+
+    # 0. Env defaults — seed .env.local from .env.example BEFORE opencode
+    # runs so dev servers don't crash on missing `NEXT_PUBLIC_CLERK_*`,
+    # `DATABASE_URL`, etc. Idempotent and conservative — only fills empty
+    # keys with safe dummies; never overrides a real value the user
+    # already pasted in.
+    env_result = ensure_env_defaults(project_dir)
+    actions.append({"runtime": "env", **env_result})
 
     # 1. Node.
     needed_node = required_node_major(project_dir)
