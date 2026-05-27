@@ -663,24 +663,55 @@ def _spawn_python_bot(
     bot_token: str,
     log_file: str = TG_BOT_LOG_FILE,
 ) -> dict[str, Any]:
-    """Detached `nohup python bot.py & disown` so the bot outlives the call.
+    """Detached ``python <entrypoint>`` so the bot outlives the call.
 
     The daemon's WS dispatcher does not stick around — when this thread
     returns, the bot must keep polling Telegram on its own. ``nohup`` +
     ``start_new_session=True`` reparent the child under PID 1 (tini),
     matching the dev-server spawn pattern.
 
-    Picks the entrypoint in this order: ``bot.py`` at the repo root,
-    then ``main.py``, then ``app.py``. Anything else and we return an
-    error — the templates we ship for tg_bot all use one of these names.
+    Entrypoint discovery covers the two common shapes:
+    * Script at repo root: ``bot.py`` → ``main.py`` → ``app.py`` →
+      ``backend/bot.py`` → ``src/bot.py`` (in priority order). Runs as
+      ``python <path>``.
+    * Package with ``__main__.py``: ``app/__main__.py`` → ``bot/__main__.py``
+      → ``src/__main__.py`` (in priority order). Runs as ``python -m <pkg>``.
+      The aiogram_bot_template we ship for tg_bot uses this layout.
+
+    Anything else returns ``no_python_entrypoint`` so the launcher can
+    POST clone-status ok=false with a stable error code.
     """
-    entrypoint: Path | None = None
-    for candidate in ("bot.py", "main.py", "app.py"):
-        path = Path(project_dir) / candidate
+    project_path = Path(project_dir)
+
+    cmd: list[str] | None = None
+    entrypoint_repr: str | None = None
+
+    # 1. Script files at the repo root or one level down. Order matters —
+    # `bot.py` wins over `app.py` when both exist (some templates ship
+    # `app.py` as a leftover example).
+    for candidate in (
+        "bot.py",
+        "main.py",
+        "app.py",
+        "backend/bot.py",
+        "src/bot.py",
+    ):
+        path = project_path / candidate
         if path.exists():
-            entrypoint = path
+            cmd = ["python", str(path)]
+            entrypoint_repr = str(path)
             break
-    if entrypoint is None:
+
+    # 2. Runnable package — `python -m <pkg>` looks for `<pkg>/__main__.py`.
+    if cmd is None:
+        for pkg in ("app", "bot", "src"):
+            main_py = project_path / pkg / "__main__.py"
+            if main_py.exists():
+                cmd = ["python", "-m", pkg]
+                entrypoint_repr = f"-m {pkg}"
+                break
+
+    if cmd is None:
         return {"ok": False, "error": "no_python_entrypoint"}
 
     try:
@@ -691,7 +722,7 @@ def _spawn_python_bot(
     env = {**os.environ, "BOT_TOKEN": bot_token, "PYTHONUNBUFFERED": "1"}
     try:
         proc = subprocess.Popen(  # noqa: S603 — python interpreter from PATH
-            ["python", str(entrypoint)],
+            cmd,
             cwd=project_dir,
             stdout=log_fh,
             stderr=subprocess.STDOUT,
@@ -707,7 +738,7 @@ def _spawn_python_bot(
 
         with contextlib.suppress(OSError):
             log_fh.close()
-    return {"ok": True, "pid": proc.pid, "entrypoint": str(entrypoint)}
+    return {"ok": True, "pid": proc.pid, "entrypoint": entrypoint_repr or " ".join(cmd)}
 
 
 def _watch_and_launch_tg_bot(
@@ -938,7 +969,7 @@ def _tail_and_stream_agent_log(
     pid_alive: Callable[[int | None], bool] = _is_pid_alive,
     now: Callable[[], float] = time.monotonic,
 ) -> None:
-    """Tail opencode stdout + POST batches of lines to /agent-log.
+    """Tail opencode stdout + POST batches of lines to /daemon-log/.../agent-log.
 
     The opencode CLI prints structured progress to ``log_path``. We open the
     file, seek to EOF (it already contains the spawn's first writes by the
@@ -971,7 +1002,10 @@ def _tail_and_stream_agent_log(
         return
 
     api_base = _normalise_api_base(os.environ.get("AF_API_URL", "https://agentflow.website"))
-    url = f"{api_base}/internal/projects/{project_id}/agent-log"
+    # Cloudflare blocks POST to /_agents/internal/* from pod IPs with 403.
+    # Backend PR #894 exposes the same handler at /daemon-log/* (still gated
+    # by requireInternalSecret) which CF allows.
+    url = f"{api_base}/daemon-log/projects/{project_id}/agent-log"
 
     # Wait briefly for the log file to appear — spawn_opencode opens it
     # before returning, but on a slow filesystem a follow-up open could
