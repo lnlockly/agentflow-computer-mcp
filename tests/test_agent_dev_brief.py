@@ -416,6 +416,56 @@ def test_spawn_python_bot_rejects_when_no_entrypoint(tmp_path):
     assert res == {"ok": False, "error": "no_python_entrypoint"}
 
 
+def test_spawn_python_bot_uses_module_for_app_package(tmp_path, monkeypatch):
+    # aiogram_bot_template (the default tg_bot scout pick) ships
+    # `app/__main__.py` so `python -m app` is the entrypoint. The launcher
+    # must build that command line rather than failing with
+    # no_python_entrypoint.
+    proj = tmp_path / "proj-x"
+    (proj / "app").mkdir(parents=True)
+    (proj / "app" / "__main__.py").write_text("print('hi')")
+
+    captured: dict[str, Any] = {}
+
+    class FakeProc:
+        pid = 4242
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr(ab.subprocess, "Popen", fake_popen)
+    res = ab._spawn_python_bot(str(proj), bot_token="t:t")
+    assert res["ok"] is True
+    assert res["pid"] == 4242
+    assert captured["cmd"] == ["python", "-m", "app"]
+
+
+def test_spawn_python_bot_prefers_root_bot_py_over_module(tmp_path, monkeypatch):
+    # When both exist, `bot.py` at the root wins. Otherwise a stray sample
+    # `app/__main__.py` from a template's docs/examples directory could
+    # shadow the real bot entrypoint.
+    proj = tmp_path / "proj-x"
+    (proj / "app").mkdir(parents=True)
+    (proj / "app" / "__main__.py").write_text("print('module')")
+    (proj / "bot.py").write_text("print('script')")
+
+    captured: dict[str, Any] = {}
+
+    class FakeProc:
+        pid = 1
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr(ab.subprocess, "Popen", fake_popen)
+    ab._spawn_python_bot(str(proj), bot_token="t:t")
+    assert captured["cmd"][0] == "python"
+    assert captured["cmd"][1].endswith("bot.py")
+    assert "-m" not in captured["cmd"]
+
+
 def test_watch_and_launch_tg_bot_reports_bot_username_on_getme_ok(
     tmp_path, monkeypatch
 ):
