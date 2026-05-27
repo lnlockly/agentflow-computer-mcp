@@ -65,13 +65,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         novnc \
         websockify \
         python3-websockify \
-        nodejs \
-        npm \
-    # pnpm 10.x requires Node 22.13+; Debian bookworm ships Node 18.20.
-    # Pin to pnpm 9.x so the daemon image keeps working without a Node
-    # major bump. Drop the pin when we move to a Node 22 base image.
-    && npm install -g --no-audit --no-fund pnpm@9 yarn opencode-ai \
+        gnupg \
     && rm -rf /var/lib/apt/lists/*
+
+# Node 22 LTS via NodeSource. Debian bookworm ships Node 18.20, which is
+# below the floor for Vite >=7 (needs Node 20.19+), Next 15, and pnpm
+# 10. Coder-spawned `pnpm dev` against vite7 dies with
+# `crypto.hash is not a function` on Node 18 — so we install a fresh
+# Node 22 from NodeSource here.
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm install -g --no-audit --no-fund pnpm yarn opencode-ai \
+    && rm -rf /var/lib/apt/lists/* \
+    && node --version && npm --version && pnpm --version
 
 # Non-root user. Pod's default uid is 0 in many vclusters but the daemon
 # only writes to /data and ~/.agentflow so we don't need root after the
