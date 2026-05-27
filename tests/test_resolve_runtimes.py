@@ -301,7 +301,10 @@ def test_resolve_runtimes_empty_workspace(tmp_path):
         current_node=lambda r: 22,
     )
     assert result["ok"] is True
-    assert result["actions"] == []
+    # env step always runs (no-op skip when there's no .env.example)
+    runtimes = [a["runtime"] for a in result["actions"]]
+    assert runtimes == ["env"]
+    assert result["actions"][0]["action"] == "skip"
 
 
 def test_resolve_runtimes_missing_workspace(tmp_path):
@@ -325,8 +328,9 @@ def test_resolve_runtimes_node_only_skip(tmp_path):
     )
     assert result["ok"] is True
     runtimes = [a["runtime"] for a in result["actions"]]
-    assert runtimes == ["node"]
-    assert result["actions"][0]["action"] == "skip"
+    assert runtimes == ["env", "node"]
+    node_action = next(a for a in result["actions"] if a["runtime"] == "node")
+    assert node_action["action"] == "skip"
 
 
 def test_resolve_runtimes_python_path(tmp_path):
@@ -347,7 +351,61 @@ def test_resolve_runtimes_python_path(tmp_path):
     )
     assert result["ok"] is True
     runtimes = [a["runtime"] for a in result["actions"]]
-    assert runtimes == ["python"]
+    assert runtimes == ["env", "python"]
+
+
+# --- env defaults --------------------------------------------------------
+
+
+def test_ensure_env_defaults_picks_clerk_publishable(tmp_path):
+    proj = tmp_path / "p"
+    proj.mkdir()
+    (proj / ".env.example").write_text(
+        "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_test_REPLACE_ME\n"
+        "CLERK_SECRET_KEY=\n"
+        "DATABASE_URL=\n",
+    )
+    res = rr.ensure_env_defaults(str(proj))
+    assert res["action"] == "wrote"
+    body = (proj / ".env.local").read_text()
+    assert "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_test_dummy" in body
+    assert "CLERK_SECRET_KEY=dummydummy" in body
+    assert "DATABASE_URL=file:./dev.db" in body
+
+
+def test_ensure_env_defaults_preserves_existing_real_value(tmp_path):
+    proj = tmp_path / "p"
+    proj.mkdir()
+    (proj / ".env.example").write_text("API_KEY=\n")
+    (proj / ".env.local").write_text("API_KEY=real-paid-key-xyz\n")
+    res = rr.ensure_env_defaults(str(proj))
+    assert res["action"] == "wrote"
+    assert "API_KEY=real-paid-key-xyz" in (proj / ".env.local").read_text()
+    assert "API_KEY" not in res["filled_keys"]
+
+
+def test_ensure_env_defaults_no_example_skips(tmp_path):
+    proj = tmp_path / "p"
+    proj.mkdir()
+    res = rr.ensure_env_defaults(str(proj))
+    assert res == {"action": "skip", "reason": "no_env_example"}
+
+
+def test_ensure_env_defaults_detects_sample_variant(tmp_path):
+    proj = tmp_path / "p"
+    proj.mkdir()
+    (proj / ".env.sample").write_text("JWT_SECRET=\n")
+    res = rr.ensure_env_defaults(str(proj))
+    assert res["action"] == "wrote"
+    body = (proj / ".env.local").read_text()
+    assert "JWT_SECRET=" in body and "JWT_SECRET=\n" not in body  # got a dummy
+
+
+def test_pick_env_default_longest_suffix_wins():
+    # PUBLISHABLE_KEY beats KEY because of longer suffix match.
+    assert rr._pick_env_default("STRIPE_PUBLISHABLE_KEY").startswith("pk_test_dummy")
+    # No match → empty string.
+    assert rr._pick_env_default("WEIRD_CUSTOM_VAR") == ""
 
 
 # --- CLI ------------------------------------------------------------------
