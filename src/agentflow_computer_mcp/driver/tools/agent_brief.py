@@ -614,6 +614,11 @@ def _watch_and_report_clone_status(
         headers={
             "content-type": "application/json",
             "x-agentflow-secret": internal_secret,
+            # Cloudflare's WAF flags Python-urllib's default user-agent
+            # and replies with 403 to POSTs from k8s pod IPs. curl-shaped
+            # UA passes through cleanly. Owner repro 2026-05-27 — both
+            # clone-status and agent-log tailers ate 403 in a tight loop.
+            "user-agent": "curl/8.5.0 agentflow-daemon",
         },
     )
     try:
@@ -860,6 +865,11 @@ def _watch_and_launch_tg_bot(
         headers={
             "content-type": "application/json",
             "x-agentflow-secret": internal_secret,
+            # Cloudflare's WAF flags Python-urllib's default user-agent
+            # and replies with 403 to POSTs from k8s pod IPs. curl-shaped
+            # UA passes through cleanly. Owner repro 2026-05-27 — both
+            # clone-status and agent-log tailers ate 403 in a tight loop.
+            "user-agent": "curl/8.5.0 agentflow-daemon",
         },
     )
     try:
@@ -1040,6 +1050,8 @@ def _tail_and_stream_agent_log(
                 {
                     "content-type": "application/json",
                     "x-agentflow-secret": internal_secret,
+                    # See clone-status note — CF blocks default Python UA.
+                    "user-agent": "curl/8.5.0 agentflow-daemon",
                 },
             )
             if status >= 400:
