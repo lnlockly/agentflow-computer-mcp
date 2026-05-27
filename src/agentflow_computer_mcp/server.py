@@ -326,6 +326,16 @@ async def _dispatch_tool(name: str, args: dict[str, Any], config: AppConfig) -> 
         # the clone+spawn in a worker thread so the WS event loop keeps
         # ticking heartbeats; the opencode child itself is detached and
         # outlives this call.
+        #
+        # tg_bot projects pass extra fields in scope: ``kind``,
+        # ``bot_token``, ``bot_username``. The token never reaches
+        # opencode's prompt — agent_brief writes it to the project's
+        # ``.env`` before opencode runs, and the dedicated
+        # ``_watch_and_launch_tg_bot`` thread spawns ``python bot.py``
+        # after opencode exits.
+        kind_val = args.get("kind")
+        bot_token_val = args.get("bot_token")
+        bot_username_val = args.get("bot_username")
         return await asyncio.to_thread(
             agent_dev_brief,
             template_repo_full=str(args.get("template_repo_full", "")),
@@ -333,6 +343,9 @@ async def _dispatch_tool(name: str, args: dict[str, Any], config: AppConfig) -> 
             project_id=int(args.get("project_id", 0) or 0),
             brief=str(args.get("brief", "")),
             port=int(args.get("port", 3000) or 3000),
+            kind=str(kind_val) if kind_val else None,
+            bot_token=str(bot_token_val) if bot_token_val else None,
+            bot_username=str(bot_username_val) if bot_username_val else None,
         )
     raise LookupError(f"unknown tool: {name}")
 
