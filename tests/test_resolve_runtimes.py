@@ -15,6 +15,7 @@ Covered:
 
 from __future__ import annotations
 
+import contextlib
 import json
 from pathlib import Path
 from typing import Any
@@ -22,7 +23,6 @@ from typing import Any
 import pytest
 
 import agentflow_computer_mcp.driver.resolve_runtimes as rr
-
 
 # --- shared fakes ---------------------------------------------------------
 
@@ -53,10 +53,8 @@ class FakeDownloader:
         self.calls.append((url, dest, timeout_s))
         if self.ok:
             # Touch dest so callers see the file.
-            try:
+            with contextlib.suppress(OSError):
                 Path(dest).write_text("# fake n binary\n", encoding="utf-8")
-            except OSError:
-                pass
         return self.ok
 
 
