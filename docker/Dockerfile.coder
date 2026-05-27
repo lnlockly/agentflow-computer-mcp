@@ -22,16 +22,21 @@ ENV AF_HOSTED_VARIANT=coder
 USER root
 
 # Node 22 from NodeSource (matches PR #112 fix/daemon-node22-vite7 — Debian's
-# 18.20 breaks pnpm 10 and vite 7 toolchains). Install ttyd from apt (bookworm
-# carries 1.7) so the cabinet can iframe a real terminal at /me/devices/:id/term.
+# 18.20 breaks pnpm 10 and vite 7 toolchains). ttyd is NOT in bookworm's apt
+# repo (only in trixie/sid), so we grab the static binary from the upstream
+# release and drop it in /usr/local/bin.
+ARG TTYD_VERSION=1.7.7
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gnupg \
         git \
         jq \
-        ttyd \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && npm install -g --no-audit --no-fund pnpm@10 yarn opencode-ai \
+    && curl -fsSL "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.x86_64" \
+         -o /usr/local/bin/ttyd \
+    && chmod +x /usr/local/bin/ttyd \
+    && /usr/local/bin/ttyd --version \
     && apt-get purge -y --auto-remove gnupg \
     && rm -rf /var/lib/apt/lists/* /root/.npm
 
