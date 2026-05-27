@@ -713,11 +713,15 @@ def _tail_and_stream_agent_log(
         buffer.clear()
         last_flush = now()
 
+    # ``errors='replace'`` so a stray byte in pnpm's progress bar can't
+    # crash the reader. ``newline=''`` keeps universal-newlines off so we
+    # own the split exactly on ``\n``. The file handle is closed in the
+    # ``finally`` block at the end of the function — ruff's SIM115 wants a
+    # context manager, but the tail loop runs for up to 30 minutes and
+    # ``with`` would force us to inline the entire loop body, which is
+    # worse for readability than the explicit close.
     try:
-        # ``errors='replace'`` so a stray byte in pnpm's progress bar can't
-        # crash the reader. ``newline=''`` keeps universal-newlines off so
-        # we own the split exactly on ``\n``.
-        fh = open(log_path, encoding="utf-8", errors="replace", newline="")
+        fh = open(log_path, encoding="utf-8", errors="replace", newline="")  # noqa: SIM115 — long-lived handle
     except OSError as exc:
         log.warning(
             "agent-log tailer: open %s failed for project %d: %s",
@@ -758,12 +762,14 @@ def _tail_and_stream_agent_log(
             if now() >= deadline:
                 break
 
-            if not pid_alive(opencode_pid):
-                # opencode exited — drain any remaining bytes for up to
-                # ``drain_grace_sec`` then stop. The grace covers stdout
-                # buffer flushes that arrive after waitpid resolves.
-                if now() - last_byte_at >= drain_grace_sec:
-                    break
+            # opencode exited AND a drain grace window passed with no new
+            # bytes — combine into one ``and`` per ruff SIM102. The grace
+            # covers stdout-buffer flushes that arrive after waitpid resolves.
+            if (
+                not pid_alive(opencode_pid)
+                and now() - last_byte_at >= drain_grace_sec
+            ):
+                break
 
             time.sleep(poll_sleep_sec)
     finally:
@@ -773,10 +779,10 @@ def _tail_and_stream_agent_log(
             buffer.append({"line": leftover.rstrip("\r"), "ts": int(time.time() * 1000)})
             leftover = ""
         _flush()
-        try:
+        import contextlib
+
+        with contextlib.suppress(OSError):
             fh.close()
-        except OSError:
-            pass
 
 
 AGENT_DEV_BRIEF_DESCRIPTOR: dict[str, Any] = {
