@@ -259,15 +259,21 @@ elif [[ -z "${AF_API_KEY:-}" ]]; then
   exec agentflow-desktop selftest
 fi
 
-# OpenCode CLI routes through the AgentFlow LLM gateway by default. The
-# gateway speaks the Anthropic Messages API at /llm/v1/messages, so
-# `opencode` just needs the standard ANTHROPIC_* env vars pointed at it.
-# AF_API_KEY (owner key, af_live_*) is accepted as the bearer.
-# Skip if the operator overrode ANTHROPIC_BASE_URL — they know better.
-if [[ -n "${AF_API_KEY:-}" && -z "${ANTHROPIC_BASE_URL:-}" ]]; then
-  export ANTHROPIC_BASE_URL="${AF_API_URL:-https://agentflow.website}/llm/v1"
-  export ANTHROPIC_API_KEY="${AF_API_KEY}"
-  echo "[entrypoint] opencode wired to ${ANTHROPIC_BASE_URL}" >&2
+# OpenCode CLI routes through the AgentFlow LLM gateway via the OpenAI
+# format. The gateway at /llm/v1 resolves the model name through
+# llm_model_aliases (DB-backed, hot-swappable from the cabinet) before
+# picking an upstream — the canonical alias is `flow`, mapped to
+# whichever real model the owner has chosen (default gpt-5.3-codex via
+# codex.sale). Sending model=flow keeps the daemon image immune to
+# upstream swaps. See RAG subsystems/llm-aliases.mdx.
+if [[ -n "${AF_API_KEY:-}" && -z "${OPENAI_BASE_URL:-}" ]]; then
+  export OPENAI_BASE_URL="${AF_API_URL:-https://agentflow.website}/llm/v1"
+  export OPENAI_API_KEY="${AF_API_KEY}"
+  export OPENCODE_MODEL="${OPENCODE_MODEL:-openai/flow}"
+  # Belt-and-braces: keep ANTHROPIC_* unset so opencode doesn't fall
+  # back to Claude when the OpenAI provider rejects a request.
+  unset ANTHROPIC_BASE_URL ANTHROPIC_API_KEY
+  echo "[entrypoint] opencode wired to ${OPENAI_BASE_URL} model=${OPENCODE_MODEL}" >&2
 fi
 
 # Hand off. `exec` so signals (SIGTERM from kubectl delete) reach the
