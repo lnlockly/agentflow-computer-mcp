@@ -20,6 +20,7 @@ from agentflow_computer_mcp.driver.tools import agent_brief as ab
 from agentflow_computer_mcp.driver.tools import code_agents
 from agentflow_computer_mcp.driver.tools.code_agents.aider import AiderBackend
 from agentflow_computer_mcp.driver.tools.code_agents.cli_generic import GenericCLIBackend
+from agentflow_computer_mcp.driver.tools.code_agents.goose import GooseBackend
 from agentflow_computer_mcp.driver.tools.code_agents.opencode import OpenCodeBackend
 
 
@@ -105,6 +106,91 @@ def test_opencode_backend_command_unchanged():
     assert env["OPENAI_API_KEY"] == "af_live_xxx"
     # Model alias flows through OPENCODE_MODEL — opencode reads it.
     assert env["OPENCODE_MODEL"] == "openai/flow"
+
+
+# ---------------------------------------------------------------------------
+# Goose backend — block/goose Rust binary, uses OPENAI_HOST + OPENAI_BASE_PATH
+# env vars (NOT the OpenAI shim aider uses) because goose talks HTTP via its
+# own Rust client. Owner verified the recipe locally on 2026-05-28.
+# ---------------------------------------------------------------------------
+
+
+def test_goose_backend_command_includes_developer_extension():
+    # Brief spec test: --with-builtin developer is what loads goose's
+    # file-edit / shell tools. Without it goose runs chat-only and never
+    # touches the workspace, which would silently no-op every project.
+    cmd, env = GooseBackend().build_command(
+        brief="x",
+        project_dir="/x",
+        api_key="k",
+        api_base="https://x.com/llm/v1",
+    )
+    assert "--with-builtin" in cmd
+    assert "developer" in cmd
+    assert env["GOOSE_PROVIDER"] == "openai"
+    assert env["OPENAI_HOST"] == "https://x.com"
+
+
+def test_goose_backend_full_argv_shape():
+    # Pin the exact argv so a future "we'll just add a flag" change can't
+    # silently drop --no-session (would leak state across project runs)
+    # or move the brief away from the last slot (would let brief-shaped
+    # text get misparsed as flags).
+    backend = GooseBackend()
+    argv, _ = backend.build_command(
+        brief="build a pizza landing",
+        project_dir="/workspace/proj-demo",
+        api_key="af_live_xxx",
+        api_base="https://agentflow.website/_agents",
+    )
+    assert argv[0] == "goose"
+    assert argv[1] == "run"
+    assert "--no-session" in argv
+    # -t carries the brief — last two slots so argparse cannot eat it.
+    assert argv[-2] == "-t"
+    assert argv[-1] == "build a pizza landing"
+
+
+def test_goose_backend_env_for_production_api_base():
+    # Production api_base shape is ``https://agentflow.website/_agents``
+    # (no /llm/v1 suffix — daemon receives the gateway root). OPENAI_HOST
+    # must be scheme+netloc only so OPENAI_BASE_PATH lands on the right
+    # route. Catching this here means the spawn hits the gateway instead
+    # of a 404 at ``/_agents/llm/v1/chat/completions``.
+    backend = GooseBackend()
+    _, env = backend.build_command(
+        brief="x",
+        project_dir="/tmp",
+        api_key="af_live_xxx",
+        api_base="https://agentflow.website/_agents",
+    )
+    assert env["OPENAI_HOST"] == "https://agentflow.website"
+    assert env["OPENAI_BASE_PATH"] == "/llm/v1/chat/completions"
+    assert env["OPENAI_API_KEY"] == "af_live_xxx"
+    assert env["GOOSE_MODEL"] == "flow"
+    # Telemetry off — egress restrictions in the coder pod otherwise log
+    # noisy connect errors that pollute the agent_log stream.
+    assert env["GOOSE_ANALYTICS_ENABLED"] == "false"
+
+
+def test_goose_backend_omits_openai_env_when_api_key_blank():
+    # Mirrors the aider contract — empty key produces a runnable argv
+    # without sneaking partial OpenAI env that would auth as someone else.
+    backend = GooseBackend()
+    _, env = backend.build_command(
+        brief="x", project_dir="/tmp", api_key="", api_base="https://x/_agents"
+    )
+    assert "OPENAI_API_KEY" not in env
+    assert "OPENAI_HOST" not in env
+    assert "OPENAI_BASE_PATH" not in env
+
+
+def test_goose_backend_registered():
+    # Registry must expose goose so CODE_AGENT_BACKEND=goose resolves;
+    # missing this entry would make the env-var flip a no-op.
+    assert "goose" in code_agents.list_backends()
+    backend = code_agents.get_backend("goose")
+    assert isinstance(backend, GooseBackend)
 
 
 # ---------------------------------------------------------------------------
