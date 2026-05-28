@@ -1002,25 +1002,96 @@ def run_task(
         t for t in all_tool_descriptors() if not t["name"].startswith("af_")
     ]
 
-    messages: list[dict[str, Any]] = [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/jpeg",
-                        "data": jpeg_b64_full(),
-                    },
-                },
-                {
-                    "type": "text",
-                    "text": f"Снимок экрана. Задача: {task}\n\nКогда выполнишь — task_complete с ответом.",
-                },
-            ],
+    # Project-context hard tool filter (owner P0 2026-05-28).
+    # When the dispatched task text carries a `[PROJECT CONTEXT]` block
+    # (frontend prefix from agentflow-landing/src/components/workspace/
+    # widgets/projectContext.ts), the request is editing a code project,
+    # not driving a desktop. The cloud / headless pods running this
+    # daemon are missing libxcb, so any `screen_capture` call crashes
+    # with `ScreenShotError: Library libxcb.so not found` and loops
+    # forever — exactly the trap project 1566 / device ba6e74ab fell
+    # into. Soft system-prompt directives ("do NOT use screen_capture")
+    # didn't stop the LLM from picking the tool; the only reliable fix
+    # is to physically remove desktop-only tools from the descriptor
+    # list. The LLM can't call what it can't see.
+    if "[PROJECT CONTEXT]" in task or "project_id:" in task or "project_dir:" in task:
+        _PROJECT_BANNED_TOOLS = {
+            "screen_capture",
+            "screen_region",
+            "screen_record_start",
+            "screen_record_stop",
+            "screen_record_status",
+            "list_windows",
+            "activate_app",
+            "chrome_open_url",
+            "chrome_eval",
+            "chrome_tabs",
+            "browser_eval",
+            "browser_snapshot",
+            "keyboard_type",
+            "keyboard_press",
+            "mouse_click",
+            "mouse_move",
+            "mouse_scroll",
+            "mouse_drag",
         }
-    ]
+        before = len(tools)
+        tools = [t for t in tools if t.get("name") not in _PROJECT_BANNED_TOOLS]
+        after = len(tools)
+        print(
+            f"[project-context] filtered desktop tools: {before} -> {after} "
+            f"(banned={sorted(_PROJECT_BANNED_TOOLS)})",
+            flush=True,
+        )
+
+    # Project-context tasks ship without an initial screenshot —
+    # `jpeg_b64_full()` calls into `pyautogui.screenshot()` which
+    # boots libxcb on headless cloud pods and crashes the loop on
+    # iteration 0 before any file tool can run. The system prompt
+    # plus task text are enough for code-editing turns.
+    _is_project_task = (
+        "[PROJECT CONTEXT]" in task
+        or "project_id:" in task
+        or "project_dir:" in task
+    )
+    messages: list[dict[str, Any]]
+    if _is_project_task:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            f"Задача: {task}\n\n"
+                            "Это редактирование кода веб-проекта. "
+                            "Используй только файловые / shell / git инструменты. "
+                            "Когда выполнишь — task_complete с ответом."
+                        ),
+                    },
+                ],
+            }
+        ]
+    else:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": jpeg_b64_full(),
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": f"Снимок экрана. Задача: {task}\n\nКогда выполнишь — task_complete с ответом.",
+                    },
+                ],
+            }
+        ]
 
     def _emit_cancel() -> str:
         state.abort_flag.clear()
