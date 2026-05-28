@@ -2,9 +2,12 @@
 #
 # Picked when the cabinet user selects "Облачное · Разработка для кода".
 # Project workspaces (landing/spa/api/tg_bot) need:
-#   - Node 22 (NodeSource — Debian bookworm ships 18, opencode + vite 7 need 22)
+#   - Node 22 (NodeSource — Debian bookworm ships 18, vite 7 needs 22)
 #   - pnpm 10, yarn (lockfile compatibility per project)
-#   - opencode-ai CLI (LLM-driven code editing routed via the AF gateway)
+#   - aider CLI (LLM-driven code editing routed via the AF gateway —
+#     replaced opencode-ai 2026-05-28 because opencode's vendor-imposed
+#     iteration cap stalled multi-step briefs; aider has no such cap)
+#   - serve (npm global) for static landing fallbacks
 #   - git, jq (project setup + brief shaping)
 #   - ttyd (web terminal at :7681 — surfaced as iframe in the cabinet)
 #
@@ -12,7 +15,7 @@
 # browser inside the pod. They get preview via *.proj.agentflow.website which
 # the host serves through the per-project ingress.
 #
-# Target size: ~350 MB compressed (Node + opencode dominate).
+# Target size: ~400 MB compressed (Node + Python + aider deps dominate).
 
 ARG BASE_IMAGE=ghcr.io/lnlockly/agentflow-daemon-base:latest
 FROM ${BASE_IMAGE}
@@ -32,7 +35,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         jq \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
-    && npm install -g --no-audit --no-fund pnpm@10 yarn opencode-ai \
+    && npm install -g --no-audit --no-fund pnpm@10 yarn serve \
+    && pip install --no-cache-dir aider-chat \
     && curl -fsSL "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.x86_64" \
          -o /usr/local/bin/ttyd \
     && chmod +x /usr/local/bin/ttyd \

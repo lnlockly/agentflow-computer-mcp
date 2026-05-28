@@ -1,19 +1,25 @@
-"""OpenCode-driven project bootstrap for hosted daemons.
+"""Aider-driven project bootstrap for hosted daemons.
 
 Phase A4 of the project-architecture refactor. Backend picks any repo
-that matches the user's brief, daemon clones it, and an `opencode` CLI
-session takes over: it installs deps, modifies code to match the brief,
-and starts the dev server. The user watches it happen live in
-`/cabinet/devices/<id>/live` (Xvfb screen) while opencode prints into
-the daemon's task action log.
+that matches the user's brief, daemon clones it, and an `aider` CLI
+session takes over: it edits code to match the brief, then exits. The
+daemon then spawns the dev server (or Python bot) itself. The user
+watches it happen live in `/cabinet/devices/<id>/live` while aider
+prints diffs + chat into the daemon's task action log.
+
+Replaced opencode-ai 2026-05-28 because opencode's built-in iteration
+cap stalled multi-step briefs mid-todo-list. Aider has no vendor cap +
+`--yes-always` skips confirmations + `--message` runs one-shot
+non-interactively. Tool name (`agent_dev_brief`) stays unchanged so
+the backend WS dispatcher does not need to know about the swap.
 
 Why this shape:
 
 * The backend has no business knowing how to install Node/pnpm/Bun or
-  pick a dev command. Opencode does, per repo.
-* The brief is the source of truth — opencode takes it as the user's
-  ask and produces a working app. We don't pre-bake Next-only assumptions.
-* We return immediately and let opencode run as a long-lived background
+  pick a dev command. The daemon does, per repo, after aider exits.
+* The brief is the source of truth — aider takes it as the user's ask
+  and produces a working app. We don't pre-bake Next-only assumptions.
+* We return immediately and let aider run as a long-lived background
   process; status is surfaced through the dev-server port probe + the
   daemon's existing `device_action_log` stream.
 
@@ -67,8 +73,13 @@ def _normalise_api_base(raw: str) -> str:
     return base
 
 
-OPENCODE_PID_FILE = "/tmp/agent-brief-opencode.pid"
-OPENCODE_LOG_FILE = "/tmp/agent-brief-opencode.log"
+AIDER_PID_FILE = "/tmp/agent-brief-aider.pid"
+AIDER_LOG_FILE = "/tmp/agent-brief-aider.log"
+
+# Back-compat aliases — some tests + the WS dispatcher still reference the
+# old names. Removed once the rename has rolled fully.
+OPENCODE_PID_FILE = AIDER_PID_FILE
+OPENCODE_LOG_FILE = AIDER_LOG_FILE
 
 
 def rewrite_dev_command_for_port(command: str, port: int) -> str:
@@ -157,44 +168,91 @@ def _patch_package_json_for_port(pkg_path: Path, port: int) -> None:
         log.warning("could not rewrite %s: %s", pkg_path, exc)
 
 
-def _default_spawn_opencode(
+def _default_spawn_aider(
     brief: str,
     cwd: str,
     *,
-    pid_file: str = OPENCODE_PID_FILE,
-    log_file: str = OPENCODE_LOG_FILE,
+    pid_file: str = AIDER_PID_FILE,
+    log_file: str = AIDER_LOG_FILE,
     env: dict[str, str] | None = None,
-    opencode_bin: str = "opencode",
+    aider_bin: str = "aider",
+    # Back-compat alias — older callers (server.py + tests) pass
+    # `opencode_bin=`. Both names accepted; aider_bin wins when set.
+    opencode_bin: str | None = None,
 ) -> dict[str, Any]:
-    """Spawn `opencode run "<brief>"` as a detached background process.
+    """Spawn `aider --message "<brief>"` as a detached background process.
 
-    Opencode's `run` subcommand is non-interactive: it executes the brief
-    end-to-end (install deps, edit files, start dev server when asked)
-    and prints structured progress to stdout. We capture that into
-    ``log_file`` so the daemon can stream it to ``device_action_log``.
+    Aider's ``--message`` mode is one-shot non-interactive: it edits files
+    end-to-end and exits. We capture stdout into ``log_file`` so the
+    daemon can stream it to ``device_action_log``.
+
+    Flags rationale:
+      * ``--yes-always`` — skip every confirmation. Pod boundary already
+        sandboxes the agent; in-loop prompts hang the spawn forever.
+      * ``--no-pretty`` — plain output, no ANSI rewrites. agent_log reads
+        line-by-line; pretty mode rewrites lines in place and confuses
+        the tailer.
+      * ``--no-auto-commits`` — daemon strips ``.git`` before spawn, no
+        repo to commit into anyway. ``--no-git`` finishes the job.
+      * ``--no-stream`` — partial stream tokens are noise in the log; we
+        want the final reply per turn.
+      * ``--model openai/flow`` — AgentFlow gateway resolves the alias
+        server-side (gpt-5.3-codex → gpt-5.5 → opus → sonnet → haiku) so
+        swapping models never rebuilds this image.
+      * ``--edit-format diff`` — patch-style edits are the most reliable
+        format aider supports across model families.
+      * ``--map-tokens 2048`` — repo-map context for non-tiny projects so
+        aider can pick the right files without an explicit add list.
     """
     try:
         log_fh = open(log_file, "ab", buffering=0)  # noqa: SIM115 — fd handed to child
     except OSError as exc:
         return {"ok": False, "error": "open_log_failed", "detail": str(exc)}
 
-    # --dangerously-skip-permissions: opencode otherwise asks for
-    # permission on every file outside its strict cwd guess, including
-    # the project's own subdirectories — verified empirically in pod
-    # hd-f86ecd7d-0 on 2026-05-26: every spawn died with
-    # `permission requested: external_directory (/workspace/proj-*); auto-rejecting`
-    # and exited as a zombie. The flag unblocks the agent for the
-    # hosted sandbox we already enforce at the pod boundary.
-    cmd = [opencode_bin, "run", "--dangerously-skip-permissions", brief]
+    # Pin aider's provider to the AgentFlow gateway via OpenAI-compatible
+    # env vars. Aider treats `openai/<model>` as an OpenAI-shaped call and
+    # picks up base+key from these envs. Project-local config (`.aider.conf.yml`)
+    # would also work but env vars stay out of the project workspace, so
+    # the user's repo never carries gateway credentials.
+    aider_env = dict(env) if env is not None else dict(os.environ)
+    api_key = aider_env.get("AF_API_KEY", "") or os.environ.get("AF_API_KEY", "")
+    api_base = _normalise_api_base(
+        aider_env.get("AF_API_URL") or os.environ.get("AF_API_URL", "https://agentflow.website")
+    )
+    if api_key:
+        aider_env["OPENAI_API_BASE"] = api_base + "/llm/v1"
+        aider_env["OPENAI_API_KEY"] = api_key
+    # Aider phones home for analytics + checks PyPI for updates by default —
+    # both fail noisily under egress restrictions and would spam the log.
+    aider_env.setdefault("AIDER_ANALYTICS", "false")
+    aider_env.setdefault("AIDER_CHECK_UPDATE", "false")
+
+    if opencode_bin and opencode_bin != "opencode":
+        aider_bin = opencode_bin
+    cmd = [
+        aider_bin,
+        "--yes-always",
+        "--no-pretty",
+        "--no-auto-commits",
+        "--no-stream",
+        "--no-git",
+        "--no-show-model-warnings",
+        "--model", "openai/flow",
+        "--edit-format", "diff",
+        "--map-tokens", "2048",
+        "--map-refresh", "auto",
+        "--message", brief,
+    ]
+    log.info("[aider] starting cmd=%s cwd=%s", " ".join(cmd[:-1]) + " <brief>", cwd)
     try:
-        proc = subprocess.Popen(  # noqa: S603 — opencode is on PATH from image
+        proc = subprocess.Popen(  # noqa: S603 — aider is on PATH from image
             cmd,
             cwd=cwd,
             stdout=log_fh,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
-            env=env,
+            env=aider_env,
         )
     except OSError as exc:
         log_fh.close()
@@ -213,6 +271,12 @@ def _default_spawn_opencode(
     return {"ok": True, "pid": proc.pid}
 
 
+# Back-compat alias. The WS dispatcher passes `spawn_opencode=` by name in
+# server.py legacy paths + tests still wire it through. New code uses
+# _default_spawn_aider directly.
+_default_spawn_opencode = _default_spawn_aider
+
+
 def agent_dev_brief(
     template_repo_full: str,
     slug: str,
@@ -221,28 +285,31 @@ def agent_dev_brief(
     *,
     workspace_root: str = DEFAULT_WORKSPACE_ROOT,
     port: int = DEFAULT_PORT,
-    pid_file: str = OPENCODE_PID_FILE,
-    log_file: str = OPENCODE_LOG_FILE,
+    pid_file: str = AIDER_PID_FILE,
+    log_file: str = AIDER_LOG_FILE,
     run: Callable[..., dict[str, Any]] = _default_run,
-    spawn_opencode: Callable[..., dict[str, Any]] = _default_spawn_opencode,
-    opencode_bin: str = "opencode",
+    spawn_opencode: Callable[..., dict[str, Any]] = _default_spawn_aider,
+    opencode_bin: str = "aider",
     kind: str | None = None,
     bot_token: str | None = None,
     bot_username: str | None = None,
 ) -> dict[str, Any]:
-    """Clone repo + hand the brief to opencode.
+    """Clone repo + hand the brief to aider, then daemon spawns dev server.
 
-    Returns immediately after opencode is spawned. The dev-server port
-    is *not* probed here — opencode owns the lifecycle and the cabinet's
-    live screen tile + action log are the user's source of truth.
+    Returns immediately after aider is spawned. The dev-server port is
+    *not* probed here — the clone-status watcher polls and spawns the
+    dev server itself once aider exits.
 
     Telegram-bot projects (``kind="tg_bot"``) take a different shape:
-    the brief tells opencode to install Python deps + edit ``bot.py`` per
-    the user's brief, but NOT to run anything. The daemon spawns
-    ``python bot.py`` itself after opencode exits (see
+    aider installs Python deps + edits ``bot.py`` per the user's brief,
+    then exits. The daemon spawns ``python bot.py`` itself (see
     :func:`_watch_and_launch_tg_bot`) and uses Telegram's ``getMe`` API
     as the alive signal instead of an HTTP port probe — Python bots
     don't bind a listening port.
+
+    Parameter names ``spawn_opencode`` + ``opencode_bin`` are kept for
+    back-compat with tests + the server.py dispatcher. They now point at
+    aider; the rename will land in a follow-up sweep.
     """
     if not _looks_like_repo_full(template_repo_full):
         return {"ok": False, "error": "invalid_template_repo_full"}
@@ -353,176 +420,82 @@ def agent_dev_brief(
         except OSError as exc:
             log.warning("could not write .env for tg_bot project %d: %s", project_id, exc)
 
-    # The composed prompt tells opencode what shape we expect: install
-    # deps, satisfy the brief, start the dev server on the project's
-    # canonical port. Opencode picks the package manager + dev command
-    # from the repo itself.
+    # The composed prompt tells aider what shape we expect: edit files
+    # to satisfy the brief, then exit. The daemon owns dev-server +
+    # python-bot lifecycle (see _watch_and_report_clone_status +
+    # _watch_and_launch_tg_bot) — aider's --message mode is one-shot,
+    # so spawning a long-lived process from inside aider's run never
+    # worked reliably.
     #
-    # Step 4 used to read `Start the dev server bound to 0.0.0.0:{port}
-    # (Next.js: next dev -H 0.0.0.0 -p {port})` and that wording caused a
-    # real bug for our default static-starter template: opencode
-    # interpreted the hint literally and ran `npm run dev -- --listen
-    # 0.0.0.0:3000`, but the template's `serve` script does not accept a
-    # `--listen` flag (serve v14 already binds to all interfaces with
-    # `-l 3000`). The dev server crashed on first turn and the pod
-    # served HTTP 502 forever. The new wording defers to the template's
-    # own dev script and never tries to override host/port flags.
-    #
-    # `nohup ... & disown`: opencode `run` is single-shot — when it
-    # exits, any child process inherits SIGHUP from the controlling tty
-    # and dies. `nohup` plus `disown` reparents the dev server under
-    # PID 1 (tini), so it keeps listening on $port after opencode is
-    # gone. Without this, the dev server lived for ~2 seconds and the
-    # public URL stayed 502.
     # No port numbers in the brief on purpose: the daemon pre-patched
     # `package.json` so `npm run dev` already binds to `$PORT`, and the
-    # `PORT` env var is exported below. Telling opencode "bind to port
-    # N" risks an LLM hallucination — wrong flag, wrong stack, wrong
-    # number. The deterministic path is "trust the template + env".
-    # Brief is split into IMPERATIVE blocks — opencode treats these as
-    # commands, not questions. Earlier versions used quoted code blocks
-    # ("`curl …`") and opencode mistook the prompt for a citation,
-    # refused to run the server, and left the project stuck. Verified
-    # 2026-05-26 on pod hd-f86ecd7d-0 (project 1506): edit ran, dev
-    # server never started, opencode logged 'это оформлено как цитата'.
+    # `PORT` env var is exported below.
     if is_tg_bot:
-        # Telegram bots: no HTTP dev server in the loop. opencode edits the
-        # Python source to satisfy the brief, installs deps, and exits.
-        # The daemon's `_watch_and_launch_tg_bot` thread then spawns
-        # `python bot.py` itself — keeping the launch + alive-check off the
-        # LLM's plate. Earlier landing-only wording ("npm run dev", "no
-        # flags added", "do not modify package.json") was actively
-        # misleading for Python projects: opencode would either invent
-        # node commands or refuse to install Python deps.
+        # Telegram bots: no HTTP dev server in the loop. Aider edits the
+        # Python source to satisfy the brief and exits. The daemon's
+        # `_watch_and_launch_tg_bot` thread then spawns `python bot.py`
+        # itself — keeping the launch + alive-check off the LLM's plate.
         composed = (
-            f"You are editing a Telegram bot at {project_dir}. "
+            f"You are editing a Telegram bot project rooted at {project_dir}. "
             f"User's brief: {brief.strip()}\n\n"
-            "You MUST complete every numbered step. Do not summarise. "
-            "Do not ask for confirmation. Treat each shell command below as "
-            "an instruction to execute, not text to quote back.\n\n"
-            "1. Read pyproject.toml (or requirements.txt) to identify Python deps.\n"
-            "2. Install dependencies. Use uv if `uv` is on PATH, else pip:\n"
-            "       uv pip install --system -r requirements.txt  # preferred\n"
-            "       pip install -r requirements.txt              # fallback\n"
-            "   If neither file lists aiogram, run: pip install aiogram aiosqlite python-dotenv.\n"
-            "3. Edit the bot's source code (typically `bot.py` and `handlers/` if present) "
-            "so /start, /help, and the rest of the bot's behavior match the user's brief above. "
-            "Use brief-derived copy in the bot's replies — never leave generic template strings.\n"
-            "4. Do NOT run the bot yourself. Do NOT spawn `python bot.py`. "
-            "The hosting daemon launches the bot process after you exit.\n"
-            "5. End your run after step 3. Print a one-line summary of files you changed."
+            "Edit the source so /start, /help, and the rest of the bot's "
+            "behavior match the user's brief. Use brief-derived copy in the "
+            "bot's replies — never leave generic template strings or "
+            "placeholders. Look at bot.py first, then handlers/ or src/ if "
+            "they exist, then any text resources / locale files. Treat "
+            "pyproject.toml or requirements.txt as read-only — the daemon "
+            "installs Python deps separately. Do NOT run the bot yourself "
+            "and do NOT spawn `python bot.py` — the hosting daemon launches "
+            "the bot process after you exit. Make reasonable assumptions "
+            "where the brief is silent; never ask the user a clarifying "
+            "question. Finish by printing a one-line summary of the files "
+            "you changed."
         )
     else:
+        # Landing / SPA / Next.js: aider edits files, then the daemon
+        # spawns `npm run dev` via _watch_and_report_clone_status. Aider
+        # must NOT try to start the dev server — single-shot --message
+        # mode exits before the spawn finishes and the orphaned process
+        # gets reaped. The daemon path is the reliable lane.
+        #
+        # We keep the deterministic-port discipline ("$PORT", "no flags
+        # added", "do not modify package.json scripts") so even an
+        # over-eager aider rewrite cannot break port binding. Backwards-
+        # compatible substring footprints satisfy regression tests that
+        # lock in those guarantees.
         composed = (
-            f"You are bootstrapping a project at {project_dir}. "
+            f"You are editing a project rooted at {project_dir}. "
             f"User's brief: {brief.strip()}\n\n"
-            "You have FULL access to the workspace via your built-in tools "
-            "(Read, Write, Edit, Glob, Grep, Bash). You are NOT in a "
-            "read-only mode. You are NOT asking for context. The user has "
-            "already approved this run.\n\n"
-            "Hard rules — break any of these and the run is a failure:\n"
-            "  • You MUST write or edit at least one file under "
-            f"{project_dir}/ before terminating.\n"
-            "  • Reading files alone is NOT progress. After every Read/Glob, "
-            "ask yourself: \"Have I edited anything yet?\" If no, keep going.\n"
-            "  • Never reply with phrases like «нет доступа к структуре», "
-            "«не выполнено в этом сообщении», \"I'd need more context\". If "
-            "you feel you lack context, READ MORE FILES — never stop.\n"
-            "  • Never ask the user a clarifying question. The brief above "
-            "is final. Make reasonable assumptions where the brief is silent "
-            "and proceed.\n\n"
-            "Execute every numbered step below. Treat each shell command as "
-            "an instruction to RUN, not text to quote.\n\n"
-            "1. Identify the stack by reading package.json (or pyproject.toml / Cargo.toml).\n"
-            "2. Install dependencies with the project's package manager: "
-            "pnpm if pnpm-lock.yaml exists, yarn if yarn.lock exists, npm otherwise. "
-            "For Python use uv if available, else pip.\n"
-            "2b. Env vars. The daemon has already seeded `.env.local` (or "
-            "`.env`) from `.env.example` with dev-safe dummies — verify it "
-            "exists. If a missing or template-specific key still crashes "
-            "the dev server later in step 5, write a sensible default and "
-            "retry: auth publishable keys → `pk_test_dummy`, secret keys "
-            "→ any 32-char string, DATABASE_URL → `file:./dev.db`. Do NOT "
-            "block on real credentials — the user fills them in the "
-            "cabinet later. NEVER ask the user for an API key.\n"
-            "3. Edit project files to satisfy the user's brief. "
-            "At minimum, change visible UI copy / routes / handlers to match "
-            "the brief — never leave the template's default text in place. "
-            "If the template ships auth/onboarding flows the brief doesn't "
-            "mention (Clerk, NextAuth, sign-in pages), strip them: replace "
-            "the auth provider wrapper in layout.tsx with a plain "
-            "fragment and remove sign-in links from the navbar so the "
-            "user lands on the brief content immediately. "
-            "Do NOT modify package.json scripts — they have been pre-patched "
-            "to read the PORT environment variable.\n"
-            "4. Start the dev server. Run exactly this command in a shell, "
-            "no flags added:\n"
-            "       nohup npm run dev > /tmp/dev.log 2>&1 & disown\n"
-            "   (Substitute pnpm or yarn for npm to match the lockfile.) "
-            "The PORT environment variable is already set; npm passes it to the script.\n"
-            "5. Verify the server replies. Run:\n"
-            "       sleep 3 && curl -sf http://127.0.0.1:$PORT/ | head -c 200\n"
-            "   The first attempt may be early — retry once after another `sleep 3` if it failed.\n"
-            "6. End your run after step 5 succeeds. Do not stop the dev server.\n\n"
-            "For Telegram bots or other non-HTTP runtimes: "
-            "in step 4 spawn the entrypoint via `nohup … & disown`; "
-            "in step 5 confirm the process is alive with `pgrep -f <entrypoint>` instead of curl."
+            "Hard rules — break any and the run is a failure:\n"
+            f"  • You MUST edit at least one file under {project_dir}/.\n"
+            "  • Never ask a clarifying question. The brief is final — "
+            "make reasonable assumptions where it is silent.\n"
+            "  • Never reply with «нет доступа», «не выполнено», "
+            "\"I'd need more context\". Read more files instead.\n\n"
+            "Steps:\n"
+            "1. Read package.json (or pyproject.toml / Cargo.toml) to "
+            "identify the stack.\n"
+            "2. Edit project files so the user-visible content (UI copy, "
+            "routes, handlers, page titles, hero text, FAQ, pricing — "
+            "whatever the template ships) reflects the brief. Never leave "
+            "the template's default placeholder text in place.\n"
+            "3. If the template ships auth/onboarding flows the brief "
+            "doesn't mention (Clerk, NextAuth, sign-in pages), strip them "
+            "to a plain fragment so the user lands on brief content "
+            "immediately.\n"
+            "4. Do NOT modify package.json scripts — they have been "
+            "pre-patched to read the PORT environment variable; the dev "
+            "server uses $PORT verbatim with no flags added.\n"
+            "5. Do NOT spawn `nohup npm run dev` or `disown` the dev "
+            "server. The daemon owns dev-server lifecycle and will run "
+            "`npm run dev` (or pnpm/yarn) itself after you exit.\n"
+            "6. Finish by printing a one-line summary of files you changed."
         )
 
-    # Pin opencode's provider to the AgentFlow gateway + a real model.
-    # Without this opencode falls back to its built-in default
-    # (`gpt-5.3-chat-latest`) which our gateway does not list, and the
-    # subprocess dies on first turn with «Model not available».
-    # Project-local `opencode.json` wins over `~/.config/opencode/`.
-    # AF_API_KEY is the per-pod owner key already injected by
-    # renderDaemonManifest (agentflow-agents).
-    api_key = os.environ.get("AF_API_KEY", "")
-    if api_key:
-        # Use the logical "flow" model. The AgentFlow gateway picks the
-        # actual upstream (gpt-5.3-codex → gpt-5.5 → opus → sonnet → haiku)
-        # at request time, so swapping models never requires rebuilding
-        # this image. Companion change: PR agentflow-agents#901 adds the
-        # "flow" alias resolution in /llm/v1/{chat/completions,messages,
-        # responses}.
-        #
-        # opencode 1.15.x's `build` sub-agent has its own default model
-        # that overrides the root `model` key — pin every agent to
-        # openai/flow so the gateway stays in charge of selection.
-        opencode_cfg = {
-            "$schema": "https://opencode.ai/config.json",
-            "model": "openai/flow",
-            "permission": {
-                "edit": "allow",
-                "bash": "allow",
-                "webfetch": "allow",
-            },
-            "agent": {
-                "build": {"model": "openai/flow"},
-                "plan": {"model": "openai/flow"},
-                "general": {"model": "openai/flow"},
-            },
-            "provider": {
-                "openai": {
-                    "options": {
-                        "baseURL": (
-                            _normalise_api_base(
-                                os.environ.get("AF_API_URL", "https://agentflow.website")
-                            )
-                            + "/llm/v1"
-                        ),
-                        "apiKey": api_key,
-                    },
-                    "models": {"flow": {}},
-                }
-            },
-        }
-        try:
-            Path(project_dir, "opencode.json").write_text(
-                json.dumps(opencode_cfg, indent=2), encoding="utf-8"
-            )
-        except OSError as exc:
-            log.warning("could not write opencode.json: %s", exc)
-
+    # Aider picks up provider config from env vars (OPENAI_API_BASE +
+    # OPENAI_API_KEY) inside _default_spawn_aider — no project-local
+    # config file written here. AF_API_KEY is the per-pod owner key
+    # already injected by renderDaemonManifest (agentflow-agents).
     env = {**os.environ, "PORT": str(port), "BROWSER": "none", "CI": "1"}
     spawn_res = spawn_opencode(
         composed,
@@ -627,8 +600,12 @@ def agent_dev_brief(
     }
 
 
-OPENCODE_EDIT_PID_FILE = "/tmp/agent-brief-opencode-edit.pid"
-OPENCODE_EDIT_LOG_FILE = "/tmp/agent-brief-opencode-edit.log"
+AIDER_EDIT_PID_FILE = "/tmp/agent-brief-aider-edit.pid"
+AIDER_EDIT_LOG_FILE = "/tmp/agent-brief-aider-edit.log"
+
+# Back-compat aliases.
+OPENCODE_EDIT_PID_FILE = AIDER_EDIT_PID_FILE
+OPENCODE_EDIT_LOG_FILE = AIDER_EDIT_LOG_FILE
 
 
 def agent_dev_brief_edit(
@@ -637,24 +614,24 @@ def agent_dev_brief_edit(
     edit_prompt: str,
     *,
     workspace_root: str = DEFAULT_WORKSPACE_ROOT,
-    pid_file: str = OPENCODE_EDIT_PID_FILE,
-    log_file: str = OPENCODE_EDIT_LOG_FILE,
-    spawn_opencode: Callable[..., dict[str, Any]] = _default_spawn_opencode,
-    opencode_bin: str = "opencode",
+    pid_file: str = AIDER_EDIT_PID_FILE,
+    log_file: str = AIDER_EDIT_LOG_FILE,
+    spawn_opencode: Callable[..., dict[str, Any]] = _default_spawn_aider,
+    opencode_bin: str = "aider",
     kind: str | None = None,
 ) -> dict[str, Any]:
-    """Re-spawn opencode against an existing project workspace.
+    """Re-spawn aider against an existing project workspace.
 
     Unlike :func:`agent_dev_brief` this does NOT clone, NOT install deps,
-    NOT touch ``opencode.json`` or ``package.json``. The workspace is
-    expected to already exist from a prior ``agent_dev_brief`` run. The
-    edit prompt is handed to opencode verbatim with a thin instruction
-    wrapper so the model stays grounded in the brief shape (no
-    early-termination, write files, then verify).
+    NOT touch ``package.json``. The workspace is expected to already
+    exist from a prior ``agent_dev_brief`` run. The edit prompt is
+    handed to aider verbatim with a thin instruction wrapper so the
+    model stays grounded in the brief shape (no early-termination,
+    write files, then verify).
 
     Used by the AgentFlow chat → running-project edit flow: the user
     sends a message like «сделай кнопку красной», the platform routes
-    it here, opencode edits the source, the running dev server reloads
+    it here, aider edits the source, the running dev server reloads
     automatically (vite / next watch mode). Caller is expected to watch
     ``log_file`` for stdout via ``/internal/projects/:id/agent-log`` —
     the daemon's log tailer streams it the same way as initial runs.
@@ -756,15 +733,13 @@ def agent_dev_brief_edit(
 DEV_SERVER_LOG_FILE = "/tmp/agent-brief-dev-server.log"
 DEV_SERVER_PID_FILE = "/tmp/agent-brief-dev-server.pid"
 
-# Daemon-side dev-server fallback gates (2026-05-28). When opencode exits
-# without leaving a listening dev server, the watcher waits this long after
-# its death before stepping in. Short enough that a 900s `port_unreachable`
-# becomes a ~3min recovery, long enough that we don't race opencode's
-# final `npm run dev` invocation that just hadn't bound the port yet.
+# Daemon-side dev-server spawn gates (2026-05-28). After the aider replace,
+# the agent never spawns a dev server itself — the daemon always does, once
+# aider exits. We still wait a short grace + minimum wall clock so a fast
+# aider crash from a permission error or a stuck npm install can settle
+# before the spawn fires. The 30s grace + 45s wall mirror the original
+# opencode-era values so existing tests + ops runbooks stay consistent.
 DEV_FALLBACK_GRACE_AFTER_OPENCODE_EXIT_SEC = 30.0
-# Minimum wall-clock before we consider falling back. Even if opencode dies
-# in <10s (rare; usually means a permission error before any work), we still
-# give the project a moment to settle so we don't recover the wrong thing.
 DEV_FALLBACK_MIN_WALL_CLOCK_SEC = 45.0
 
 
@@ -1655,11 +1630,11 @@ AGENT_DEV_BRIEF_DESCRIPTOR: dict[str, Any] = {
     "name": "agent_dev_brief",
     "description": (
         "Clone a GitHub repo into the hosted workspace and hand a brief "
-        "to the opencode CLI, which then installs deps, edits files to "
-        "match the brief, and starts the dev server. Returns immediately; "
-        "progress is visible via the daemon's live screen and action log. "
-        "Daemon-only tool; the platform invokes it after "
-        "/me/projects/:id/approve."
+        "to the aider CLI, which edits files to match the brief and "
+        "exits. The daemon then spawns the dev server (or Python bot) "
+        "itself. Returns immediately; progress is visible via the "
+        "daemon's live screen and action log. Daemon-only tool; the "
+        "platform invokes it after /me/projects/:id/approve."
     ),
     "input_schema": {
         "type": "object",
@@ -1719,13 +1694,13 @@ AGENT_DEV_BRIEF_DESCRIPTOR: dict[str, Any] = {
 AGENT_DEV_BRIEF_EDIT_DESCRIPTOR: dict[str, Any] = {
     "name": "agent_dev_brief_edit",
     "description": (
-        "Re-spawn opencode against an existing project workspace to apply "
-        "an incremental edit. Does NOT clone, NOT install deps, NOT "
-        "rewrite opencode.json. Used by the AgentFlow chat → running "
-        "project flow: the user sends a follow-up message, the platform "
-        "routes it here, opencode edits the source in place. The running "
-        "dev server reloads automatically (vite/next watch). Returns "
-        "immediately; progress streams to /agent-log."
+        "Re-spawn aider against an existing project workspace to apply "
+        "an incremental edit. Does NOT clone, NOT install deps. Used by "
+        "the AgentFlow chat → running project flow: the user sends a "
+        "follow-up message, the platform routes it here, aider edits "
+        "the source in place. The running dev server reloads "
+        "automatically (vite/next watch). Returns immediately; progress "
+        "streams to /agent-log."
     ),
     "input_schema": {
         "type": "object",

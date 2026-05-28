@@ -560,6 +560,148 @@ def test_watch_and_launch_tg_bot_reports_failure_when_spawn_dies(
     assert body["port"] == 0
 
 
+# ---------------------------------------------------------------------------
+# aider replaces opencode — 2026-05-28. Tests below pin the cmd line + env
+# so a future rewrite cannot quietly drop --yes-always (would hang on a
+# confirmation prompt) or stop pinning openai/flow (would route via the
+# bare OpenAI API instead of the AgentFlow gateway).
+# ---------------------------------------------------------------------------
+
+
+def test_default_spawn_aider_builds_aider_command_with_required_flags(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("AF_API_KEY", "af_live_test")
+    monkeypatch.setenv("AF_API_URL", "https://agentflow.website")
+
+    captured: dict[str, Any] = {}
+
+    class FakeProc:
+        pid = 7
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs.get("env") or {}
+        return FakeProc()
+
+    monkeypatch.setattr(ab.subprocess, "Popen", fake_popen)
+    res = ab._default_spawn_aider(
+        "edit the landing",
+        cwd=str(tmp_path),
+        pid_file=str(tmp_path / "pid"),
+        log_file=str(tmp_path / "log"),
+        env=None,
+    )
+    assert res["ok"] is True
+    cmd = captured["cmd"]
+    assert cmd[0] == "aider"
+    # Required flags — pin so a future rewrite can't silently drop one.
+    for flag in (
+        "--yes-always",
+        "--no-pretty",
+        "--no-auto-commits",
+        "--no-stream",
+        "--no-git",
+        "--no-show-model-warnings",
+    ):
+        assert flag in cmd, f"missing required flag {flag}"
+    # Model + edit format pinned to gateway alias.
+    assert "--model" in cmd
+    assert cmd[cmd.index("--model") + 1] == "openai/flow"
+    assert "--edit-format" in cmd
+    assert cmd[cmd.index("--edit-format") + 1] == "diff"
+    # The brief is the LAST arg right after --message so logs don't truncate it.
+    assert cmd[-2] == "--message"
+    assert cmd[-1] == "edit the landing"
+    # Provider env — without these aider sends to api.openai.com and 401s.
+    env = captured["env"]
+    assert env.get("OPENAI_API_KEY") == "af_live_test"
+    assert env.get("OPENAI_API_BASE", "").endswith("/llm/v1")
+    assert "agentflow.website" in env.get("OPENAI_API_BASE", "")
+
+
+def test_default_spawn_aider_accepts_opencode_bin_alias(tmp_path, monkeypatch):
+    # server.py dispatcher + older tests still pass `opencode_bin=` by
+    # name. Keep the alias resolving to a real `aider` binary when the
+    # legacy default ("opencode") is passed; honour any override that
+    # isn't the placeholder.
+    monkeypatch.setenv("AF_API_KEY", "k")
+    captured: dict[str, Any] = {}
+
+    class FakeProc:
+        pid = 1
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr(ab.subprocess, "Popen", fake_popen)
+    ab._default_spawn_aider(
+        "x",
+        cwd=str(tmp_path),
+        pid_file=str(tmp_path / "p"),
+        log_file=str(tmp_path / "l"),
+        env=None,
+        opencode_bin="opencode",  # legacy placeholder — falls through to aider
+    )
+    assert captured["cmd"][0] == "aider"
+
+    # Real override — eg a custom aider build at a fixed path.
+    captured.clear()
+    ab._default_spawn_aider(
+        "x",
+        cwd=str(tmp_path),
+        pid_file=str(tmp_path / "p"),
+        log_file=str(tmp_path / "l"),
+        env=None,
+        opencode_bin="/opt/aider-bin/aider",
+    )
+    assert captured["cmd"][0] == "/opt/aider-bin/aider"
+
+
+def test_landing_prompt_tells_aider_not_to_spawn_dev_server(workspace):
+    # Daemon owns dev-server lifecycle after aider exits (via
+    # _watch_and_report_clone_status fallback). If aider tries to spawn
+    # `npm run dev` itself, the spawn dies when aider's --message run
+    # ends and the dev server orphan gets reaped.
+    runner = FakeRunner()
+    spawner = FakeOpencodeSpawner(pid=1)
+    ab.agent_dev_brief(
+        "owner/repo",
+        "demo",
+        42,
+        "static landing",
+        workspace_root=str(workspace),
+        run=runner,
+        spawn_opencode=spawner,
+    )
+    composed = spawner.calls[0]["brief"]
+    lc = composed.lower()
+    # New contract: aider must NOT spawn dev server, daemon does.
+    assert "do not spawn" in lc
+    assert "daemon owns" in lc
+
+
+def test_agent_dev_brief_does_not_write_opencode_json(workspace):
+    # opencode.json was opencode-specific config. With aider we configure
+    # via env vars (OPENAI_API_BASE/KEY) inside the spawner, not a file
+    # in the project workspace. Leaving an opencode.json in the project
+    # tree would leak gateway config into the user's repo.
+    runner = FakeRunner()
+    spawner = FakeOpencodeSpawner(pid=1)
+    ab.agent_dev_brief(
+        "owner/repo",
+        "demo",
+        42,
+        "anything",
+        workspace_root=str(workspace),
+        run=runner,
+        spawn_opencode=spawner,
+    )
+    project_dir = workspace / "proj-demo"
+    assert not (project_dir / "opencode.json").exists()
+
+
 def test_watch_and_launch_tg_bot_skips_when_secret_missing(tmp_path, monkeypatch):
     monkeypatch.delenv("AF_INTERNAL_API_SECRET", raising=False)
     posts: list[Any] = []
