@@ -229,6 +229,13 @@ def _default_spawn_aider(
 
     if opencode_bin and opencode_bin != "opencode":
         aider_bin = opencode_bin
+    # Hotfix 2026-05-28: env vars (`OPENAI_API_BASE` / `OPENAI_API_KEY`) are
+    # silently ignored by aider 0.86 when the model has the `openai/` provider
+    # prefix — `aider --verbose` shows `openai_api_base: None` even when env
+    # is set on the subprocess. CLI flags `--openai-api-base` / `--openai-api-key`
+    # win the config cascade and force aider to talk to the AgentFlow gateway.
+    # Without these flags the LLM call goes to `api.openai.com` and the
+    # gateway responds `Your request was blocked`.
     cmd = [
         aider_bin,
         "--yes-always",
@@ -238,6 +245,8 @@ def _default_spawn_aider(
         "--no-git",
         "--no-show-model-warnings",
         "--model", "openai/flow",
+        "--openai-api-base", aider_env.get("OPENAI_API_BASE", ""),
+        "--openai-api-key", aider_env.get("OPENAI_API_KEY", ""),
         "--edit-format", "diff",
         "--map-tokens", "2048",
         "--map-refresh", "auto",
