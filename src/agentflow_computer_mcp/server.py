@@ -322,17 +322,18 @@ async def _dispatch_tool(name: str, args: dict[str, Any], config: AppConfig) -> 
             port=int(args.get("port", 3000) or 3000),
         )
     if name == "agent_dev_brief":
-        # Clone repo + hand brief to opencode (background process). Run
-        # the clone+spawn in a worker thread so the WS event loop keeps
-        # ticking heartbeats; the opencode child itself is detached and
-        # outlives this call.
+        # Clone repo + hand brief to aider (background process). Run the
+        # clone+spawn in a worker thread so the WS event loop keeps
+        # ticking heartbeats; the aider child itself is detached and
+        # outlives this call. (Aider replaced opencode 2026-05-28 — tool
+        # name stays `agent_dev_brief` for backend compatibility.)
         #
         # tg_bot projects pass extra fields in scope: ``kind``,
         # ``bot_token``, ``bot_username``. The token never reaches
-        # opencode's prompt — agent_brief writes it to the project's
-        # ``.env`` before opencode runs, and the dedicated
+        # aider's prompt — agent_brief writes it to the project's
+        # ``.env`` before aider runs, and the dedicated
         # ``_watch_and_launch_tg_bot`` thread spawns ``python bot.py``
-        # after opencode exits.
+        # after aider exits.
         kind_val = args.get("kind")
         bot_token_val = args.get("bot_token")
         bot_username_val = args.get("bot_username")
@@ -379,7 +380,7 @@ async def _dispatch_tool(name: str, args: dict[str, Any], config: AppConfig) -> 
     if name == "agent_dev_brief_edit":
         # Incremental edit against an existing workspace — no clone, no
         # deps install. Used by the AgentFlow chat → running-project edit
-        # flow so the user's follow-up messages reach opencode without
+        # flow so the user's follow-up messages reach aider without
         # blowing away the workspace.
         kind_val = args.get("kind")
         return await asyncio.to_thread(

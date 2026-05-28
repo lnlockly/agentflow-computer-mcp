@@ -535,11 +535,11 @@ def install_go(
 # ---------------------------------------------------------------------------
 # Why: templates from the wider ecosystem (Clerk-based Next.js, Supabase
 # starters, NextAuth examples) crash on first render when their required
-# env vars are missing. opencode could in principle copy `.env.example`
+# env vars are missing. the coder agent could in principle copy `.env.example`
 # itself, but historically refuses to invent secrets (security guardrail),
 # leaving the dev server to 500 on first request. We pre-seed safe dev
-# defaults BEFORE opencode runs so the template boots; the brief tells the
-# user (and opencode) that real values can be set in
+# defaults BEFORE the coder agent runs so the template boots; the brief tells the
+# user (and the coder agent) that real values can be set in
 # /cabinet/devices/<id>/secrets later.
 
 # Heuristics: longest-match key suffix wins.
@@ -739,7 +739,7 @@ def resolve_runtimes(
     _log(f"start workspace={project_dir}")
     actions: list[dict[str, Any]] = []
 
-    # 0. Env defaults — seed .env.local from .env.example BEFORE opencode
+    # 0. Env defaults — seed .env.local from .env.example BEFORE the coder agent
     # runs so dev servers don't crash on missing `NEXT_PUBLIC_CLERK_*`,
     # `DATABASE_URL`, etc. Idempotent and conservative — only fills empty
     # keys with safe dummies; never overrides a real value the user
