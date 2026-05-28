@@ -643,6 +643,182 @@ def connect_integration(
     }
 
 
+def connect_integration_direct(
+    provider: str,
+    *,
+    api_key: str,
+    api_base: str = DEFAULT_API_BASE,
+    cookie_readers: list[Callable[[str], list[dict[str, Any]]]] | None = None,
+    http_get: Callable[[str], Any] | None = None,
+    http_post: Callable[[str, dict[str, Any], str], tuple[int, Any]] = _http_post_json,
+    now: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    """Direct dispatch flow: skip Chrome focus / probe / AppleScript.
+
+    Used by the WS ``task_dispatch`` short-circuit (``server._dispatch_tool``)
+    so backend-driven jobs run without bringing Chrome to the front. Reads
+    cookies straight from the browser SQLite stores (Chrome via Keychain,
+    Safari/Arc via ``browser_cookie3``) and POSTs them to the platform.
+
+    The first reader that returns ≥1 cookie wins. Default order tries
+    Chrome (matches the LLM flow), then ``browser_cookie3.chrome``, then
+    ``browser_cookie3.safari``, then ``browser_cookie3.arc``. The owner's
+    manual ``python3 -c browser_cookie3.chrome(...)`` call corresponds to
+    reader #2.
+    """
+    if not provider or not isinstance(provider, str):
+        return {"ok": False, "error": "provider_required"}
+
+    if http_get is None:
+        def http_get(url: str) -> Any:
+            return _http_get_json(url, api_key=api_key)
+
+    try:
+        registry = fetch_registry(api_base=api_base, http_get=http_get, now=now)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("registry fetch failed: %s", exc)
+        return {"ok": False, "error": "registry_unavailable", "detail": str(exc)}
+
+    entry = _find_provider(registry, provider)
+    if entry is None:
+        return {
+            "ok": False,
+            "error": "provider_not_found",
+            "provider": provider,
+            "available": [str(e.get("slug")) for e in registry if isinstance(e, dict)],
+        }
+
+    cookie_domain = str(entry.get("cookie_domain", "")).strip()
+    slug = str(entry.get("slug", provider)).strip()
+    if not cookie_domain:
+        return {"ok": False, "error": "registry_entry_incomplete", "provider": slug, "missing": ["cookie_domain"]}
+
+    if cookie_readers is None:
+        cookie_readers = _default_cookie_readers()
+
+    cookies: list[dict[str, Any]] = []
+    reader_used = ""
+    reader_errors: list[str] = []
+    for reader in cookie_readers:
+        try:
+            result = reader(cookie_domain)
+        except Exception as exc:  # noqa: BLE001 — each reader best-effort
+            reader_errors.append(f"{getattr(reader, '__name__', 'reader')}: {exc}")
+            continue
+        if result:
+            cookies = result
+            reader_used = getattr(reader, "__name__", "reader")
+            break
+
+    if not cookies:
+        return {
+            "ok": False,
+            "error": "no_cookies_found",
+            "provider": slug,
+            "hint": (
+                f"Не нашёл cookies для {cookie_domain} ни в одном браузере. "
+                "Открой сайт в Chrome/Safari, залогинься, потом повтори."
+            ),
+            "reader_errors": reader_errors,
+        }
+
+    post_url = f"{api_base.rstrip('/')}/me/integrations/{slug}"
+    try:
+        status, body = http_post(
+            post_url,
+            {"cookies": cookies, "profile": reader_used},
+            api_key,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": "post_failed", "provider": slug, "detail": str(exc)}
+
+    if status >= 400:
+        backend_err = (body.get("error") if isinstance(body, dict) else None) or f"http_{status}"
+        return {"ok": False, "error": str(backend_err), "provider": slug, "status": status}
+
+    secret_created = False
+    if isinstance(body, dict):
+        secret_created = bool(body.get("secret_created") or body.get("created") or body.get("ok"))
+
+    return {
+        "ok": True,
+        "provider": slug,
+        "cookie_count": len(cookies),
+        "browser": reader_used,
+        "secret_created": secret_created,
+        "display_name": entry.get("display_name"),
+    }
+
+
+def _default_cookie_readers() -> list[Callable[[str], list[dict[str, Any]]]]:
+    """Build the default reader chain.
+
+    Returns callables `(domain) -> list[cookie_dict]`. Chrome SQLite +
+    Keychain first (matches the LLM-driven flow + handles HttpOnly via
+    macOS keychain). Then ``browser_cookie3`` Chrome/Safari/Arc as
+    fallbacks because owner's manual repro used browser_cookie3 directly.
+    """
+    readers: list[Callable[[str], list[dict[str, Any]]]] = []
+
+    def _read_chrome_keychain(domain: str) -> list[dict[str, Any]]:
+        from ..chrome_cookies import export_cookies
+
+        result = export_cookies(domain, "Default")
+        if not result or not result.get("ok"):
+            return []
+        return list(result.get("cookies") or [])
+
+    _read_chrome_keychain.__name__ = "chrome_keychain"
+    readers.append(_read_chrome_keychain)
+
+    for browser_name in ("chrome", "safari", "arc", "firefox", "edge", "brave"):
+        readers.append(_make_browser_cookie3_reader(browser_name))
+
+    return readers
+
+
+def _make_browser_cookie3_reader(
+    browser_name: str,
+) -> Callable[[str], list[dict[str, Any]]]:
+    """Return a reader that calls ``browser_cookie3.<browser_name>(domain)``.
+
+    Imported lazily so the daemon doesn't fail to start when the package
+    is missing. Cookies are converted to the Playwright-compatible
+    storage_state shape that the backend already accepts.
+    """
+
+    def _reader(domain: str) -> list[dict[str, Any]]:
+        try:
+            import browser_cookie3  # type: ignore[import-untyped]
+        except ImportError:
+            return []
+        fn = getattr(browser_cookie3, browser_name, None)
+        if fn is None:
+            return []
+        try:
+            jar = fn(domain_name=domain)
+        except Exception:  # noqa: BLE001 — browser may be locked / not installed
+            return []
+        out: list[dict[str, Any]] = []
+        for c in jar:
+            out.append(
+                {
+                    "name": c.name,
+                    "value": c.value or "",
+                    "domain": c.domain,
+                    "path": c.path or "/",
+                    "expires": float(c.expires) if c.expires else -1,
+                    "httpOnly": bool(c._rest.get("HttpOnly") if hasattr(c, "_rest") else False),
+                    "secure": bool(c.secure),
+                    "sameSite": "Unspecified",
+                }
+            )
+        return out
+
+    _reader.__name__ = f"browser_cookie3_{browser_name}"
+    return _reader
+
+
 # Tool descriptor consumed by ``desktop_tools.all_tool_descriptors``.
 CONNECT_INTEGRATION_DESCRIPTOR: dict[str, Any] = {
     "name": "connect_integration",
