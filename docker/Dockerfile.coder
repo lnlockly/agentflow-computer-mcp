@@ -37,6 +37,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gnupg \
         git \
         jq \
+        bzip2 \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && npm install -g --no-audit --no-fund pnpm@10 yarn serve \
