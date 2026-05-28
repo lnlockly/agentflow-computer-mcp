@@ -578,6 +578,23 @@ def agent_dev_brief(
             },
             daemon=True,
         ).start()
+        # Phase-3 priority #0 (2026-05-27): daemon-push preview heartbeat.
+        # Replaces host-side polling of *.proj.agentflow.website from the
+        # agents pod. The daemon lives next to the dev process, so probing
+        # 127.0.0.1:$PORT is precise (no HMR-induced 5xx false positives,
+        # no per-kind cool-down, no flap). We POST /preview-alive every 30s
+        # while the port answers, and /preview-alive { alive: false } once
+        # we see three consecutive misses. Backend treats fresh heartbeat
+        # as the alive signal and skips its public-URL probe entirely.
+        threading.Thread(
+            target=_heartbeat_preview_loop,
+            name=f"preview-heartbeat-{project_id}",
+            kwargs={
+                "project_id": project_id,
+                "port": port,
+            },
+            daemon=True,
+        ).start()
 
     # Second fire-and-forget watcher that tails the opencode stdout log and
     # POSTs batches of lines to the platform's /agent-log route. Without
@@ -818,6 +835,135 @@ def _watch_and_report_clone_status(
         log.warning(
             "clone-status report failed for project %d: %s", project_id, exc
         )
+
+
+def _post_heartbeat(
+    api_base: str,
+    internal_secret: str,
+    project_id: int,
+    *,
+    alive: bool,
+    port: int,
+    http_post: HttpPoster | None = None,
+) -> None:
+    """POST a single preview heartbeat to the backend.
+
+    Uses the ``/daemon-log/projects/:id/preview-alive`` alias (mirroring
+    the agent-log + clone-status pattern from PR #894 / #105 / #106).
+    Cloudflare's WAF blocks POSTs to ``/_agents/internal/*`` from k8s pod
+    IPs with 403; the alias keeps the same secret-protected handler but
+    ducks under the /internal block.
+
+    Best-effort: any HTTP failure logs at warning and returns. The next
+    tick will retry — that's the whole point of the loop.
+    """
+    # Late-import the local default so tests can swap the poster cleanly
+    # via injection without monkey-patching the module's urllib path.
+    poster = http_post or _default_http_post
+    url = f"{api_base}/daemon-log/projects/{project_id}/preview-alive"
+    payload = json.dumps({"alive": bool(alive), "port": int(port)}).encode("utf-8")
+    headers = {
+        "content-type": "application/json",
+        "x-agentflow-secret": internal_secret,
+        # Cloudflare's WAF flags Python-urllib's default UA — see notes in
+        # _watch_and_report_clone_status for the full repro.
+        "user-agent": "curl/8.5.0 agentflow-daemon",
+    }
+    try:
+        status, _body = poster(url, payload, headers)
+        if status >= 400:
+            log.warning(
+                "preview-heartbeat POST returned %d for project %d (alive=%s)",
+                status,
+                project_id,
+                alive,
+            )
+    except (urllib.error.URLError, OSError) as exc:
+        log.warning(
+            "preview-heartbeat POST failed for project %d: %s", project_id, exc
+        )
+
+
+def _heartbeat_preview_loop(
+    *,
+    project_id: int,
+    port: int,
+    heartbeat_interval_sec: float = 30.0,
+    consecutive_misses_before_dead: int = 3,
+    http_probe: Callable[[int], bool] | None = None,
+    http_post: HttpPoster | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    max_iterations: int | None = None,
+) -> None:
+    """Continuously probe ``localhost:$PORT`` + POST alive/dead heartbeats.
+
+    Why this exists (phase-3 priority #0, 2026-05-27):
+        Host-side polling of ``https://<slug>.proj.agentflow.website`` from
+        the agents pod was fighting symptoms (HMR 5xx, cold-start 5xx) with
+        per-kind cool-downs. The daemon is the one process that knows
+        *for sure* whether the dev server is up — it lives in the same pod
+        as opencode. So the daemon pushes alive/dead instead of the host
+        pulling.
+
+    Loop:
+        Every ``heartbeat_interval_sec`` (default 30s):
+          * probe ``http://127.0.0.1:{port}/`` (cheap TCP+HTTP round-trip)
+          * on success → POST ``alive=true``, reset miss counter
+          * on failure → increment miss counter; when it reaches
+            ``consecutive_misses_before_dead`` (default 3) POST ``alive=false``
+            once, then keep trying — the dev server may come back.
+
+    Daemon thread: process shutdown does not block. ``max_iterations`` is
+    a test hook — production code never sets it, so the loop runs forever.
+    """
+    probe = http_probe or _http_probe
+    internal_secret = os.environ.get("AF_INTERNAL_API_SECRET", "")
+    if not internal_secret:
+        log.info(
+            "preview-heartbeat skipping project %d — AF_INTERNAL_API_SECRET unset",
+            project_id,
+        )
+        return
+    api_base = _normalise_api_base(os.environ.get("AF_API_URL", "https://agentflow.website"))
+
+    consecutive_misses = 0
+    dead_reported = False
+    iterations = 0
+    while True:
+        sleep(heartbeat_interval_sec)
+        ok = probe(port)
+        if ok:
+            consecutive_misses = 0
+            dead_reported = False
+            _post_heartbeat(
+                api_base,
+                internal_secret,
+                project_id,
+                alive=True,
+                port=port,
+                http_post=http_post,
+            )
+        else:
+            consecutive_misses += 1
+            if consecutive_misses >= consecutive_misses_before_dead and not dead_reported:
+                # POST `alive=false` exactly once per outage so the backend
+                # gets a precise dead signal without event-spam. Subsequent
+                # ticks keep probing — when the dev server recovers, the
+                # next ok=True path resets dead_reported so a fresh outage
+                # later still emits a dead heartbeat.
+                _post_heartbeat(
+                    api_base,
+                    internal_secret,
+                    project_id,
+                    alive=False,
+                    port=port,
+                    http_post=http_post,
+                )
+                dead_reported = True
+
+        iterations += 1
+        if max_iterations is not None and iterations >= max_iterations:
+            return
 
 
 TG_BOT_LOG_FILE = "/tmp/agent-brief-tg-bot.log"
