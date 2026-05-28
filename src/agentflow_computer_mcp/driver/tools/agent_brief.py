@@ -575,6 +575,7 @@ def agent_dev_brief(
                 "port": port,
                 "project_dir": project_dir,
                 "repo_url": repo_url,
+                "opencode_pid": opencode_pid_for_watch,
             },
             daemon=True,
         ).start()
@@ -752,6 +753,114 @@ def agent_dev_brief_edit(
     }
 
 
+DEV_SERVER_LOG_FILE = "/tmp/agent-brief-dev-server.log"
+DEV_SERVER_PID_FILE = "/tmp/agent-brief-dev-server.pid"
+
+# Daemon-side dev-server fallback gates (2026-05-28). When opencode exits
+# without leaving a listening dev server, the watcher waits this long after
+# its death before stepping in. Short enough that a 900s `port_unreachable`
+# becomes a ~3min recovery, long enough that we don't race opencode's
+# final `npm run dev` invocation that just hadn't bound the port yet.
+DEV_FALLBACK_GRACE_AFTER_OPENCODE_EXIT_SEC = 30.0
+# Minimum wall-clock before we consider falling back. Even if opencode dies
+# in <10s (rare; usually means a permission error before any work), we still
+# give the project a moment to settle so we don't recover the wrong thing.
+DEV_FALLBACK_MIN_WALL_CLOCK_SEC = 45.0
+
+
+def _spawn_dev_server(
+    project_dir: str,
+    port: int,
+    *,
+    log_file: str = DEV_SERVER_LOG_FILE,
+    pid_file: str = DEV_SERVER_PID_FILE,
+    run: Callable[..., dict[str, Any]] = _default_run,
+) -> dict[str, Any]:
+    """Detached ``npm run dev`` so the dev server outlives the watcher.
+
+    Used by ``_watch_and_report_clone_status`` as a fallback when opencode
+    exits without binding the dev port. Mirrors the spawn pattern of
+    :func:`_spawn_python_bot`:
+
+    * Resolve the package manager from lockfiles (pnpm-lock.yaml → pnpm,
+      yarn.lock → yarn, default npm). We do not look at the LLM's lockfile
+      preference — the file on disk is the source of truth.
+    * If ``node_modules`` is missing, run ``<pm> install`` first. opencode
+      always runs this before reaching the dev step, so the common path is
+      a no-op; the guard exists for the case where opencode crashed mid-run.
+    * Spawn ``<pm> run dev`` with ``PORT=<port>``, detached via ``nohup``
+      semantics (``start_new_session=True``) so it reparents under PID 1
+      (tini) and keeps listening after this function returns.
+
+    Returns ``{"ok": True, "pid": <int>, "package_manager": <str>}`` on
+    success or ``{"ok": False, "error": "<code>", "detail": "<msg>"}`` on
+    failure. Never raises — caller logs and moves on.
+    """
+    project_path = Path(project_dir)
+    if not project_path.is_dir():
+        return {"ok": False, "error": "project_dir_missing"}
+    pkg_json = project_path / "package.json"
+    if not pkg_json.exists():
+        return {"ok": False, "error": "no_package_json"}
+
+    # Pick the package manager from lockfiles. The patched ``scripts.dev``
+    # is identical across npm/pnpm/yarn since it goes through ``sh -c`` —
+    # the only thing that matters is which CLI is on PATH.
+    if (project_path / "pnpm-lock.yaml").exists():
+        pm = "pnpm"
+    elif (project_path / "yarn.lock").exists():
+        pm = "yarn"
+    else:
+        pm = "npm"
+
+    # Install deps if opencode bailed before reaching the install step.
+    # The 5-minute cap is enough for `pnpm install` on a fresh project +
+    # buffer; longer-running installs likely indicate a deeper issue
+    # (network, lockfile mismatch) that this fallback cannot fix anyway.
+    if not (project_path / "node_modules").exists():
+        install_args = ["install"]
+        install_res = run([pm, *install_args], cwd=project_dir, timeout=300)
+        if install_res.get("exit_code") != 0:
+            return {
+                "ok": False,
+                "error": "fallback_install_failed",
+                "detail": (install_res.get("stderr") or install_res.get("stdout") or "")[:500],
+            }
+
+    try:
+        log_fh = open(log_file, "ab", buffering=0)  # noqa: SIM115 — fd handed to child
+    except OSError as exc:
+        return {"ok": False, "error": "open_log_failed", "detail": str(exc)}
+
+    env = {**os.environ, "PORT": str(port), "BROWSER": "none", "CI": "1"}
+    cmd = [pm, "run", "dev"]
+    try:
+        proc = subprocess.Popen(  # noqa: S603 — pm is from a fixed allowlist
+            cmd,
+            cwd=project_dir,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            env=env,
+        )
+    except OSError as exc:
+        log_fh.close()
+        return {"ok": False, "error": "spawn_failed", "detail": str(exc)}
+    finally:
+        import contextlib
+
+        with contextlib.suppress(OSError):
+            log_fh.close()
+
+    try:
+        Path(pid_file).write_text(str(proc.pid), encoding="utf-8")
+    except OSError as exc:
+        log.warning("could not write dev-server pid file %s: %s", pid_file, exc)
+
+    return {"ok": True, "pid": proc.pid, "package_manager": pm}
+
+
 def _watch_and_report_clone_status(
     *,
     project_id: int,
@@ -761,6 +870,9 @@ def _watch_and_report_clone_status(
     repo_url: str,
     timeout_sec: float = 900.0,
     poll_interval_sec: float = 5.0,
+    opencode_pid: int | None = None,
+    spawn_dev_server: Callable[..., dict[str, Any]] | None = None,
+    pid_alive: Callable[[int | None], bool] | None = None,
 ) -> None:
     """Background watcher: poll the dev port + POST clone-status.
 
@@ -771,6 +883,19 @@ def _watch_and_report_clone_status(
     (~15 min — long enough for `pnpm install` + `next build`), reports
     `ok=false, error=port_unreachable`. Idempotent on the backend side:
     re-running clone-status repoints the existing Service/Endpoints.
+
+    Dev-server fallback (2026-05-28):
+        opencode sometimes exits without spawning ``npm run dev`` —
+        observed in projects 1547, 1552, 1553, 1557 where the run log
+        ends mid-todo-list and the dev server never binds the port. The
+        watcher detects this (opencode pid dead + grace window passed +
+        port still cold) and spawns the dev server itself with the right
+        ``PORT`` env. node_modules is reused when present; otherwise a
+        bounded ``<pm> install`` runs first.
+
+        Fired at most once per watcher run. After the fallback the loop
+        continues polling — the next 2xx/3xx reply promotes the project
+        as usual.
     """
     # The public ingress mounts agentflow-agents under /_agents/* — paths
     # at root (e.g. https://agentflow.website/internal/...) return 404
@@ -790,12 +915,52 @@ def _watch_and_report_clone_status(
         )
         return
     pod_ip = _resolve_pod_ip()
-    deadline = time.monotonic() + timeout_sec
+    spawn_dev = spawn_dev_server or _spawn_dev_server
+    is_pid_alive_fn = pid_alive or _is_pid_alive
+
+    started_at = time.monotonic()
+    deadline = started_at + timeout_sec
     port_reachable = False
+    fallback_attempted = False
+    fallback_result: dict[str, Any] | None = None
+    opencode_dead_since: float | None = None
     while time.monotonic() < deadline:
         if _http_probe(port):
             port_reachable = True
             break
+        # Dev-server fallback: opencode is dead AND grace window passed AND
+        # we haven't already tried. One-shot — if the fallback itself fails
+        # we keep polling normally so a slow `npm install` from opencode
+        # earlier in the run can still cross the line.
+        if not fallback_attempted and opencode_pid is not None:
+            opencode_alive = is_pid_alive_fn(opencode_pid)
+            if not opencode_alive:
+                if opencode_dead_since is None:
+                    opencode_dead_since = time.monotonic()
+                dead_for = time.monotonic() - opencode_dead_since
+                wall_clock = time.monotonic() - started_at
+                if (
+                    dead_for >= DEV_FALLBACK_GRACE_AFTER_OPENCODE_EXIT_SEC
+                    and wall_clock >= DEV_FALLBACK_MIN_WALL_CLOCK_SEC
+                ):
+                    fallback_attempted = True
+                    log.info(
+                        "dev-server fallback firing for project %d (port %d, "
+                        "opencode dead %.0fs, wall %.0fs)",
+                        project_id,
+                        port,
+                        dead_for,
+                        wall_clock,
+                    )
+                    try:
+                        fallback_result = spawn_dev(project_dir, port)
+                    except Exception as exc:  # noqa: BLE001 — never let fallback crash watcher
+                        log.warning(
+                            "dev-server fallback raised for project %d: %s",
+                            project_id,
+                            exc,
+                        )
+                        fallback_result = {"ok": False, "error": "fallback_exception", "detail": str(exc)[:300]}
         time.sleep(poll_interval_sec)
 
     body = {
@@ -806,6 +971,19 @@ def _watch_and_report_clone_status(
         "repo_url": repo_url,
         "pod_ip": pod_ip,
     }
+    # Surface the fallback so /clone-status events have a single grep target
+    # (`dev_server_fallback`) when ops triage stuck previews. The field is
+    # absent on runs that never needed the fallback so the common path stays
+    # cheap to parse.
+    if fallback_attempted:
+        body["dev_server_fallback"] = {
+            "attempted": True,
+            "ok": bool(fallback_result and fallback_result.get("ok")),
+            "error": (fallback_result or {}).get("error"),
+            "detail": ((fallback_result or {}).get("detail") or "")[:300] or None,
+            "package_manager": (fallback_result or {}).get("package_manager"),
+            "pid": (fallback_result or {}).get("pid"),
+        }
     if not port_reachable:
         body["error"] = "port_unreachable"
         body["detail"] = (
