@@ -23,6 +23,7 @@ import os
 from .aider import AiderBackend
 from .base import CodeAgentBackend
 from .cli_generic import GenericCLIBackend
+from .goose import GooseBackend
 from .opencode import OpenCodeBackend
 
 # Single source of truth for backend selection. Keys are the values
@@ -31,6 +32,7 @@ from .opencode import OpenCodeBackend
 _REGISTRY: dict[str, type[CodeAgentBackend]] = {
     "aider": AiderBackend,
     "opencode": OpenCodeBackend,
+    "goose": GooseBackend,
     "cli": GenericCLIBackend,
 }
 
@@ -71,6 +73,7 @@ __all__ = [
     "AiderBackend",
     "CodeAgentBackend",
     "GenericCLIBackend",
+    "GooseBackend",
     "OpenCodeBackend",
     "get_backend",
     "list_backends",
