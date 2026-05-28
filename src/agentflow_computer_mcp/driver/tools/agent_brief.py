@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import Any
 
 from ..resolve_runtimes import resolve_runtimes
+from .code_agents import CodeAgentBackend, get_backend
 from .project_setup import (
     DEFAULT_PORT,
     DEFAULT_WORKSPACE_ROOT,
@@ -168,6 +169,53 @@ def _patch_package_json_for_port(pkg_path: Path, port: int) -> None:
         log.warning("could not rewrite %s: %s", pkg_path, exc)
 
 
+def _resolve_backend_for_spawn(
+    *,
+    backend: CodeAgentBackend | str | None,
+    aider_bin: str,
+    opencode_bin: str | None,
+) -> CodeAgentBackend:
+    """Pick the code-agent backend honouring legacy kwargs.
+
+    Precedence (highest wins):
+
+    1. Explicit :class:`CodeAgentBackend` instance via ``backend=`` —
+       used by tests and any future call site that wants a custom build.
+    2. Slug string via ``backend=`` — resolved through the registry.
+    3. Legacy ``opencode_bin=`` pointing at a non-default value
+       (eg ``"opencode"``) — picks :class:`OpenCodeBackend` for
+       back-compat with the pre-aider era. ``opencode_bin="aider"``
+       reads as "use aider with that binary path".
+    4. :envvar:`CODE_AGENT_BACKEND` env var via :func:`get_backend`.
+    5. Default :class:`AiderBackend` with ``aider_bin`` as the binary.
+
+    Returning a constructed backend (rather than a slug) means the
+    caller never re-instantiates and any custom binary path threads
+    through.
+    """
+    if isinstance(backend, CodeAgentBackend):
+        return backend
+    if isinstance(backend, str) and backend:
+        return get_backend(backend)
+    # Legacy: ``opencode_bin="opencode"`` was the historical placeholder
+    # default that always fell through to aider (see the pre-refactor
+    # body in git history). Treat the literal "opencode" string as the
+    # placeholder, not a request to use the OpenCode backend — flipping
+    # backends must go through ``backend=`` or ``CODE_AGENT_BACKEND``.
+    if opencode_bin and opencode_bin != "opencode" and opencode_bin != "aider":
+        # Custom binary path — honoured as the aider binary, matching
+        # the pre-refactor behaviour.
+        aider_bin = opencode_bin
+    env_backend = os.environ.get("CODE_AGENT_BACKEND", "").strip().lower()
+    if env_backend and env_backend != "aider":
+        return get_backend(env_backend)
+    # AiderBackend constructor accepts the binary path so a baked image
+    # variant (eg ``/usr/local/bin/aider``) plugs in cleanly.
+    from .code_agents.aider import AiderBackend
+
+    return AiderBackend(binary=aider_bin)
+
+
 def _default_spawn_aider(
     brief: str,
     cwd: str,
@@ -179,89 +227,65 @@ def _default_spawn_aider(
     # Back-compat alias — older callers (server.py + tests) pass
     # `opencode_bin=`. Both names accepted; aider_bin wins when set.
     opencode_bin: str | None = None,
+    # New: explicit backend selection. ``None`` falls back to env-driven
+    # registry lookup, preserving the byte-for-byte aider default.
+    backend: CodeAgentBackend | str | None = None,
 ) -> dict[str, Any]:
-    """Spawn `aider --message "<brief>"` as a detached background process.
+    """Spawn the selected code-agent backend as a detached background process.
 
-    Aider's ``--message`` mode is one-shot non-interactive: it edits files
-    end-to-end and exits. We capture stdout into ``log_file`` so the
-    daemon can stream it to ``device_action_log``.
+    The function name stays ``_default_spawn_aider`` because tests +
+    ``server.py`` import it by name; the body is now backend-agnostic and
+    delegates to :class:`CodeAgentBackend`. Aider remains the default —
+    set :envvar:`CODE_AGENT_BACKEND` to flip without touching this file.
 
-    Flags rationale:
-      * ``--yes-always`` — skip every confirmation. Pod boundary already
-        sandboxes the agent; in-loop prompts hang the spawn forever.
-      * ``--no-pretty`` — plain output, no ANSI rewrites. agent_log reads
-        line-by-line; pretty mode rewrites lines in place and confuses
-        the tailer.
-      * ``--no-auto-commits`` — daemon strips ``.git`` before spawn, no
-        repo to commit into anyway. ``--no-git`` finishes the job.
-      * ``--no-stream`` — partial stream tokens are noise in the log; we
-        want the final reply per turn.
-      * ``--model openai/flow`` — AgentFlow gateway resolves the alias
-        server-side (gpt-5.3-codex → gpt-5.5 → opus → sonnet → haiku) so
-        swapping models never rebuilds this image.
-      * ``--edit-format diff`` — patch-style edits are the most reliable
-        format aider supports across model families.
-      * ``--map-tokens 2048`` — repo-map context for non-tiny projects so
-        aider can pick the right files without an explicit add list.
+    Flag rationale for the default (aider) backend lives in
+    :class:`agentflow_computer_mcp.driver.tools.code_agents.aider.AiderBackend`.
     """
     try:
         log_fh = open(log_file, "ab", buffering=0)  # noqa: SIM115 — fd handed to child
     except OSError as exc:
         return {"ok": False, "error": "open_log_failed", "detail": str(exc)}
 
-    # Pin aider's provider to the AgentFlow gateway via OpenAI-compatible
-    # env vars. Aider treats `openai/<model>` as an OpenAI-shaped call and
-    # picks up base+key from these envs. Project-local config (`.aider.conf.yml`)
-    # would also work but env vars stay out of the project workspace, so
-    # the user's repo never carries gateway credentials.
-    aider_env = dict(env) if env is not None else dict(os.environ)
-    api_key = aider_env.get("AF_API_KEY", "") or os.environ.get("AF_API_KEY", "")
+    # Build the env first so the backend's overrides layer on top. ``env``
+    # comes from the caller (agent_dev_brief composes PORT/BROWSER/CI),
+    # and the backend adds OPENAI_API_BASE / OPENAI_API_KEY / analytics
+    # opt-outs etc.
+    spawn_env = dict(env) if env is not None else dict(os.environ)
+    api_key = spawn_env.get("AF_API_KEY", "") or os.environ.get("AF_API_KEY", "")
     api_base = _normalise_api_base(
-        aider_env.get("AF_API_URL") or os.environ.get("AF_API_URL", "https://agentflow.website")
+        spawn_env.get("AF_API_URL") or os.environ.get("AF_API_URL", "https://agentflow.website")
     )
-    if api_key:
-        aider_env["OPENAI_API_BASE"] = api_base + "/llm/v1"
-        aider_env["OPENAI_API_KEY"] = api_key
-    # Aider phones home for analytics + checks PyPI for updates by default —
-    # both fail noisily under egress restrictions and would spam the log.
-    aider_env.setdefault("AIDER_ANALYTICS", "false")
-    aider_env.setdefault("AIDER_CHECK_UPDATE", "false")
 
-    if opencode_bin and opencode_bin != "opencode":
-        aider_bin = opencode_bin
-    # Hotfix 2026-05-28: env vars (`OPENAI_API_BASE` / `OPENAI_API_KEY`) are
-    # silently ignored by aider 0.86 when the model has the `openai/` provider
-    # prefix — `aider --verbose` shows `openai_api_base: None` even when env
-    # is set on the subprocess. CLI flags `--openai-api-base` / `--openai-api-key`
-    # win the config cascade and force aider to talk to the AgentFlow gateway.
-    # Without these flags the LLM call goes to `api.openai.com` and the
-    # gateway responds `Your request was blocked`.
-    cmd = [
-        aider_bin,
-        "--yes-always",
-        "--no-pretty",
-        "--no-auto-commits",
-        "--no-stream",
-        "--no-git",
-        "--no-show-model-warnings",
-        "--model", "openai/flow",
-        "--openai-api-base", aider_env.get("OPENAI_API_BASE", ""),
-        "--openai-api-key", aider_env.get("OPENAI_API_KEY", ""),
-        "--edit-format", "diff",
-        "--map-tokens", "2048",
-        "--map-refresh", "auto",
-        "--message", brief,
-    ]
-    log.info("[aider] starting cmd=%s cwd=%s", " ".join(cmd[:-1]) + " <brief>", cwd)
     try:
-        proc = subprocess.Popen(  # noqa: S603 — aider is on PATH from image
+        backend_impl = _resolve_backend_for_spawn(
+            backend=backend, aider_bin=aider_bin, opencode_bin=opencode_bin
+        )
+        cmd, env_overrides = backend_impl.build_command(
+            brief=brief,
+            project_dir=cwd,
+            api_key=api_key,
+            api_base=api_base,
+        )
+    except ValueError as exc:
+        log_fh.close()
+        return {"ok": False, "error": "backend_unconfigured", "detail": str(exc)}
+
+    spawn_env.update(env_overrides)
+    log.info(
+        "[code-agent:%s] starting cmd=%s cwd=%s",
+        backend_impl.slug,
+        " ".join(cmd[:-1]) + " <brief>" if cmd else "<empty>",
+        cwd,
+    )
+    try:
+        proc = subprocess.Popen(  # noqa: S603 — backend binary from fixed registry
             cmd,
             cwd=cwd,
             stdout=log_fh,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
-            env=aider_env,
+            env=spawn_env,
         )
     except OSError as exc:
         log_fh.close()
