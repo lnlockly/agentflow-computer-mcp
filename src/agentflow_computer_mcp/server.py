@@ -347,6 +347,35 @@ async def _dispatch_tool(name: str, args: dict[str, Any], config: AppConfig) -> 
             bot_token=str(bot_token_val) if bot_token_val else None,
             bot_username=str(bot_username_val) if bot_username_val else None,
         )
+    if name == "connect_integration":
+        # Backend dispatches this directly (not via LLM) for the
+        # "connect a third-party site" UX. The LLM-driven branch in
+        # desktop_tools.py drives Chrome via AppleScript; this direct
+        # path skips probe/focus and reads cookies straight from the
+        # browser SQLite stores (Chrome via Keychain, then
+        # browser_cookie3 fallbacks for Safari/Arc/Chrome). Works on
+        # the host daemon without bringing any window to the front.
+        from .driver.tools.integrations import connect_integration_direct
+
+        api_key = config.auth.api_key
+        if not api_key:
+            return {
+                "ok": False,
+                "error": "no_api_key",
+                "hint": "auth.json missing api_key",
+            }
+        api_base = os.environ.get(
+            "AF_API_URL", "https://agentflow.website"
+        ).rstrip("/")
+        if not api_base.endswith("/_agents"):
+            api_base = api_base + "/_agents"
+        provider_arg = args.get("provider") or args.get("scope", {}).get("provider")
+        return await asyncio.to_thread(
+            connect_integration_direct,
+            provider=str(provider_arg or ""),
+            api_key=api_key,
+            api_base=api_base,
+        )
     if name == "agent_dev_brief_edit":
         # Incremental edit against an existing workspace — no clone, no
         # deps install. Used by the AgentFlow chat → running-project edit
