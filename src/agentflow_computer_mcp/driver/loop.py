@@ -1218,6 +1218,14 @@ def run_task(
             return ""
         if resp.get("type") == "error":
             update_live(state, "error", f"api error: {resp}")
+            if state.current_task_id:
+                state.publish_outbound(
+                    {
+                        "type": "task_error",
+                        "task_id": state.current_task_id,
+                        "error": f"api_error: {str(resp)[:200]}",
+                    }
+                )
             return ""
 
         usage = resp.get("usage") or {}
@@ -1240,15 +1248,34 @@ def run_task(
                     f"completion_blocked_after_tool_error: {unresolved_tool_error}",
                     "completion_blocked",
                 )
+            # The model produced a plain-text final answer (stop_reason=end_turn,
+            # no tool_use blocks) instead of calling the task_complete tool.
+            answer = final_answer or thinking
             # Persist a success outcome — the model finished without further tools.
             _memory_save_outcome(
                 task,
                 success=True,
                 steps=tool_calls_count,
                 tools_used=tools_used,
-                answer=final_answer or thinking,
+                answer=answer,
             )
-            return final_answer
+            # Publish a terminal task_complete so the platform flips the
+            # device_tasks row to `done` with the result. Without this the
+            # daemon does the work but never reports back, and the row stays
+            # `dispatched` until the 15-min reaper marks it failed. Mirrors the
+            # explicit task_complete-tool `done` branch below.
+            if state.current_task_id:
+                state.publish_outbound(
+                    {
+                        "type": "task_complete",
+                        "task_id": state.current_task_id,
+                        "answer": answer,
+                        "iterations": iterations,
+                        "tokens_used": total_tokens_used,
+                        "cost_usd": round(total_cost_usd, 6),
+                    }
+                )
+            return answer
 
         # Once we enter the single grace turn after hitting the budget cap,
         # only a terminal task_complete is allowed. Any further non-terminal
@@ -1512,7 +1539,7 @@ def task_worker(
                 scope_reasoning = task_scope.get("reasoning_effort")
                 if isinstance(scope_reasoning, str) and scope_reasoning.strip():
                     run_reasoning = scope_reasoning.strip()
-            run_task(
+            result = run_task(
                 task,
                 state,
                 executor,
@@ -1522,6 +1549,29 @@ def task_worker(
                 max_usd=max_usd,
                 reasoning_effort=run_reasoning,
             )
+            # Defensive terminal-frame net. run_task has several exit paths;
+            # every one is now expected to publish a task_complete / task_error.
+            # If a future path (or an edge case) returns without one, publish a
+            # fallback task_complete so the platform never leaves the
+            # device_tasks row stuck `dispatched` (cabinet spinner forever until
+            # the 15-min reaper). Belt-and-braces — the explicit per-branch
+            # publishes above are the primary fix.
+            if task_id and not state.terminal_emitted(task_id):
+                print(
+                    f"[task_worker] run_task returned without a terminal frame "
+                    f"for task={task_id} — publishing fallback task_complete",
+                    flush=True,
+                )
+                state.publish_outbound(
+                    {
+                        "type": "task_complete",
+                        "task_id": task_id,
+                        "answer": result if isinstance(result, str) else "",
+                        "iterations": 0,
+                        "tokens_used": 0,
+                        "cost_usd": 0,
+                    }
+                )
         except Exception as exc:  # noqa: BLE001
             update_live(state, "error", f"{type(exc).__name__}: {exc}")
             print(f"task error: {exc}", flush=True)
@@ -1535,6 +1585,7 @@ def task_worker(
                 )
         finally:
             executor.reset_task_scope()
+            state.reset_terminal(task_id)
             state.busy = False
             state.current_task = ""
             state.current_task_id = ""

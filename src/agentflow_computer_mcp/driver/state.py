@@ -55,6 +55,13 @@ class DriverState:
     # Process-level shutdown signal used by desktop_cli signal handlers so the
     # task_worker loop can exit cleanly instead of surviving SIGTERM forever.
     shutdown_flag: threading.Event = field(default_factory=threading.Event)
+    # Task ids for which a terminal frame (task_complete / task_error) was
+    # already published this process. Recorded centrally in publish_outbound
+    # so task_worker can tell whether run_task reported a result; if not, it
+    # publishes a fallback task_complete instead of leaving the platform's
+    # device_tasks row stuck `dispatched` forever.
+    _terminal_task_ids: set[str] = field(default_factory=set)
+    _terminal_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def __post_init__(self) -> None:
         self.live_dir.mkdir(parents=True, exist_ok=True)
@@ -90,13 +97,38 @@ class DriverState:
 
     # ─────────── outbound WS helpers ───────────
     def publish_outbound(self, payload: dict[str, Any]) -> None:
-        """Best-effort send to the WS bridge. No-op when offline."""
+        """Best-effort send to the WS bridge. No-op when offline.
+
+        Records terminal frames (task_complete / task_error) keyed by task_id
+        so task_worker can detect a run_task return that never reported a
+        result and publish a fallback terminal frame.
+        """
+        ptype = payload.get("type")
+        if ptype in ("task_complete", "task_error"):
+            tid = payload.get("task_id")
+            if isinstance(tid, str) and tid:
+                with self._terminal_lock:
+                    self._terminal_task_ids.add(tid)
         pub = self.outbound_publisher
         if pub is None:
             return
         # never crash the AI loop on a flaky socket
         with contextlib.suppress(Exception):
             pub(payload)
+
+    def terminal_emitted(self, task_id: str) -> bool:
+        """True iff a task_complete / task_error was published for *task_id*."""
+        if not task_id:
+            return False
+        with self._terminal_lock:
+            return task_id in self._terminal_task_ids
+
+    def reset_terminal(self, task_id: str) -> None:
+        """Forget a task's terminal-frame record (called when the task ends)."""
+        if not task_id:
+            return
+        with self._terminal_lock:
+            self._terminal_task_ids.discard(task_id)
 
     def request_abort(self, task_id: str | None = None) -> None:
         """Signal the running task to abort within ~2s.
