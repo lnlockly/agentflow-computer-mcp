@@ -23,7 +23,6 @@ from agentflow_computer_mcp.driver.tools.code_agents.cli_generic import GenericC
 from agentflow_computer_mcp.driver.tools.code_agents.goose import GooseBackend
 from agentflow_computer_mcp.driver.tools.code_agents.opencode import OpenCodeBackend
 
-
 # ---------------------------------------------------------------------------
 # Backend command shape — pin the exact CLI flags + env keys each backend
 # emits. A regression here means the spawn ran a different tool than the

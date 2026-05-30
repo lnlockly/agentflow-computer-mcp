@@ -17,6 +17,50 @@ HARD_DENY_PATHS: tuple[str, ...] = (
 
 DEFAULT_CONFIRM_BEFORE: tuple[str, ...] = ("computer.fs.write", "computer.shell.exec")
 
+# Programs that `code_run_command` always accepts, regardless of what the
+# per-device `shell_whitelist` holds. The friendly cabinet permission
+# toggles (Файлы / Интернет / Память + «спрашивать перед важным») never
+# write `shell_whitelist`, so a device whose stored scope omits or narrows
+# it used to block read-only basics like `uname -a` with
+# `command not in shell_whitelist: uname`. This baseline guarantees a device
+# can always run read-only diagnostics and the common dev toolchain.
+#
+# Membership rule: read-only inspection + common build/dev tools only.
+# Destructive programs (rm, dd, mkfs, shutdown, reboot, poweroff, kill,
+# pkill, …) are deliberately absent — they stay gated behind the
+# configurable `shell_whitelist`, and `rm` keeps its recursive-flag guard
+# in scope.check_shell.
+SAFE_BASELINE_PROGRAMS: frozenset[str] = frozenset(
+    {
+        # read-only inspection
+        "uname", "ls", "cat", "pwd", "echo", "whoami", "id", "env",
+        "printenv", "date", "head", "tail", "grep", "egrep", "fgrep",
+        "wc", "find", "which", "type", "file", "stat", "du", "df", "ps",
+        "top", "free", "uptime", "sort", "uniq", "cut", "tr", "sed",
+        "awk", "basename", "dirname", "realpath", "readlink", "tree",
+        "hostname", "host", "dig", "nslookup", "ping",
+        # common dev toolchain
+        "node", "npm", "npx", "python3", "pip", "pip3", "git",
+        "curl", "wget",
+    }
+)
+
+# Baseline for a fresh device whose scope file/env set no `shell_whitelist`
+# of their own. The safe baseline above already lets read-only diagnostics
+# through; this default additionally lets the device run the usual build and
+# package workflows out of the box so an enrolled daemon is useful without
+# the owner hand-editing a TOML. The configurable `shell_whitelist` (file,
+# env, or platform-pushed scope) EXTENDS both this default and the baseline.
+DEFAULT_SHELL_WHITELIST: tuple[str, ...] = tuple(
+    dict.fromkeys(
+        (
+            *sorted(SAFE_BASELINE_PROGRAMS),
+            "bash", "sh", "zsh", "make", "pnpm", "yarn", "gh", "python",
+            "pytest", "mkdir", "touch", "cp", "mv", "tar", "unzip",
+        )
+    )
+)
+
 # Hosted daemons (kind=daemon pods, AF_HOSTED=1 env) have no user sitting at
 # a screen to dismiss native confirm dialogs — every confirm() would block
 # forever and then auto-deny. The owner already configures the device's
@@ -83,7 +127,7 @@ class Scope:
     allow_apps: tuple[str, ...] = ()
     allow_paths: tuple[str, ...] = ()
     deny_paths: tuple[str, ...] = HARD_DENY_PATHS
-    shell_whitelist: tuple[str, ...] = ()
+    shell_whitelist: tuple[str, ...] = DEFAULT_SHELL_WHITELIST
     confirm_before: tuple[str, ...] = DEFAULT_CONFIRM_BEFORE
     max_actions_per_session: int = 50
     budget_usd: float = 2.0
