@@ -109,11 +109,16 @@ def test_load_scope_picks_up_env_when_no_file(tmp_path: Path) -> None:
 
 
 def test_load_scope_empty_env_falls_back_to_defaults(tmp_path: Path) -> None:
+    from agentflow_computer_mcp.config import DEFAULT_SHELL_WHITELIST
+
     missing = tmp_path / "computer-scope.toml"
     env_without = {k: v for k, v in os.environ.items() if k != SHELL_WHITELIST_ENV_VAR}
     with mock.patch.dict(os.environ, env_without, clear=True):
         scope = load_scope(missing)
-    assert scope.shell_whitelist == ()
+    # No file, no env → a fresh device gets the sane default whitelist so it
+    # is useful out of the box (the safe baseline already covers read-only
+    # basics regardless of this value).
+    assert scope.shell_whitelist == DEFAULT_SHELL_WHITELIST
 
 
 def test_load_scope_merges_env_and_file(tmp_path: Path) -> None:

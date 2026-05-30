@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .config import HARD_DENY_PATHS, Scope
+from .config import HARD_DENY_PATHS, SAFE_BASELINE_PROGRAMS, Scope
 
 
 class ScopeDenied(Exception):
@@ -48,15 +48,22 @@ def check_path(path: str, scope: Scope, write: bool = False) -> Path:
 
 
 def check_shell(cmd: str, scope: Scope) -> str:
-    if not scope.shell_whitelist:
-        raise ScopeDenied("shell_whitelist is empty; shell.exec disabled")
-
     head = cmd.strip().split()
     if not head:
         raise ScopeDenied("empty command")
 
     program = head[0]
-    if program not in scope.shell_whitelist:
+    # The safe baseline (read-only diagnostics + common dev toolchain) is
+    # always allowed so a device never blocks `uname`, `ls`, `cat`, etc. —
+    # even when its stored scope carries an empty or narrow shell_whitelist.
+    # The configurable shell_whitelist EXTENDS the baseline for anything
+    # outside it (destructive or host-specific programs the owner opts in to).
+    if program not in SAFE_BASELINE_PROGRAMS and program not in scope.shell_whitelist:
+        if not scope.shell_whitelist:
+            raise ScopeDenied(
+                f"command not allowed: {program} (not in safe baseline and "
+                "shell_whitelist is empty)"
+            )
         raise ScopeDenied(f"command not in shell_whitelist: {program}")
 
     # Hard reject of recursive deletes. Hosted whitelists routinely
