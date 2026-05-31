@@ -26,6 +26,15 @@ class PlatformBackend(Protocol):
     def capture_region(self, x: int, y: int, w: int, h: int) -> bytes:
         """Return PNG bytes for the given pixel rectangle."""
 
+    # ---- Screen geometry ----------------------------------------------------
+    def screen_size(self) -> tuple[int, int]:
+        """Logical primary-display size ``(width, height)`` in the SAME
+        coordinate space :meth:`mouse_click` consumes (``pyautogui`` points —
+        not the physical/Retina capture pixels, not the down-scaled MJPEG
+        frame). Reported on the WS ``hello`` so the server can scale
+        normalized 0..1 click coords to device pixels."""
+        ...
+
     # ---- Mouse --------------------------------------------------------------
     def mouse_click(self, x: int, y: int, button: str = "left", clicks: int = 1) -> dict[str, int]:
         ...
