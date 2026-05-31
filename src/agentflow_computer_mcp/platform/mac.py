@@ -114,6 +114,13 @@ class MacBackend:
     def capture_region(self, x: int, y: int, w: int, h: int) -> bytes:
         return self.capture_screen({"x": x, "y": y, "width": w, "height": h})
 
+    # ---- Screen geometry ----------------------------------------------------
+    def screen_size(self) -> tuple[int, int]:
+        # pyautogui.size() returns logical points on macOS (Retina-aware),
+        # which is exactly the space pyautogui.click() below consumes.
+        size = pyautogui.size()
+        return int(size[0]), int(size[1])
+
     # ---- Mouse --------------------------------------------------------------
     def mouse_click(self, x: int, y: int, button: str = "left", clicks: int = 1) -> dict[str, int]:
         pyautogui.click(x=x, y=y, button=button, clicks=clicks)

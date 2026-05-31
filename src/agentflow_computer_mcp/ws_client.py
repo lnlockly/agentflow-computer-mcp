@@ -35,6 +35,29 @@ TaskDispatchHandler = Callable[[str, str, dict[str, Any] | None], None]
 StreamSubscribeHandler = Callable[[bool], None]
 
 
+def _probe_screen_size() -> dict[str, int] | None:
+    """Logical screen size for the WS `hello`, or None if it can't be read.
+
+    Goes through the platform backend (`pyautogui.size()`), which is the same
+    coordinate space `computer.mouse.click` consumes — so the server's
+    normalized→pixel scaling lands where the cursor actually goes. Imported
+    lazily to keep `from .ws_client import …` cheap for the test suite, and
+    wrapped so a headless host (no display) degrades to the server default
+    instead of breaking the handshake.
+    """
+    try:
+        from .platform import backend as _backend
+
+        if _backend is None:
+            return None
+        width, height = _backend.screen_size()
+        if width > 0 and height > 0:
+            return {"w": int(width), "h": int(height)}
+    except Exception as exc:  # noqa: BLE001
+        log.debug("screen_size probe failed: %s", exc)
+    return None
+
+
 class WSClient:
     """Reverse-tunnel client for the AgentFlow devices WS.
 
@@ -164,6 +187,13 @@ class WSClient:
                 "version": __version__,
                 "tools": self._tool_names,
             }
+            # Report the logical screen size so the server can scale the
+            # cabinet's normalized 0..1 Drive clicks to device pixels. Optional
+            # + best-effort: on a headless host with no display the probe
+            # raises, and the server falls back to its default resolution.
+            screen = _probe_screen_size()
+            if screen is not None:
+                hello["screen"] = screen
             await ws.send(json.dumps(hello))
 
             # Wire the WS log uploader so WARN+ records start flowing to

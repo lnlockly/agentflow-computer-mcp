@@ -95,6 +95,15 @@ class LinuxBackend:
     def capture_region(self, x: int, y: int, w: int, h: int) -> bytes:
         return _encode_png(_capture({"x": x, "y": y, "width": w, "height": h}))
 
+    # ---- Screen geometry ----------------------------------------------------
+    def screen_size(self) -> tuple[int, int]:
+        import pyautogui
+
+        # On X11/Xvfb there is no Retina scaling, so pyautogui.size() is both
+        # the capture resolution and the click space (e.g. Xvfb 1440x900).
+        size = pyautogui.size()
+        return int(size[0]), int(size[1])
+
     # ---- Mouse --------------------------------------------------------------
     def mouse_click(self, x: int, y: int, button: str = "left", clicks: int = 1) -> dict[str, int]:
         import pyautogui

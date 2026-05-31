@@ -34,6 +34,7 @@ def test_backend_advertises_name() -> None:
         "capture_screen_fast",
         "capture_screen",
         "capture_region",
+        "screen_size",
         "mouse_click",
         "mouse_move",
         "mouse_scroll",
